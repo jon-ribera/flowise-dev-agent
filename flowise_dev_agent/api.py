@@ -25,11 +25,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pathlib
 from contextlib import asynccontextmanager
 from typing import Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi.responses import FileResponse
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -860,6 +862,19 @@ async def stream_resume_session(
             yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# Developer web UI
+# ---------------------------------------------------------------------------
+
+_STATIC_DIR = pathlib.Path(__file__).parent / "static"
+
+
+@app.get("/ui", include_in_schema=False)
+async def serve_ui() -> FileResponse:
+    """Serve the local developer web UI (single-page HTML app)."""
+    return FileResponse(_STATIC_DIR / "index.html", media_type="text/html")
 
 
 # ---------------------------------------------------------------------------

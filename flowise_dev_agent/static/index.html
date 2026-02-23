@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flowise Dev Agent</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    :root {
+      --bg:          #0f1117;
+      --surface:     #1a1d27;
+      --sidebar-bg:  #13151f;
+      --border:      #2a2d3e;
+      --accent:      #5865f2;
+      --accent-h:    #6d7af5;
+      --accent-dim:  #2d3270;
+      --text:        #e8eaf6;
+      --muted:       #7b7f9e;
+      --green:       #22c55e;
+      --amber:       #f59e0b;
+      --red:         #ef4444;
+      --blue:        #3b82f6;
+      --stream-text: #a8d8a8;
+      --mono: "JetBrains Mono","Fira Code","Cascadia Code","Consolas",monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui,-apple-system,"Segoe UI",sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: grid;
+      grid-template-rows: 52px 1fr;
+      grid-template-columns: 280px 1fr;
+      overflow: hidden;
+    }
+
+    /* ── Header ── */
+    #header {
+      grid-column: 1 / -1;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 18px;
+      gap: 12px;
+    }
+    .logo { font-weight: 700; font-size: 15px; color: var(--accent); flex: 1; letter-spacing: .3px; }
+    .logo span { color: var(--muted); font-weight: 400; }
+    #api-key-input {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      width: 180px;
+    }
+    #api-key-input:focus { outline: none; border-color: var(--accent); color: var(--text); }
+    #api-key-input::placeholder { color: var(--muted); }
+
+    /* ── Sidebar ── */
+    #sidebar {
+      background: var(--sidebar-bg);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .sidebar-hdr {
+      padding: 11px 14px 9px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    #refresh-btn {
+      background: none; border: none; color: var(--muted);
+      cursor: pointer; font-size: 15px; padding: 2px 6px; border-radius: 4px;
+    }
+    #refresh-btn:hover { background: var(--border); color: var(--text); }
+    #new-session-btn {
+      margin: 10px;
+      padding: 8px 12px;
+      background: var(--accent);
+      border: none; color: white;
+      font-size: 13px; font-weight: 500;
+      border-radius: 6px; cursor: pointer;
+    }
+    #new-session-btn:hover { background: var(--accent-h); }
+    #session-list { list-style: none; overflow-y: auto; flex: 1; padding: 4px 0; }
+    .s-item {
+      padding: 8px 14px; cursor: pointer;
+      border-left: 3px solid transparent;
+      transition: background .1s;
+    }
+    .s-item:hover { background: var(--surface); }
+    .s-item.active { border-left-color: var(--accent); background: var(--surface); }
+    .s-id {
+      font-family: var(--mono); font-size: 11px;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .s-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+    .s-meta {
+      font-size: 10px; color: var(--muted); margin-top: 2px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
+    /* ── Main ── */
+    #main { overflow: hidden; position: relative; }
+    .panel { display: none; flex-direction: column; height: 100%; overflow: hidden; }
+    .panel.active { display: flex; }
+
+    /* ── Idle ── */
+    #panel-idle { align-items: center; justify-content: center; padding: 40px 60px; }
+    .idle-inner { width: 100%; max-width: 600px; }
+    .idle-inner h2 { font-size: 22px; font-weight: 600; margin-bottom: 6px; }
+    .idle-inner p  { font-size: 13px; color: var(--muted); margin-bottom: 18px; }
+    textarea {
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 12px 14px;
+      border-radius: 8px;
+      font-size: 14px; font-family: inherit;
+      resize: vertical; min-height: 100px;
+    }
+    textarea:focus { outline: none; border-color: var(--accent); }
+    textarea::placeholder { color: var(--muted); }
+    .form-row {
+      display: flex; align-items: center; gap: 16px;
+      margin-top: 12px; font-size: 13px; color: var(--muted);
+    }
+    .form-row label { display: flex; align-items: center; gap: 8px; }
+    .form-row input[type=number] {
+      width: 60px; background: var(--surface);
+      border: 1px solid var(--border); color: var(--text);
+      padding: 5px 8px; border-radius: 6px; font-size: 13px; text-align: center;
+    }
+    .btn-primary {
+      padding: 9px 22px; background: var(--accent); border: none;
+      color: white; font-size: 14px; font-weight: 500;
+      border-radius: 6px; cursor: pointer; margin-top: 16px;
+    }
+    .btn-primary:hover { background: var(--accent-h); }
+    .btn-secondary {
+      padding: 8px 16px; background: transparent;
+      border: 1px solid var(--border); color: var(--muted);
+      font-size: 13px; border-radius: 6px; cursor: pointer;
+    }
+    .btn-secondary:hover { border-color: var(--accent); color: var(--text); }
+
+    /* ── Streaming ── */
+    #panel-streaming { padding: 16px 20px; gap: 10px; }
+    .stream-hdr { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+    .thread-badge {
+      font-family: var(--mono); font-size: 11px; color: var(--muted);
+      background: var(--surface); padding: 3px 8px;
+      border-radius: 4px; border: 1px solid var(--border);
+    }
+    .running-badge {
+      font-size: 11px; font-weight: 600; color: var(--accent);
+      background: var(--accent-dim); padding: 3px 8px; border-radius: 4px;
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%,100%{ opacity:1 } 50%{ opacity:.45 } }
+    #tool-badges { display: flex; flex-wrap: wrap; gap: 6px; flex-shrink: 0; min-height: 0; }
+    .t-badge {
+      font-size: 11px; font-family: var(--mono); padding: 2px 8px;
+      border-radius: 4px; border: 1px solid var(--border);
+      color: var(--muted); background: var(--surface);
+    }
+    .t-badge.calling { border-color: var(--amber); color: var(--amber); animation: pulse 1s infinite; }
+    .t-badge.done    { border-color: var(--green);  color: var(--green); }
+    #stream-output {
+      flex: 1; background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 14px 16px; overflow-y: auto;
+      font-family: var(--mono); font-size: 13px; line-height: 1.6;
+      color: var(--stream-text); white-space: pre-wrap; word-break: break-word;
+    }
+
+    /* ── Interrupted ── */
+    #panel-interrupted { padding: 20px 24px; overflow-y: auto; }
+    .intr-card { max-width: 800px; width: 100%; margin: 0 auto; }
+    .intr-label {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 11px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 1px; padding: 4px 10px; border-radius: 4px; margin-bottom: 14px;
+    }
+    .type-clarification    { background: #1e3a5f; color: #60a5fa; }
+    .type-credential_check { background: #3b1f1f; color: #fca5a5; }
+    .type-plan_approval    { background: #1a2e1a; color: #86efac; }
+    .type-result_review    { background: #1e2a4a; color: #93c5fd; }
+    .intr-body {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 16px 20px; margin-bottom: 14px;
+    }
+    .intr-body pre {
+      white-space: pre-wrap; font-family: var(--mono);
+      font-size: 13px; line-height: 1.6; color: var(--text);
+    }
+    .cred-badge {
+      display: inline-block; font-family: var(--mono); font-size: 12px;
+      background: #2a1f1f; color: #fca5a5;
+      border: 1px solid #5c2a2a; padding: 2px 8px;
+      border-radius: 4px; margin: 3px 4px;
+    }
+
+    /* Markdown */
+    .md { color: var(--text); line-height: 1.7; }
+    .md h1,.md h2,.md h3 { color: var(--accent); margin: 12px 0 6px; font-size: 15px; }
+    .md p  { margin: 6px 0; }
+    .md ul,.md ol { padding-left: 20px; margin: 6px 0; }
+    .md li { margin: 3px 0; }
+    .md code {
+      font-family: var(--mono); background: var(--bg);
+      padding: 1px 5px; border-radius: 3px; font-size: 12px;
+    }
+    .md pre { background: var(--bg); padding: 10px 14px; border-radius: 6px; overflow-x: auto; margin: 8px 0; }
+    .md strong { color: #c5c8ff; }
+
+    /* Result badges */
+    .result-row { display: flex; gap: 10px; margin-bottom: 10px; }
+    .r-badge {
+      padding: 4px 12px; border-radius: 4px;
+      font-size: 12px; font-weight: 600;
+    }
+    .r-badge.pass { background: #0d2b1a; color: var(--green); border: 1px solid var(--green); }
+    .r-badge.fail { background: #2b0d0d; color: var(--red);   border: 1px solid var(--red); }
+
+    /* Interrupt form */
+    .intr-form { margin-top: 4px; }
+    .intr-form label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    .intr-form textarea { min-height: 80px; }
+    .btn-row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+    .btn-approve {
+      padding: 9px 20px; background: var(--green); border: none;
+      color: white; font-weight: 600; font-size: 14px; border-radius: 6px; cursor: pointer;
+    }
+    .btn-approve:hover { background: #16a34a; }
+    .btn-send {
+      padding: 9px 20px; background: var(--accent); border: none;
+      color: white; font-weight: 500; font-size: 14px; border-radius: 6px; cursor: pointer;
+    }
+    .btn-send:hover { background: var(--accent-h); }
+
+    /* ── Completed ── */
+    #panel-completed { align-items: center; justify-content: center; padding: 40px; gap: 20px; }
+    .done-card {
+      max-width: 600px; width: 100%;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 28px 32px;
+    }
+    .done-icon { font-size: 32px; margin-bottom: 10px; }
+    .done-card h2 { font-size: 20px; margin-bottom: 6px; color: var(--green); }
+    .done-card p  { font-size: 13px; color: var(--muted); margin: 4px 0; }
+    .cflow-id {
+      font-family: var(--mono); font-size: 13px; color: var(--text);
+      background: var(--bg); padding: 8px 12px; border-radius: 6px;
+      border: 1px solid var(--border); margin: 14px 0; word-break: break-all;
+    }
+    .tok-row { display: flex; gap: 20px; font-size: 12px; color: var(--muted); margin-bottom: 18px; }
+    .tok-row span { display: flex; flex-direction: column; gap: 2px; }
+    .tok-row strong { font-size: 16px; color: var(--text); }
+    .audit-wrap {
+      max-width: 600px; width: 100%;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 16px 20px;
+      overflow-y: auto; max-height: 380px;
+    }
+    .audit-wrap .md { font-size: 13px; }
+
+    /* ── Error ── */
+    #panel-error { align-items: center; justify-content: center; padding: 40px; }
+    .err-card { max-width: 500px; text-align: center; }
+    .err-card h2 { color: var(--red); margin-bottom: 10px; }
+    .err-card pre {
+      background: var(--surface); border: 1px solid #5c2a2a; border-radius: 6px;
+      padding: 12px; font-family: var(--mono); font-size: 12px; color: #fca5a5;
+      white-space: pre-wrap; text-align: left; margin: 12px 0 20px;
+      max-height: 200px; overflow-y: auto;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+  </style>
+</head>
+<body>
+
+<header id="header">
+  <div class="logo">Flowise Dev Agent <span>co-pilot</span></div>
+  <input id="api-key-input" type="password" placeholder="API Key (blank if none)" title="AGENT_API_KEY">
+</header>
+
+<aside id="sidebar">
+  <div class="sidebar-hdr">
+    Sessions
+    <button id="refresh-btn" title="Refresh">↺</button>
+  </div>
+  <button id="new-session-btn">+ New Session</button>
+  <ul id="session-list"><li style="padding:20px 14px;font-size:12px;color:var(--muted);text-align:center">Loading…</li></ul>
+</aside>
+
+<main id="main">
+
+  <!-- IDLE -->
+  <div id="panel-idle" class="panel active">
+    <div class="idle-inner">
+      <h2>New Session</h2>
+      <p>Describe what you want to build or change in Flowise. The agent will discover, plan, build, and test it.</p>
+      <textarea id="req-input" rows="5"
+        placeholder="e.g. Build a customer support chatbot with memory that uses GPT-4o"></textarea>
+      <div class="form-row">
+        <label>
+          Test trials
+          <input id="trials-input" type="number" min="1" max="5" value="1">
+        </label>
+        <span style="font-size:11px;color:var(--muted)">Higher = pass^k reliability testing</span>
+      </div>
+      <button class="btn-primary" id="start-btn">Start Session →</button>
+      <div style="margin-top:10px;font-size:11px;color:var(--muted)">Tip: Ctrl+Enter to start</div>
+    </div>
+  </div>
+
+  <!-- STREAMING -->
+  <div id="panel-streaming" class="panel">
+    <div class="stream-hdr">
+      <span id="thread-badge" class="thread-badge">—</span>
+      <span class="running-badge">Running…</span>
+      <span id="iter-label" style="font-size:11px;color:var(--muted);font-family:var(--mono)"></span>
+    </div>
+    <div id="tool-badges"></div>
+    <div id="stream-output"></div>
+  </div>
+
+  <!-- INTERRUPTED -->
+  <div id="panel-interrupted" class="panel">
+    <div class="intr-card">
+      <div id="intr-label" class="intr-label"></div>
+      <div id="intr-body"  class="intr-body"></div>
+      <div class="intr-form">
+        <label id="intr-form-label">Your response:</label>
+        <textarea id="resp-input" rows="4" placeholder="Type your response…"></textarea>
+        <div class="btn-row" id="btn-row">
+          <!-- buttons injected by renderInterruptPanel() -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- COMPLETED -->
+  <div id="panel-completed" class="panel">
+    <div class="done-card">
+      <div class="done-icon">✓</div>
+      <h2>Session Complete</h2>
+      <p id="done-msg"></p>
+      <div id="cflow-id" class="cflow-id" style="display:none"></div>
+      <div class="tok-row" id="tok-row"></div>
+      <div class="btn-row">
+        <button class="btn-primary"   id="new-done-btn">+ New Session</button>
+        <button class="btn-secondary" id="audit-btn">View Audit Trail</button>
+      </div>
+    </div>
+    <div id="audit-wrap" class="audit-wrap" style="display:none">
+      <div id="audit-content"></div>
+    </div>
+  </div>
+
+  <!-- ERROR -->
+  <div id="panel-error" class="panel">
+    <div class="err-card">
+      <h2>Something went wrong</h2>
+      <pre id="err-msg"></pre>
+      <button class="btn-secondary" id="back-btn">← Back</button>
+    </div>
+  </div>
+
+</main>
+
+<script>
+// ─────────────────────────────────────────────────────────
+//  Constants
+// ─────────────────────────────────────────────────────────
+const INTERRUPT_TYPES = new Set([
+  'clarification', 'credential_check', 'plan_approval', 'result_review'
+]);
+
+// ─────────────────────────────────────────────────────────
+//  State
+// ─────────────────────────────────────────────────────────
+const state = {
+  phase:           'idle',       // idle | streaming | interrupted | completed | error
+  threadId:        null,
+  interruptPayload: null,
+  streamBuffer:    '',
+  toolCalls:       [],
+  sessions:        [],
+  apiKey:          localStorage.getItem('flowise_agent_api_key') || '',
+  error:           null,
+  tokens:          { input: 0, output: 0 },
+  chatflowId:      null,
+  iteration:       0,
+};
+
+// ─────────────────────────────────────────────────────────
+//  Utilities
+// ─────────────────────────────────────────────────────────
+function apiFetch(url, opts = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  if (state.apiKey) headers['Authorization'] = `Bearer ${state.apiKey}`;
+  return fetch(url, { ...opts, headers });
+}
+
+function transition(phase, updates = {}) {
+  state.phase = phase;
+  Object.assign(state, updates);
+  render();
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function shortId(id) { return id ? id.slice(0, 13) + '…' : '—'; }
+
+// ─────────────────────────────────────────────────────────
+//  SSE via fetch + ReadableStream  (POST-compatible)
+// ─────────────────────────────────────────────────────────
+async function openStream(url, body) {
+  state.streamBuffer = '';
+  state.toolCalls    = [];
+  renderStream();
+  renderToolBadges();
+
+  let resp;
+  try {
+    resp = await apiFetch(url, { method: 'POST', body: JSON.stringify(body) });
+  } catch (e) {
+    transition('error', { error: `Network error: ${e.message}` });
+    return;
+  }
+
+  if (!resp.ok) {
+    let detail = `HTTP ${resp.status}`;
+    try { const j = await resp.json(); detail += ': ' + (j.detail || JSON.stringify(j)); } catch {}
+    transition('error', { error: detail });
+    return;
+  }
+
+  const reader  = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let   buf     = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split('\n\n');
+      buf = parts.pop();               // hold incomplete last chunk
+      for (const part of parts) {
+        const line = part.trim();
+        if (line.startsWith('data: ')) {
+          try { handleSSEEvent(JSON.parse(line.slice(6))); } catch {}
+        }
+      }
+    }
+  } catch (e) {
+    if (state.phase === 'streaming') {
+      transition('error', { error: `Stream interrupted: ${e.message}` });
+    }
+  }
+}
+
+function handleSSEEvent(ev) {
+  switch (ev.type) {
+    case 'token':
+      state.streamBuffer += ev.content;
+      renderStream();
+      break;
+
+    case 'tool_call':
+      state.toolCalls.push({ name: ev.name, status: 'calling' });
+      renderToolBadges();
+      break;
+
+    case 'tool_result': {
+      // Find last calling badge with this name
+      const tc = [...state.toolCalls].reverse().find(t => t.name === ev.name && t.status === 'calling');
+      if (tc) { tc.status = 'done'; tc.preview = ev.preview; }
+      renderToolBadges();
+      break;
+    }
+
+    case 'done':
+      if (ev.thread_id) state.threadId = ev.thread_id;
+      transition('completed');
+      break;
+
+    case 'error':
+      transition('error', { error: ev.detail || 'Unknown server error' });
+      break;
+
+    default:
+      // _sse_final spreads the interrupt dict, so the interrupt kind IS ev.type
+      if (INTERRUPT_TYPES.has(ev.type)) {
+        if (ev.chatflow_id)          state.chatflowId   = ev.chatflow_id;
+        if (ev.iteration != null)    state.iteration    = ev.iteration;
+        if (ev.total_input_tokens)   state.tokens.input  = ev.total_input_tokens;
+        if (ev.total_output_tokens)  state.tokens.output = ev.total_output_tokens;
+        transition('interrupted', { interruptPayload: ev });
+      }
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+//  Render
+// ─────────────────────────────────────────────────────────
+function render() {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  const panel = document.getElementById(`panel-${state.phase}`);
+  if (panel) panel.classList.add('active');
+
+  if (state.phase === 'streaming')   renderStreamPanel();
+  if (state.phase === 'interrupted') renderInterruptPanel();
+  if (state.phase === 'completed')   renderCompletedPanel();
+  if (state.phase === 'error')       document.getElementById('err-msg').textContent = state.error || 'Unknown error';
+
+  renderSessionList();
+}
+
+// — Stream panel —
+function renderStreamPanel() {
+  document.getElementById('thread-badge').textContent = shortId(state.threadId);
+  document.getElementById('iter-label').textContent   = state.iteration ? `iteration ${state.iteration}` : '';
+  renderStream();
+  renderToolBadges();
+}
+
+let _autoScroll = true;
+function renderStream() {
+  const el = document.getElementById('stream-output');
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 60;
+  el.textContent = state.streamBuffer || '';
+  if (atBottom || _autoScroll) { el.scrollTop = el.scrollHeight; _autoScroll = true; }
+}
+document.getElementById('stream-output').addEventListener('scroll', function () {
+  _autoScroll = this.scrollTop + this.clientHeight >= this.scrollHeight - 60;
+});
+
+function renderToolBadges() {
+  document.getElementById('tool-badges').innerHTML = state.toolCalls.map(tc =>
+    `<span class="t-badge ${tc.status}">${esc(tc.name)} ${tc.status === 'calling' ? '…' : '✓'}</span>`
+  ).join('');
+}
+
+// — Interrupt panel —
+const INTR_NAMES = {
+  clarification:    '? Clarification Needed',
+  credential_check: '⚠ Credential Check',
+  plan_approval:    '✎ Plan Ready for Review',
+  result_review:    '✓ Tests Complete — Review Results',
+};
+
+function renderInterruptPanel() {
+  const pl   = state.interruptPayload;
+  if (!pl) return;
+  const kind = pl.type;
+
+  // Label
+  const labelEl = document.getElementById('intr-label');
+  labelEl.textContent = INTR_NAMES[kind] || kind;
+  labelEl.className   = `intr-label type-${kind}`;
+
+  // Body
+  const body = document.getElementById('intr-body');
+  const md   = typeof marked !== 'undefined';
+
+  if (kind === 'clarification') {
+    body.innerHTML = `<pre>${esc(pl.prompt || '')}</pre>`;
+    document.getElementById('intr-form-label').textContent = 'Answer the questions above:';
+    document.getElementById('resp-input').placeholder = 'Type your answers…';
+
+  } else if (kind === 'credential_check') {
+    const badges = (pl.missing_credentials || [])
+      .map(c => `<span class="cred-badge">${esc(c)}</span>`).join(' ');
+    body.innerHTML = `
+      <p style="color:var(--muted);font-size:13px;margin-bottom:10px;">
+        The following credential types are required but not found in Flowise:
+      </p>
+      <div style="margin-bottom:14px">${badges}</div>
+      <p style="font-size:13px;color:var(--muted)">
+        Create them in <strong style="color:var(--text)">Flowise → Settings → Credentials → Add New</strong>,
+        then paste the credential ID(s) below.<br>
+        Or reply <code style="font-size:12px;background:var(--bg);padding:1px 5px;border-radius:3px">skip</code>
+        to continue without them.
+      </p>`;
+    document.getElementById('intr-form-label').textContent = 'Credential ID(s):';
+    document.getElementById('resp-input').placeholder = 'e.g. openAIApi: 513db410-c4c3-4818-a716-6f386aba8a82';
+
+  } else if (kind === 'plan_approval') {
+    const planHtml = md ? marked.parse(pl.plan || '') : `<pre>${esc(pl.plan || '')}</pre>`;
+    body.innerHTML = `<div class="md">${planHtml}</div>`;
+    document.getElementById('intr-form-label').textContent =
+      'Reply "approved" to proceed, or describe what to change:';
+    document.getElementById('resp-input').placeholder = 'approved';
+
+  } else if (kind === 'result_review') {
+    const raw     = pl.test_results || '';
+    const line    = raw.match(/RESULT:\s*(.+)/i);
+    let   badges  = '';
+    if (line) {
+      const happy = /HAPPY PATH\s*\[?PASS/i.test(line[1]);
+      const edge  = /EDGE CASE\s*\[?PASS/i.test(line[1]);
+      badges = `<div class="result-row">
+        <span class="r-badge ${happy ? 'pass' : 'fail'}">Happy Path: ${happy ? 'PASS' : 'FAIL'}</span>
+        <span class="r-badge ${edge  ? 'pass' : 'fail'}">Edge Case:  ${edge  ? 'PASS' : 'FAIL'}</span>
+      </div>`;
+    }
+    body.innerHTML = `${badges}
+      <pre style="max-height:260px;overflow-y:auto;font-size:12px;line-height:1.5">${esc(raw)}</pre>`;
+    document.getElementById('intr-form-label').textContent =
+      'Reply "accepted" to finish, or describe what to iterate:';
+    document.getElementById('resp-input').placeholder = 'accepted';
+  }
+
+  // Quick-reply buttons + Send button
+  const row = document.getElementById('btn-row');
+  row.innerHTML = '';
+  if (kind === 'plan_approval') {
+    const b = document.createElement('button');
+    b.className   = 'btn-approve';
+    b.textContent = '✓ Approve Plan';
+    b.onclick = () => quickReply('approved');
+    row.appendChild(b);
+  } else if (kind === 'result_review') {
+    const b = document.createElement('button');
+    b.className   = 'btn-approve';
+    b.textContent = '✓ Accept';
+    b.onclick = () => quickReply('accepted');
+    row.appendChild(b);
+  }
+  const send = document.createElement('button');
+  send.className   = 'btn-send';
+  send.textContent = 'Send →';
+  send.onclick     = submitResponse;
+  row.appendChild(send);
+
+  document.getElementById('resp-input').value = '';
+}
+
+// — Completed panel —
+function renderCompletedPanel() {
+  document.getElementById('done-msg').textContent =
+    `Built successfully in ${state.iteration} iteration(s).`;
+  const cidEl = document.getElementById('cflow-id');
+  if (state.chatflowId) {
+    cidEl.textContent    = `Chatflow ID: ${state.chatflowId}`;
+    cidEl.style.display  = 'block';
+  } else {
+    cidEl.style.display  = 'none';
+  }
+  document.getElementById('tok-row').innerHTML = `
+    <span><strong>${state.tokens.input.toLocaleString()}</strong> input tokens</span>
+    <span><strong>${state.tokens.output.toLocaleString()}</strong> output tokens</span>`;
+  document.getElementById('audit-wrap').style.display = 'none';
+}
+
+// ─────────────────────────────────────────────────────────
+//  Session Sidebar
+// ─────────────────────────────────────────────────────────
+async function refreshSessions() {
+  try {
+    const resp = await apiFetch('/sessions');
+    state.sessions = resp.ok ? await resp.json() : [];
+  } catch { state.sessions = []; }
+  renderSessionList();
+}
+
+function renderSessionList() {
+  const list = document.getElementById('session-list');
+  if (!state.sessions.length) {
+    list.innerHTML = '<li style="padding:20px 14px;font-size:12px;color:var(--muted);text-align:center">No sessions yet</li>';
+    return;
+  }
+  const statusColor = s => ({
+    pending_interrupt: 'var(--amber)',
+    completed:         'var(--green)',
+    in_progress:       'var(--blue)',
+  }[s] || 'var(--muted)');
+
+  list.innerHTML = [...state.sessions].reverse().map(s => `
+    <li class="s-item${state.threadId === s.thread_id ? ' active' : ''}"
+        onclick="loadSession('${esc(s.thread_id)}','${esc(s.status)}')">
+      <div class="s-id">
+        <span class="s-dot" style="background:${statusColor(s.status)}"></span>
+        ${esc(s.thread_id.slice(0, 13))}…
+      </div>
+      <div class="s-meta">
+        ${s.chatflow_id ? esc(s.chatflow_id.slice(0, 22)) + '…' : 'no chatflow yet'}
+        &middot; iter ${s.iteration || 0}
+      </div>
+    </li>`).join('');
+}
+
+async function loadSession(id, status) {
+  state.threadId = id;
+  if (status === 'completed') {
+    transition('completed');
+    const resp = await apiFetch(`/sessions/${id}/summary`);
+    if (resp.ok) {
+      const data = await resp.json();
+      const wrap = document.getElementById('audit-wrap');
+      wrap.style.display = 'block';
+      document.getElementById('audit-content').innerHTML =
+        typeof marked !== 'undefined'
+          ? `<div class="md">${marked.parse(data.summary || '')}</div>`
+          : `<pre style="white-space:pre-wrap;font-size:12px">${esc(data.summary || '')}</pre>`;
+    }
+  } else {
+    // Fetch the live state — never resume blindly with an empty response
+    const resp = await apiFetch(`/sessions/${id}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.chatflow_id)         state.chatflowId   = data.chatflow_id;
+    if (data.iteration != null)   state.iteration    = data.iteration;
+    if (data.total_input_tokens)  state.tokens.input  = data.total_input_tokens;
+    if (data.total_output_tokens) state.tokens.output = data.total_output_tokens;
+    if (data.interrupt)           { transition('interrupted', { interruptPayload: data.interrupt }); }
+    else                          { transition('completed'); }
+  }
+  renderSessionList();
+}
+
+// ─────────────────────────────────────────────────────────
+//  Actions
+// ─────────────────────────────────────────────────────────
+async function startSession() {
+  const req = document.getElementById('req-input').value.trim();
+  if (!req) { alert('Please describe what you want to build.'); return; }
+  const trials   = parseInt(document.getElementById('trials-input').value, 10) || 1;
+  const threadId = crypto.randomUUID();
+  state.threadId   = threadId;
+  state.chatflowId = null;
+  state.iteration  = 0;
+  state.tokens     = { input: 0, output: 0 };
+  transition('streaming');
+  await openStream('/sessions/stream', { requirement: req, test_trials: trials, thread_id: threadId });
+  await refreshSessions();
+}
+
+async function submitResponse() {
+  const response = document.getElementById('resp-input').value.trim();
+  if (!response) { alert('Please enter a response.'); return; }
+  if (!state.threadId) return;
+  transition('streaming');
+  await openStream(`/sessions/${state.threadId}/stream`, { response });
+  await refreshSessions();
+}
+
+function quickReply(text) {
+  document.getElementById('resp-input').value = text;
+  submitResponse();
+}
+
+async function viewAuditTrail() {
+  if (!state.threadId) return;
+  const wrap = document.getElementById('audit-wrap');
+  if (wrap.style.display !== 'none') { wrap.style.display = 'none'; return; }
+  document.getElementById('audit-content').innerHTML =
+    '<em style="color:var(--muted)">Loading…</em>';
+  wrap.style.display = 'block';
+  const resp = await apiFetch(`/sessions/${state.threadId}/summary`);
+  if (resp.ok) {
+    const data = await resp.json();
+    document.getElementById('audit-content').innerHTML =
+      typeof marked !== 'undefined'
+        ? `<div class="md">${marked.parse(data.summary || '')}</div>`
+        : `<pre style="white-space:pre-wrap;font-size:12px">${esc(data.summary || '')}</pre>`;
+  } else {
+    document.getElementById('audit-content').innerHTML =
+      '<em style="color:var(--red)">Failed to load audit trail.</em>';
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+//  Event listeners
+// ─────────────────────────────────────────────────────────
+document.getElementById('start-btn').onclick      = startSession;
+document.getElementById('new-session-btn').onclick = () => transition('idle');
+document.getElementById('new-done-btn').onclick   = () => {
+  document.getElementById('audit-wrap').style.display = 'none';
+  transition('idle');
+};
+document.getElementById('audit-btn').onclick = viewAuditTrail;
+document.getElementById('back-btn').onclick  = () => transition('idle');
+document.getElementById('refresh-btn').onclick = refreshSessions;
+
+document.getElementById('req-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) startSession();
+});
+
+// API key persistence
+document.getElementById('api-key-input').value = state.apiKey;
+document.getElementById('api-key-input').addEventListener('input', e => {
+  state.apiKey = e.target.value;
+  localStorage.setItem('flowise_agent_api_key', state.apiKey);
+});
+
+// ─────────────────────────────────────────────────────────
+//  Boot
+// ─────────────────────────────────────────────────────────
+refreshSessions();
+</script>
+</body>
+</html>

@@ -36,4 +36,4 @@ where = ["."]
 include = ["flowise_dev_agent*"]
 
 [tool.setuptools.package-data]
-flowise_dev_agent = ["skills/*.md"]
+flowise_dev_agent = ["skills/*.md", "static/*"]

@@ -160,9 +160,11 @@ NON-NEGOTIABLE RULES:
    create_chatflow or update_chatflow. Fix ALL reported errors before proceeding.
    Never write invalid flowData to Flowise.
 
-After completing the change, confirm:
-- What was changed (brief)
-- The chatflow_id of the updated/created flow
+After completing the change, your final response MUST include this exact line:
+CHATFLOW_ID: <the-exact-uuid-of-the-created-or-updated-chatflow>
+
+Replace <the-exact-uuid...> with the real UUID from the create_chatflow response
+or the chatflow_id you used in update_chatflow. Do not omit this line.
 """
 
 _TEST_BASE = """\
@@ -411,12 +413,26 @@ async def _react(
 # ---------------------------------------------------------------------------
 
 
-def _extract_chatflow_id(messages: list[Message]) -> str | None:
-    """Scan recent tool results for a chatflow 'id' field.
+_CHATFLOW_UUID_RE = re.compile(
+    r'CHATFLOW[_\s-]*ID[:\s]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+    re.IGNORECASE,
+)
 
-    Used by the patch node to capture the chatflow_id when a new chatflow
-    is created or when the existing id needs to be confirmed.
+
+def _extract_chatflow_id(messages: list[Message]) -> str | None:
+    """Scan recent messages for a chatflow id using three fallback passes.
+
+    Pass 1 (highest confidence): tool_result dict with "id" key.
+              Catches create_chatflow and get_chatflow responses.
+    Pass 2: assistant tool_call arguments containing "chatflow_id".
+              Catches update_chatflow calls where the LLM already knew the id
+              (e.g. found via list_chatflows and called update_chatflow directly).
+    Pass 3: LLM final text containing "CHATFLOW_ID: <uuid>".
+              Catches the explicit confirmation line the patch prompt requests.
+
+    The reverse scan means the most recent matching message wins.
     """
+    # Pass 1: tool result dict with "id" field (create_chatflow, get_chatflow responses)
     for msg in reversed(messages):
         if msg.role == "tool_result" and msg.content:
             try:
@@ -425,6 +441,22 @@ def _extract_chatflow_id(messages: list[Message]) -> str | None:
                     return str(data["id"])
             except (json.JSONDecodeError, TypeError):
                 pass
+
+    # Pass 2: chatflow_id passed as argument to update_chatflow / snapshot_chatflow
+    for msg in reversed(messages):
+        if msg.role == "assistant" and msg.tool_calls:
+            for tc in msg.tool_calls:
+                cid = tc.arguments.get("chatflow_id")
+                if cid and isinstance(cid, str):
+                    return cid
+
+    # Pass 3: LLM mentioned "CHATFLOW_ID: <uuid>" in its final text response
+    for msg in reversed(messages):
+        if msg.role == "assistant" and msg.content:
+            m = _CHATFLOW_UUID_RE.search(msg.content)
+            if m:
+                return m.group(1)
+
     return None
 
 
@@ -453,7 +485,9 @@ def _make_discover_node(engine: ReasoningEngine, domains: list[DomainTools]):
         # Discover runs with only the current user message — tool call responses
         # from list_nodes / list_marketplace_templates can be 500k+ tokens and must
         # not accumulate in state["messages"] for downstream phases to inherit.
-        summary, new_msgs, in_tok, out_tok = await _react(engine, [user_msg], system, tool_defs, executor)
+        # max_rounds=20: a 13-node chatflow requires get_node for each type plus
+        # list_chatflows / list_credentials / list_marketplace_templates = 10+ calls.
+        summary, new_msgs, in_tok, out_tok = await _react(engine, [user_msg], system, tool_defs, executor, max_rounds=20)
 
         # Build a per-domain context summary (stored for extensibility / debugging)
         domain_context = dict(state.get("domain_context") or {})
@@ -701,16 +735,26 @@ def _make_patch_node(engine: ReasoningEngine, domains: list[DomainTools]):
             ),
             Message(role="assistant", content=f"Approved plan:\n{state.get('plan') or ''}"),
         ]
+        # max_rounds=15: patch may need list_chatflows + validate_flow_data +
+        # create_chatflow + verify round + final text = 4–5 rounds normally,
+        # but complex 13-node chatflows may require extra validation loops.
         _, new_msgs, in_tok, out_tok = await _react(
             engine,
             ctx + [user_msg],
             system,
             tool_defs,
             executor,
+            max_rounds=15,
         )
 
         # Try to pick up the chatflow_id from tool results (e.g. after create_chatflow)
         chatflow_id = state.get("chatflow_id") or _extract_chatflow_id(new_msgs)
+        logger.info(
+            "[PATCH] chatflow_id=%s (from_state=%s, from_messages=%s)",
+            chatflow_id,
+            state.get("chatflow_id"),
+            _extract_chatflow_id(new_msgs),
+        )
 
         return {
             "messages": [user_msg] + new_msgs,

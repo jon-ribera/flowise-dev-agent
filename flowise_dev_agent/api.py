@@ -458,7 +458,20 @@ def _sse_from_event(event: dict) -> str | None:
         if label:
             return f"data: {json.dumps({'type': 'token', 'content': label})}\n\n"
 
+    elif kind == "on_chain_stream":
+        # Custom events emitted by execute_tool() via get_stream_writer() appear here
+        # when astream_events is called with stream_mode="custom".
+        # chunk is the exact dict passed to the stream writer.
+        chunk = data.get("chunk", {})
+        if isinstance(chunk, dict):
+            ev_type = chunk.get("type")
+            if ev_type == "tool_call":
+                return f"data: {json.dumps({'type': 'tool_call', 'name': chunk.get('name', '')})}\n\n"
+            if ev_type == "tool_result":
+                return f"data: {json.dumps({'type': 'tool_result', 'name': chunk.get('name', ''), 'preview': chunk.get('preview', '')})}\n\n"
+
     elif kind == "on_tool_start":
+        # Fires only for LangChain Tool objects (future proofing)
         return f"data: {json.dumps({'type': 'tool_call', 'name': event.get('name', '')})}\n\n"
 
     elif kind == "on_tool_end":
@@ -832,6 +845,7 @@ async def stream_create_session(request: Request, body: StartSessionRequest) -> 
                 _initial_state(body.requirement, body.test_trials, body.flowise_instance_id, body.webhook_url),
                 config=config,
                 version="v2",
+                stream_mode="custom",
             ):
                 sse = _sse_from_event(event)
                 if sse:
@@ -882,6 +896,7 @@ async def stream_resume_session(
                 Command(resume=body.response),
                 config=config,
                 version="v2",
+                stream_mode="custom",
             ):
                 sse = _sse_from_event(event)
                 if sse:

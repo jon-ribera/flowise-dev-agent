@@ -439,7 +439,16 @@ function shortId(id) { return id ? id.slice(0, 13) + '…' : '—'; }
 // ─────────────────────────────────────────────────────────
 //  SSE via fetch + ReadableStream  (POST-compatible)
 // ─────────────────────────────────────────────────────────
+let _currentReader = null; // track the active SSE reader so we can cancel it on navigation
+
 async function openStream(url, body) {
+  // Cancel any in-flight stream before starting a new one.
+  // Prevents ghost streams from overwriting state when the user navigates sessions.
+  if (_currentReader) {
+    try { _currentReader.cancel(); } catch {}
+    _currentReader = null;
+  }
+
   state.streamBuffer = '';
   state.toolCalls    = [];
   renderStream();
@@ -461,6 +470,7 @@ async function openStream(url, body) {
   }
 
   const reader  = resp.body.getReader();
+  _currentReader = reader;
   const decoder = new TextDecoder();
   let   buf     = '';
 
@@ -479,9 +489,12 @@ async function openStream(url, body) {
       }
     }
   } catch (e) {
-    if (state.phase === 'streaming') {
+    // Ignore cancelled reads — these are intentional (user navigated away).
+    if (state.phase === 'streaming' && e.name !== 'AbortError') {
       transition('error', { error: `Stream interrupted: ${e.message}` });
     }
+  } finally {
+    if (_currentReader === reader) _currentReader = null;
   }
 }
 
@@ -704,7 +717,7 @@ function renderSessionList() {
 
   list.innerHTML = [...state.sessions].reverse().map(s => `
     <li class="s-item${state.threadId === s.thread_id ? ' active' : ''}"
-        onclick="loadSession('${esc(s.thread_id)}','${esc(s.status)}')">
+        onclick="loadSession('${esc(s.thread_id)}')">
       <div class="s-id">
         <span class="s-dot" style="background:${statusColor(s.status)}"></span>
         ${esc(s.thread_id.slice(0, 13))}…
@@ -716,32 +729,52 @@ function renderSessionList() {
     </li>`).join('');
 }
 
-async function loadSession(id, status) {
+async function loadSession(id) {
+  // Cancel any active stream so it can't overwrite this session's state.
+  if (_currentReader) {
+    try { _currentReader.cancel(); } catch {}
+    _currentReader = null;
+  }
   state.threadId = id;
-  if (status === 'completed') {
+
+  // Always fetch the live state — status in the sidebar list can be stale
+  // if the session is still running between checkpoints.
+  const resp = await apiFetch(`/sessions/${id}`);
+  if (!resp.ok) { renderSessionList(); return; }
+  const data = await resp.json();
+
+  if (data.chatflow_id)         state.chatflowId    = data.chatflow_id;
+  if (data.iteration != null)   state.iteration     = data.iteration;
+  if (data.total_input_tokens)  state.tokens.input  = data.total_input_tokens;
+  if (data.total_output_tokens) state.tokens.output = data.total_output_tokens;
+
+  if (data.interrupt) {
+    // Graph is paused at a HITL interrupt — show the card directly.
+    transition('interrupted', { interruptPayload: data.interrupt });
+
+  } else if (data.status === 'completed') {
+    // Session is done — show completion panel and auto-load audit trail.
     transition('completed');
-    const resp = await apiFetch(`/sessions/${id}/summary`);
-    if (resp.ok) {
-      const data = await resp.json();
+    const summResp = await apiFetch(`/sessions/${id}/summary`);
+    if (summResp.ok) {
+      const summData = await summResp.json();
       const wrap = document.getElementById('audit-wrap');
       wrap.style.display = 'block';
       document.getElementById('audit-content').innerHTML =
         typeof marked !== 'undefined'
-          ? `<div class="md">${marked.parse(data.summary || '')}</div>`
-          : `<pre style="white-space:pre-wrap;font-size:12px">${esc(data.summary || '')}</pre>`;
+          ? `<div class="md">${marked.parse(summData.summary || '')}</div>`
+          : `<pre style="white-space:pre-wrap;font-size:12px">${esc(summData.summary || '')}</pre>`;
     }
+
   } else {
-    // Fetch the live state — never resume blindly with an empty response
-    const resp = await apiFetch(`/sessions/${id}`);
-    if (!resp.ok) return;
-    const data = await resp.json();
-    if (data.chatflow_id)         state.chatflowId   = data.chatflow_id;
-    if (data.iteration != null)   state.iteration    = data.iteration;
-    if (data.total_input_tokens)  state.tokens.input  = data.total_input_tokens;
-    if (data.total_output_tokens) state.tokens.output = data.total_output_tokens;
-    if (data.interrupt)           { transition('interrupted', { interruptPayload: data.interrupt }); }
-    else                          { transition('completed'); }
+    // Session is still running (graph mid-execution between checkpoints).
+    // Show the streaming panel with an explanatory note — user can refresh in a moment.
+    state.streamBuffer =
+      '⏳ Session is running in the background.\n\n' +
+      (data.message || 'The agent is working. Refresh in a moment to see the latest state.');
+    transition('streaming');
   }
+
   renderSessionList();
 }
 

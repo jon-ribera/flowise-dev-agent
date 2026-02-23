@@ -762,6 +762,19 @@ def _make_flowise_executor(client: FlowiseClient) -> dict[str, Callable[..., Any
 # ---------------------------------------------------------------------------
 
 
+def _stream_write(payload: dict) -> None:
+    """Emit a custom event to any active LangGraph stream writer.
+
+    Uses get_stream_writer() from langgraph.config, which is a no-op when
+    called outside a LangGraph execution context (e.g. in unit tests).
+    """
+    try:
+        from langgraph.config import get_stream_writer  # noqa: PLC0415
+        get_stream_writer()(payload)
+    except Exception:
+        pass
+
+
 async def execute_tool(
     tool_name: str,
     arguments: dict[str, Any],
@@ -769,23 +782,35 @@ async def execute_tool(
 ) -> Any:
     """Execute a named tool with the given arguments.
 
+    Emits tool_call / tool_result custom events via get_stream_writer() so
+    the SSE stream receives live tool badges for each Flowise API call.
+
     Returns the raw result from the tool callable, or an error dict if the
     tool is unknown or raises an exception.
     """
+    _stream_write({"type": "tool_call", "name": tool_name})
+
     fn = executor.get(tool_name)
     if fn is None:
         logger.warning("Unknown tool requested: %r", tool_name)
-        return {"error": f"Unknown tool: {tool_name!r}. Check available tools for this phase."}
+        result: Any = {"error": f"Unknown tool: {tool_name!r}. Check available tools for this phase."}
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
+        return result
     try:
         result = await fn(**arguments)
         logger.debug("Tool %s(%s) → OK", tool_name, list(arguments.keys()))
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
         return result
     except TypeError as e:
         logger.warning("Tool %s called with wrong arguments %s: %s", tool_name, arguments, e)
-        return {"error": f"Wrong arguments for {tool_name}: {e}"}
+        result = {"error": f"Wrong arguments for {tool_name}: {e}"}
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
+        return result
     except Exception as e:
         logger.warning("Tool %s failed: %s", tool_name, e)
-        return {"error": str(e)}
+        result = {"error": str(e)}
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
+        return result
 
 
 def result_to_str(result: Any) -> str:

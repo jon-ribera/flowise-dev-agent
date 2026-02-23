@@ -308,13 +308,14 @@ def _get_client(request: Request, instance_id: str | None = None):
 # ---------------------------------------------------------------------------
 
 
-def _build_response(graph, config: dict, thread_id: str) -> SessionResponse:
+async def _build_response(graph, config: dict, thread_id: str) -> SessionResponse:
     """Inspect the graph state and build a SessionResponse.
 
     Checks for pending interrupts first. If none, the graph is complete.
+    Uses aget_state (async) because the checkpointer is AsyncSqliteSaver.
     """
     try:
-        snapshot = graph.get_state(config)
+        snapshot = await graph.aget_state(config)
     except Exception as e:
         logger.error("Failed to get graph state for thread %s: %s", thread_id, e)
         raise HTTPException(status_code=500, detail=f"Failed to read session state: {e}")
@@ -543,7 +544,7 @@ async def create_session(request: Request, body: StartSessionRequest) -> Session
         logger.exception("Session %s failed during initial run", thread_id)
         raise HTTPException(status_code=500, detail=str(e))
 
-    return _build_response(graph, config, thread_id)
+    return await _build_response(graph, config, thread_id)
 
 
 @app.post("/sessions/{thread_id}/resume", response_model=SessionResponse, tags=["sessions"], dependencies=[Depends(_verify_api_key)])
@@ -568,7 +569,7 @@ async def resume_session(
 
     # Verify the session exists before resuming
     try:
-        snapshot = graph.get_state(config)
+        snapshot = await graph.aget_state(config)
     except Exception:
         raise HTTPException(status_code=404, detail=f"Session '{thread_id}' not found.")
 
@@ -586,7 +587,7 @@ async def resume_session(
         logger.exception("Session %s failed on resume", thread_id)
         raise HTTPException(status_code=500, detail=str(e))
 
-    return _build_response(graph, config, thread_id)
+    return await _build_response(graph, config, thread_id)
 
 
 @app.get("/sessions/{thread_id}", response_model=SessionResponse, tags=["sessions"], dependencies=[Depends(_verify_api_key)])
@@ -600,11 +601,11 @@ async def get_session(thread_id: str, request: Request) -> SessionResponse:
     config = {"configurable": {"thread_id": thread_id}}
 
     try:
-        graph.get_state(config)
+        await graph.aget_state(config)
     except Exception:
         raise HTTPException(status_code=404, detail=f"Session '{thread_id}' not found.")
 
-    return _build_response(graph, config, thread_id)
+    return await _build_response(graph, config, thread_id)
 
 
 @app.get("/sessions/{thread_id}/summary", tags=["sessions"], dependencies=[Depends(_verify_api_key)])
@@ -619,7 +620,7 @@ async def get_session_summary(thread_id: str, request: Request) -> dict:
     config = {"configurable": {"thread_id": thread_id}}
 
     try:
-        snapshot = graph.get_state(config)
+        snapshot = await graph.aget_state(config)
     except Exception:
         raise HTTPException(status_code=404, detail=f"Session '{thread_id}' not found.")
 
@@ -759,7 +760,7 @@ async def rollback_session(
     config = {"configurable": {"thread_id": thread_id}}
 
     try:
-        snapshot = graph.get_state(config)
+        snapshot = await graph.aget_state(config)
     except Exception:
         raise HTTPException(status_code=404, detail=f"Session '{thread_id}' not found.")
 
@@ -781,7 +782,7 @@ async def rollback_session(
     if "error" in result:
         raise HTTPException(status_code=409, detail=result["error"])
 
-    return _build_response(graph, config, thread_id)
+    return await _build_response(graph, config, thread_id)
 
 
 @app.get("/patterns", tags=["patterns"], dependencies=[Depends(_verify_api_key)])

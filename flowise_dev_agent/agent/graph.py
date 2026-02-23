@@ -38,6 +38,7 @@ See DESIGN_DECISIONS.md — DD-007 through DD-010.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -225,6 +226,29 @@ Use INCOMPLETE when tests were not run or produced no results.
 """
 
 
+async def _fire_webhook(url: str, payload: dict) -> None:
+    """POST an interrupt payload to a developer-supplied webhook URL (DD-037).
+
+    Retries up to 3 times with exponential back-off (1s, 2s, 4s).
+    Failures are logged but never propagate — the webhook is best-effort.
+    """
+    import httpx
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=10) as http:
+                r = await http.post(url, json=payload)
+                r.raise_for_status()
+            logger.debug("Webhook delivered to %s", url)
+            return
+        except Exception as exc:
+            wait = 2 ** attempt
+            logger.warning(
+                "Webhook attempt %d failed (%s); retrying in %ds", attempt + 1, exc, wait
+            )
+            await asyncio.sleep(wait)
+    logger.error("Webhook delivery failed after 3 attempts: %s", url)
+
+
 _CLARIFY_SYSTEM = """
 You are a requirements analyst. Read the developer's requirement and decide if it is
 specific enough to build a correct Flowise chatflow without further information.
@@ -270,12 +294,15 @@ def _make_clarify_node(engine: ReasoningEngine):
             score = 0
 
         if score >= 5:
-            developer_response: str = interrupt({
+            interrupt_payload = {
                 "type": "clarification",
                 "prompt": text,
                 "requirement": state["requirement"],
                 "iteration": 0,
-            })
+            }
+            if state.get("webhook_url"):
+                asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
+            developer_response: str = interrupt(interrupt_payload)
             return {
                 "clarification": developer_response,
                 "total_input_tokens": response.input_tokens,
@@ -460,7 +487,7 @@ def _make_discover_node(engine: ReasoningEngine, domains: list[DomainTools]):
 
 
 def _make_check_credentials_node():
-    def check_credentials(state: AgentState) -> dict:
+    async def check_credentials(state: AgentState) -> dict:
         """HITL checkpoint: prompt developer if required credentials are missing.
 
         Runs between discover and plan. If credentials_missing is non-empty,
@@ -476,21 +503,22 @@ def _make_check_credentials_node():
         if missing:
             missing_list = "\n".join(f"  - {c}" for c in missing)
             logger.info("[CHECK_CREDENTIALS] missing=%r — issuing credential_check interrupt", missing)
-            response: str = interrupt(
-                {
-                    "type": "credential_check",
-                    "prompt": (
-                        f"The following credential types are required but were not found in Flowise:\n"
-                        f"{missing_list}\n\n"
-                        "Please create them in Flowise (Settings → Credentials → Add New), "
-                        "then reply with the credential ID(s) to use.\n"
-                        "Example reply: 'openAIApi credential ID is 513db410-c4c3-4818-a716-6f386aba8a82'\n"
-                        "Or reply 'skip' to proceed without credentials "
-                        "(you can add them manually before testing)."
-                    ),
-                    "missing_credentials": missing,
-                }
-            )
+            interrupt_payload = {
+                "type": "credential_check",
+                "prompt": (
+                    f"The following credential types are required but were not found in Flowise:\n"
+                    f"{missing_list}\n\n"
+                    "Please create them in Flowise (Settings → Credentials → Add New), "
+                    "then reply with the credential ID(s) to use.\n"
+                    "Example reply: 'openAIApi credential ID is 513db410-c4c3-4818-a716-6f386aba8a82'\n"
+                    "Or reply 'skip' to proceed without credentials "
+                    "(you can add them manually before testing)."
+                ),
+                "missing_credentials": missing,
+            }
+            if state.get("webhook_url"):
+                asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
+            response: str = interrupt(interrupt_payload)
             # Store the developer's reply as feedback for the plan node.
             return {"developer_feedback": response}
 
@@ -498,6 +526,32 @@ def _make_check_credentials_node():
         return {}
 
     return check_credentials
+
+
+_ERROR_PLAYBOOK: dict[str, str] = {
+    "CREDENTIAL": (
+        "RECOVERY: The failure is a missing or mis-bound credential. "
+        "In the next Patch: verify the credential ID is set at BOTH data.credential "
+        "AND data.inputs.credential for every node that requires an API key. "
+        "Re-check list_credentials before patching."
+    ),
+    "STRUCTURE": (
+        "RECOVERY: The failure is a structural flowData issue. "
+        "In the next Patch: call validate_flow_data and fix ALL reported errors before "
+        "calling update_chatflow. Ensure every node has inputAnchors, inputParams, "
+        "outputAnchors, and outputs. Ensure minimum flow_data is {'nodes':[],'edges':[]}."
+    ),
+    "LOGIC": (
+        "RECOVERY: The failure is a logic error (wrong prompt, wrong model config, "
+        "incorrect chain/agent type). Review the test failure message carefully "
+        "and change only the specific node/param that caused it."
+    ),
+    "INCOMPLETE": (
+        "RECOVERY: The chatflow is incomplete or untestable. "
+        "Verify the chatflow was deployed (deployed:true) and the correct chatflow_id "
+        "was used in predictions. Re-run list_chatflows if unsure."
+    ),
+}
 
 
 def _make_plan_node(engine: ReasoningEngine, domains: list[DomainTools]):
@@ -548,6 +602,13 @@ def _make_plan_node(engine: ReasoningEngine, domains: list[DomainTools]):
                     + (fixes_text if fixes_text else "")
                 ).strip(),
             ))
+            # Inject error recovery playbook hint (DD-038).
+            # Maps failure category → targeted repair instructions so the plan node
+            # gets concrete, pre-validated fix guidance rather than reasoning from scratch.
+            category = cv.get("category", "INCOMPLETE")
+            playbook_hint = _ERROR_PLAYBOOK.get(category, "")
+            if playbook_hint:
+                ctx.append(Message(role="user", content=playbook_hint))
 
         response = await engine.complete(
             messages=ctx + [user_msg],
@@ -569,7 +630,7 @@ def _make_plan_node(engine: ReasoningEngine, domains: list[DomainTools]):
 
 
 def _make_human_plan_approval_node():
-    def human_plan_approval(state: AgentState) -> dict:
+    async def human_plan_approval(state: AgentState) -> dict:
         """INTERRUPT: surface plan to developer and wait for approval or feedback.
 
         The graph pauses here. The calling application receives the interrupt
@@ -582,7 +643,7 @@ def _make_human_plan_approval_node():
         """
         logger.info("[HUMAN PLAN APPROVAL] waiting for developer input")
 
-        developer_response: str = interrupt({
+        interrupt_payload = {
             "type": "plan_approval",
             "plan": state["plan"],
             "iteration": state.get("iteration", 0),
@@ -591,7 +652,10 @@ def _make_human_plan_approval_node():
                 "Reply 'approved' to proceed with implementation, "
                 "or describe what needs to change."
             ),
-        })
+        }
+        if state.get("webhook_url"):
+            asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
+        developer_response: str = interrupt(interrupt_payload)
 
         approved = developer_response.strip().lower() in (
             "approved", "approve", "yes", "y", "ok", "looks good", "lgtm", "proceed"
@@ -811,7 +875,7 @@ def _make_converge_node(
 
 
 def _make_human_result_review_node():
-    def human_result_review(state: AgentState) -> dict:
+    async def human_result_review(state: AgentState) -> dict:
         """INTERRUPT: surface test results to developer. Accept or iterate.
 
         Resume values:
@@ -820,7 +884,7 @@ def _make_human_result_review_node():
         """
         logger.info("[HUMAN RESULT REVIEW] waiting for developer input")
 
-        developer_response: str = interrupt({
+        interrupt_payload = {
             "type": "result_review",
             "test_results": state.get("test_results"),
             "chatflow_id": state.get("chatflow_id"),
@@ -830,7 +894,10 @@ def _make_human_result_review_node():
                 "Review the test results above.\n"
                 "Reply 'accepted' to finish, or describe what to change for another iteration."
             ),
-        })
+        }
+        if state.get("webhook_url"):
+            asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
+        developer_response: str = interrupt(interrupt_payload)
 
         accepted = developer_response.strip().lower() in (
             "accepted", "accept", "done", "yes", "y", "looks good", "lgtm", "ship it"

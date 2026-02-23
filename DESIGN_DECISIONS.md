@@ -770,3 +770,89 @@ session-start endpoints is the minimum viable protection with negligible impleme
   for single-instance deployments.
 - Token-bucket per API key: more precise but requires tracking state per key; IP-based
   limiting is sufficient for the single-tenant use case.
+
+---
+
+## DD-037 — Webhook Callbacks for HITL Interrupts
+
+**Date**: 2026-02-22
+**Decision**: When a developer provides a `webhook_url` at session start, the agent
+POSTs the interrupt payload to that URL immediately before calling `interrupt()` at
+every HITL pause point (`clarification`, `credential_check`, `plan_approval`,
+`result_review`). The POST is fire-and-forget — it is scheduled as an
+`asyncio.create_task()` and retried up to 3 times with exponential back-off (1s, 2s, 4s).
+Delivery failures are logged but never propagate to the graph.
+
+**New state field**: `AgentState.webhook_url: str | None` — stored in the checkpoint
+so the value is available at every node, including after server restarts.
+
+**Reason**: Without webhooks, developers must poll `/sessions/{id}` to detect
+interrupts. This wastes resources and adds latency. A webhook turns the HITL flow
+into a push notification: CI pipelines, Slack bots, and custom UIs can react
+immediately without polling.
+
+**Implementation**:
+- `_fire_webhook(url, payload)` coroutine in `graph.py` — `httpx.AsyncClient` POST
+  with 10-second timeout; 3-attempt retry loop with `asyncio.sleep(2^attempt)`.
+- `asyncio.create_task(_fire_webhook(...))` called before every `interrupt()` when
+  `state.get("webhook_url")` is set. The task runs independently; graph execution
+  is not blocked.
+- All four HITL nodes (`clarify`, `check_credentials`, `human_plan_approval`,
+  `human_result_review`) converted to `async def` to support `create_task()` and
+  unified with the existing async node pattern.
+- `webhook_url: str | None` added to `StartSessionRequest` and `_initial_state()`.
+- `httpx>=0.27` added to `pyproject.toml` dependencies.
+
+**Security note**: The URL is caller-supplied and not validated beyond being a
+non-empty string. Operators running in untrusted multi-tenant environments should
+add URL allowlist validation in `_fire_webhook` before deploying.
+
+**Rejected alternatives**:
+- Blocking `await _fire_webhook(...)`: would add up to 7 seconds of latency before
+  the interrupt fires when the webhook endpoint is slow.
+- WebSocket push: stateful, requires a long-lived connection, not composable with
+  the existing HTTP interrupt/resume flow.
+- Polling endpoint on the agent side: inverts the notification model; callers can
+  still poll `/sessions/{id}` as a fallback.
+
+---
+
+## DD-038 — Error Recovery Playbook
+
+**Date**: 2026-02-22
+**Decision**: Add a static `_ERROR_PLAYBOOK: dict[str, str]` lookup table in
+`graph.py` that maps each converge failure category (`CREDENTIAL`, `STRUCTURE`,
+`LOGIC`, `INCOMPLETE`) to a targeted, pre-validated repair instruction. When the
+plan node enters an ITERATE cycle with a known category, the matching playbook
+entry is appended to the plan context as an additional `user` message.
+
+**Reason**: The converge node already classifies failures into four categories
+(DD-019). Without the playbook, the plan node receives only the structured verdict
+(`CONVERGE VERDICT [CREDENTIAL]: ...`) and must reason about the fix from first
+principles on every iteration. This wastes tokens and increases iteration count.
+The playbook converts each category into a concrete, step-by-step repair procedure
+that the plan node can apply directly, dramatically reducing the probability of
+repeating the same mistake.
+
+**Implementation**:
+- `_ERROR_PLAYBOOK` constant defined above `_make_plan_node` in `graph.py`.
+- Inside `_make_plan_node`, after appending the CONVERGE VERDICT message, the
+  category is looked up in `_ERROR_PLAYBOOK`. If a hint exists, it is appended
+  as a second `Message(role="user", ...)` so the LLM receives both the verdict
+  and the targeted fix guidance before generating the revised plan.
+- No new state fields — the playbook is stateless and consulted on every ITERATE cycle.
+
+**Playbook entries**:
+- `CREDENTIAL` — verifies dual-binding at `data.credential` and `data.inputs.credential`.
+- `STRUCTURE` — mandates `validate_flow_data` before every write, enforces minimum
+  `{"nodes":[],"edges":[]}` shape, and checks required data keys.
+- `LOGIC` — scopes the change to the specific failing node/param from the test output.
+- `INCOMPLETE` — verifies `deployed:true` and correct `chatflow_id` via `list_chatflows`.
+
+**Rejected alternatives**:
+- Dynamic playbook from a database: the four failure categories are stable and
+  well-understood; a static dict is sufficient and zero-latency.
+- Injecting hints in the converge system prompt: converge evaluates, plan repairs;
+  keeping the playbook in the plan node respects the evaluator-optimizer separation.
+- Per-failure-message prompting (not categorised): the existing category classification
+  already provides the right granularity; the playbook just adds the action to take.

@@ -121,6 +121,14 @@ class AgentState(TypedDict):
     developer_feedback: str | None
 
     # -----------------------------------------------------------------------
+    # Webhook callbacks (DD-037)
+    # -----------------------------------------------------------------------
+
+    # Optional URL to POST interrupt payloads to.
+    # None = no webhook. Set via StartSessionRequest.webhook_url.
+    webhook_url: str | None
+
+    # -----------------------------------------------------------------------
     # Requirement clarification (DD-033)
     # -----------------------------------------------------------------------
 

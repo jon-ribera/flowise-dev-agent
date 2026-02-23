@@ -194,6 +194,14 @@ class StartSessionRequest(BaseModel):
             "See DESIGN_DECISIONS.md — DD-032."
         ),
     )
+    webhook_url: str | None = Field(
+        None,
+        description=(
+            "Optional HTTPS URL to POST interrupt payloads to (DD-037). "
+            "Called when clarification, credential_check, plan_approval, or "
+            "result_review interrupts fire. Retried up to 3 times on failure."
+        ),
+    )
 
 
 class ResumeSessionRequest(BaseModel):
@@ -374,6 +382,7 @@ def _initial_state(
     requirement: str,
     test_trials: int = 1,
     flowise_instance_id: str | None = None,
+    webhook_url: str | None = None,
 ) -> dict:
     """Build the initial AgentState dict for a new session."""
     return {
@@ -386,6 +395,7 @@ def _initial_state(
         "iteration": 0,
         "done": False,
         "developer_feedback": None,
+        "webhook_url": webhook_url,
         "clarification": None,
         "credentials_missing": None,
         "converge_verdict": None,
@@ -500,7 +510,7 @@ async def create_session(request: Request, body: StartSessionRequest) -> Session
 
     try:
         await graph.ainvoke(
-            _initial_state(body.requirement, body.test_trials, body.flowise_instance_id),
+            _initial_state(body.requirement, body.test_trials, body.flowise_instance_id, body.webhook_url),
             config=config,
         )
     except Exception as e:
@@ -766,7 +776,7 @@ async def stream_create_session(request: Request, body: StartSessionRequest) -> 
     async def event_stream():
         try:
             async for event in graph.astream_events(
-                _initial_state(body.requirement, body.test_trials, body.flowise_instance_id),
+                _initial_state(body.requirement, body.test_trials, body.flowise_instance_id, body.webhook_url),
                 config=config,
                 version="v2",
             ):

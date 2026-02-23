@@ -31,8 +31,8 @@ POST /sessions/stream  {"requirement": "Build a customer support chatbot with GP
   ⏸ INTERRUPT: plan_approval  ← Developer reviews and approves (or requests changes)
          │
   ┌──────▼──────┐
-  │    PATCH    │  Minimal write: snapshot → get_chatflow → create/update_chatflow
-  └──────┬──────┘
+  │    PATCH    │  LLM emits Patch IR ops → deterministic compiler → WriteGuard → write
+  └──────┬──────┘   (snapshot first; legacy LLM-JSON path available when capabilities=None)
          │
   ┌──────▼──────┐
   │    TEST     │  Happy-path + edge-case predictions with unique sessionIds
@@ -263,10 +263,23 @@ curl http://localhost:8000/instances
 | `check_credentials` | Validation | HITL interrupt if required credentials are missing from Flowise |
 | `plan` | Planning | Creates structured plan (Goal/Inputs/Outputs/Constraints/Success Criteria) |
 | `human_plan_approval` | HITL | Developer reviews and approves plan before any writes |
-| `patch` | Write | Snapshots existing chatflow, validates flowData, creates/updates chatflow |
+| `patch` | Write | Snapshot → LLM emits Patch IR ops → compiler derives flowData → WriteGuard → write (DD-051, DD-052) |
 | `test` | Validation | Runs happy-path and edge-case predictions with unique sessionIds |
 | `converge` | Evaluation | Structured verdict: DONE or ITERATE with Category/Reason/Fix |
 | `human_result_review` | HITL | Developer accepts result or requests another iteration |
+
+### Patch IR + Deterministic Compiler (DD-051, DD-052)
+
+When `build_graph(capabilities=[FlowiseCapability(...)])` is used, the `patch` node follows a
+structured pipeline instead of asking the LLM to write raw flowData JSON:
+
+1. **LLM emits ops only** — `AddNode / SetParam / Connect / BindCredential` in JSON; no handle IDs, no edge IDs
+2. **IR validation** — `validate_patch_ops()` catches dangling refs and duplicate node IDs before compilation
+3. **Deterministic compiler** — `compile_patch_ops()` reads the existing chatflow as a `GraphIR`, resolves anchor handle IDs from node schemas, and produces `flowData + payload_hash + diff_summary`
+4. **Structural gate** — `_validate_flow_data()` must pass (same poka-yoke check as the legacy path)
+5. **WriteGuard** — `create_chatflow` / `update_chatflow` are blocked unless the payload hash matches the hash recorded at validation time; prevents any mutation between validation and write
+
+The legacy LLM-JSON patch path is unchanged and is selected when `capabilities=None` (default).
 
 ### Evaluator-Optimizer Feedback Loop
 
@@ -340,9 +353,18 @@ No build step, no Node.js, no dependencies. Single HTML file served by FastAPI.
 │       │                                     │
 │  DomainCapability layer (DD-046)            │
 │  ├── FlowiseCapability  ← ToolRegistry      │
-│  │                        (namespaced,      │
-│  │                         DD-049)          │
+│  │   discover + compile_ops + validate      │
+│  │   (namespaced, DD-049)                   │
 │  └── WorkdayCapability (stub, DD-047)       │
+│                                             │
+│  Patch IR + compiler (DD-051)               │
+│  ├── patch_ir.py  — AddNode/SetParam/       │
+│  │                  Connect/BindCredential  │
+│  └── compiler.py  — GraphIR + compile_      │
+│                     patch_ops() → hash      │
+│                                             │
+│  WriteGuard (DD-052)                        │
+│  └── SHA-256 gate before every write        │
 │                                             │
 │  ToolResult envelope (DD-048)               │
 │  └── execute_tool() → compact summary only  │
@@ -453,4 +475,4 @@ of context bloat at the tool execution boundary.
 - [cursorwise](https://github.com/jon-ribera/cursorwise) — Flowise MCP server for Cursor IDE (dependency)
 - [Flowise](https://github.com/FlowiseAI/Flowise) — the chatflow platform this agent builds on
 - [ROADMAP2.md](ROADMAP2.md) — next-wave enhancement backlog
-- [roadmap3_architecture_optimization.md](roadmap3_architecture_optimization.md) — Architecture blueprint: M1 ToolResult + ToolRegistry + DomainCapability (complete), M2 Patch IR (next), M3 Workday + cross-domain (future)
+- [roadmap3_architecture_optimization.md](roadmap3_architecture_optimization.md) — Architecture blueprint: M1 ToolResult + ToolRegistry + DomainCapability (complete), M2 Patch IR + deterministic compiler + WriteGuard (complete), M3 Workday + cross-domain (future)

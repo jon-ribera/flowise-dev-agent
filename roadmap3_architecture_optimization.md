@@ -80,11 +80,104 @@ AgentState (state.py):
 ### Milestone Path
 
 ```
-Now:   Flowise (external agent) → scaffolding + ToolResult + Registry + DomainCapability
-Next:  Workday (discover-only stub) → real tools when MCP available
-Later: Patch IR + deterministic compiler → predictable patch operations
-Far:   Embedded UX + cross-domain planner
+M1 ✅: ToolResult + ToolRegistry + DomainCapability + State trifurcation (scaffolding)
+M2 ✅: Patch IR schema + deterministic compiler + WriteGuard (predictable patching)
+M3:    Real Workday MCP + cross-domain planner
+Far:   Embedded UX + PatternCapability migration
 ```
+
+---
+
+## Before vs After: Patching Architecture
+
+### Legacy approach (LLM authors Flowise artifacts)
+
+```
+USER REQUEST
+     |
+     v
+DISCOVER (tools) ------------------------------+
+     |                                         |
+     v                                         |
+LLM CONTEXT = summaries + (often) big blobs   |
+     |                                         |
+     v                                         |
+PLAN (text plan)                               |
+     |                                         |
+     v                                         |
+PATCH (LLM writes/rewrites flowData JSON)      |
+     |                                         |
+     v                                         |
+(OPTIONAL) validate_flow_data (structural) ----+
+     |
+     v
+WRITE to Flowise (create/update chatflow)
+     |
+     v
+TEST (LLM/tool-driven, variable inputs)
+     |
+     v
+CONVERGE (LLM decides DONE/ITERATE)
+     |
+     v
+HITL REVIEW (plan approval + final review)
+```
+
+**Where correctness lives:** prompts + LLM's JSON generation quality.
+**Typical failure mode:** "almost valid" JSON (wrong handles/anchors/IDs) slips through; iterations are
+token-heavy because full artifacts are repeatedly re-ingested and rewritten.
+
+---
+
+### New approach (Patch IR + deterministic compiler)
+
+```
+USER REQUEST
+     |
+     v
+DISCOVER (namespaced tools) -> ToolResult(summary+facts, raw->debug)
+     |
+     v
+CANONICAL STATE UPDATE
+artifacts[domain] + facts[domain] (+ debug transcripts)
+     |
+     v
+PLAN (LLM outputs: structured plan + constraints)
+     |
+     v
+PATCH (LLM outputs Patch IR ops ONLY)
+     |
+     v
+DETERMINISTIC COMPILER
+ops + Graph IR + node schemas -> flowData + payload_hash + diff_summary
+     |
+     v
+TWO-STAGE VALIDATION
+IR validation + validate_flow_data -> ValidationReport(validated_hash)
+     |
+     v
+WRITE GUARD (hard gate)
+only write if validated_hash == payload_hash (same iteration)
+     |
+     v
+WRITE to Flowise (create/update chatflow)
+     |
+     v
+TEST (tests generated from artifacts/facts, pass^k supported)
+     |
+     v
+CONVERGE (structured verdict grounded in test summaries + hashes)
+     |
+     v
+HITL REVIEW (plan approval + final review, aided by diff_summary)
+```
+
+**Where correctness lives:** deterministic compiler + validators + hash-bound write guards.
+**Primary benefit:** incremental, low-token, auditable changes; clearer multi-domain scaling because
+domains compile/validate deterministically rather than relying on prompt compliance.
+
+> **Note:** The new path is active when `build_graph(capabilities=[FlowiseCapability(...)])`.
+> The legacy path remains fully intact when `capabilities=None` (default).
 
 ---
 
@@ -128,8 +221,8 @@ class DomainCapability(ABC):
     @property def domain_tools(self) -> DomainTools: ... # wrapped DomainTools
 
     async def discover(self, context) -> DomainDiscoveryResult: ...
-    async def compile_ops(self, plan) -> DomainPatchResult: ...   # STUB M1
-    async def validate(self, artifacts) -> ValidationReport: ...  # STUB M1
+    async def compile_ops(self, plan) -> DomainPatchResult: ...   # real in M2 (FlowiseCapability)
+    async def validate(self, artifacts) -> ValidationReport: ...  # real in M2 (FlowiseCapability)
     async def generate_tests(self, plan) -> TestSuite: ...
     async def evaluate(self, results) -> Verdict: ...
 ```
@@ -139,8 +232,8 @@ class DomainCapability(ABC):
 | Model | Fields | Used By |
 |-------|--------|---------|
 | `DomainDiscoveryResult` | summary, facts, artifacts, debug, tool_results | discover node → state |
-| `DomainPatchResult` | stub=True *(M1 only)* | compile_ops stub |
-| `ValidationReport` | stub=True *(M1 only)* | validate stub |
+| `DomainPatchResult` | ops, compile_result, validation_report, message | compile_ops → patch node |
+| `ValidationReport` | valid, validated_payload_hash, errors, node_count, edge_count | validate → WriteGuard |
 | `TestSuite` | happy_question, edge_question, domain_name | test node |
 | `Verdict` | done, verdict, category, reason, fixes | converge node; .to_dict()/.from_dict() ↔ legacy |
 
@@ -189,7 +282,7 @@ The `converge_verdict` state field continues to receive `.to_dict()` output for 
 4. **Dual-key executor**: `executor(phase)` always includes both the namespaced key and the simple key. Old code using bare names never breaks.
 5. **State separation**: `artifacts`, `facts`, `debug` use `_merge_domain_dict` — domain keys are merged, never globally overwritten.
 6. **Capability opt-in**: `build_graph(capabilities=None)` → all behavior is identical to pre-refactor. The capability path is additive.
-7. **No Patch IR**: `compile_ops()` and `validate()` return stubs in Milestone 1. They exist in the interface to make it clear they will be implemented in Milestone 2.
+7. **Patch IR path opt-in**: `compile_ops()` and `validate()` are stub-only for `WorkdayCapability`. `FlowiseCapability` provides real implementations (M2). Activated via `build_graph(capabilities=[...])`.
 8. **HITL unchanged**: All four interrupt points (clarify, credential_check, plan_approval, result_review) are untouched.
 
 ---

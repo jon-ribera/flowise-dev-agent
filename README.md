@@ -31,8 +31,8 @@ POST /sessions/stream  {"requirement": "Build a customer support chatbot with GP
   ⏸ INTERRUPT: plan_approval  ← Developer reviews and approves (or requests changes)
          │
   ┌──────▼──────┐
-  │    PATCH    │  LLM emits Patch IR ops → deterministic compiler → WriteGuard → write
-  └──────┬──────┘   (snapshot first; legacy LLM-JSON path available when capabilities=None)
+  │    PATCH    │  Snapshot → Patch IR ops → deterministic compiler → WriteGuard → write
+  └──────┬──────┘
          │
   ┌──────▼──────┐
   │    TEST     │  Happy-path + edge-case predictions with unique sessionIds
@@ -263,23 +263,23 @@ curl http://localhost:8000/instances
 | `check_credentials` | Validation | HITL interrupt if required credentials are missing from Flowise |
 | `plan` | Planning | Creates structured plan (Goal/Inputs/Outputs/Constraints/Success Criteria) |
 | `human_plan_approval` | HITL | Developer reviews and approves plan before any writes |
-| `patch` | Write | Snapshot → LLM emits Patch IR ops → compiler derives flowData → WriteGuard → write (DD-051, DD-052) |
+| `patch` | Write | Snapshot → compile Patch IR ops → WriteGuard → create/update chatflow (DD-051, DD-052) |
 | `test` | Validation | Runs happy-path and edge-case predictions with unique sessionIds |
 | `converge` | Evaluation | Structured verdict: DONE or ITERATE with Category/Reason/Fix |
 | `human_result_review` | HITL | Developer accepts result or requests another iteration |
 
 ### Patch IR + Deterministic Compiler (DD-051, DD-052)
 
-When `build_graph(capabilities=[FlowiseCapability(...)])` is used, the `patch` node follows a
-structured pipeline instead of asking the LLM to write raw flowData JSON:
+The `patch` node pipeline when `build_graph(capabilities=[FlowiseCapability(...)])`:
 
-1. **LLM emits ops only** — `AddNode / SetParam / Connect / BindCredential` in JSON; no handle IDs, no edge IDs
-2. **IR validation** — `validate_patch_ops()` catches dangling refs and duplicate node IDs before compilation
-3. **Deterministic compiler** — `compile_patch_ops()` reads the existing chatflow as a `GraphIR`, resolves anchor handle IDs from node schemas, and produces `flowData + payload_hash + diff_summary`
-4. **Structural gate** — `_validate_flow_data()` must pass (same poka-yoke check as the legacy path)
-5. **WriteGuard** — `create_chatflow` / `update_chatflow` are blocked unless the payload hash matches the hash recorded at validation time; prevents any mutation between validation and write
+1. **Snapshot** — save existing chatflow before any changes
+2. **LLM emits ops only** — `AddNode / SetParam / Connect / BindCredential` in JSON; no handle IDs, no edge IDs
+3. **IR validation** — `validate_patch_ops()` catches dangling refs and duplicate node IDs before compilation
+4. **Deterministic compiler** — `compile_patch_ops()` reads the existing chatflow as a `GraphIR`, resolves anchor handle IDs from node schemas, and produces `flowData + payload_hash + diff_summary`
+5. **Structural gate** — `_validate_flow_data()` must pass (same poka-yoke check as the legacy path)
+6. **WriteGuard** — `create_chatflow` / `update_chatflow` are blocked unless the payload hash matches the hash recorded at validation time; prevents any mutation between validation and write
 
-The legacy LLM-JSON patch path is unchanged and is selected when `capabilities=None` (default).
+When `capabilities=None` (default), the original LLM-JSON patch path runs unchanged.
 
 ### Evaluator-Optimizer Feedback Loop
 

@@ -413,12 +413,30 @@ def _initial_state(
 # ---------------------------------------------------------------------------
 
 
+_NODE_PROGRESS: dict[str, str] = {
+    "clarify":             "\n--- Clarifying requirement ---\n",
+    "discover":            "\n--- Discovering Flowise environment ---\n",
+    "check_credentials":   "\n--- Checking credentials ---\n",
+    "plan":                "\n--- Planning chatflow architecture ---\n",
+    "patch":               "\n--- Patching chatflow ---\n",
+    "test":                "\n--- Running test cases ---\n",
+    "converge":            "\n--- Evaluating test results ---\n",
+}
+
+
 def _sse_from_event(event: dict) -> str | None:
-    """Convert a LangGraph astream_events v2 event to an SSE data line, or None to skip."""
+    """Convert a LangGraph astream_events v2 event to an SSE data line, or None to skip.
+
+    The custom ReasoningEngine bypasses LangChain's ChatModel layer, so
+    on_chat_model_stream events are never emitted.  We instead surface
+    on_chain_start events for named graph nodes as phase-progress tokens
+    so the developer sees live feedback while the graph runs.
+    """
     kind = event.get("event")
     data = event.get("data", {})
 
     if kind == "on_chat_model_stream":
+        # Fires only when a LangChain ChatModel is used directly (future proofing).
         chunk = data.get("chunk")
         if chunk is None:
             return None
@@ -431,6 +449,13 @@ def _sse_from_event(event: dict) -> str | None:
             )
         if content:
             return f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
+
+    elif kind == "on_chain_start":
+        # Emit a progress line whenever a named graph node starts executing.
+        node = event.get("metadata", {}).get("langgraph_node", "")
+        label = _NODE_PROGRESS.get(node)
+        if label:
+            return f"data: {json.dumps({'type': 'token', 'content': label})}\n\n"
 
     elif kind == "on_tool_start":
         return f"data: {json.dumps({'type': 'tool_call', 'name': event.get('name', '')})}\n\n"
@@ -800,6 +825,7 @@ async def stream_create_session(request: Request, body: StartSessionRequest) -> 
     logger.info("Streaming new session %s: %r", thread_id, body.requirement[:80])
 
     async def event_stream():
+        yield ": connected\n\n"  # flush immediately so the browser sees open connection
         try:
             async for event in graph.astream_events(
                 _initial_state(body.requirement, body.test_trials, body.flowise_instance_id, body.webhook_url),
@@ -815,7 +841,11 @@ async def stream_create_session(request: Request, body: StartSessionRequest) -> 
             logger.exception("SSE stream failed for new session %s", thread_id)
             yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/sessions/{thread_id}/stream", tags=["sessions"], dependencies=[Depends(_verify_api_key)])
@@ -845,6 +875,7 @@ async def stream_resume_session(
     logger.info("Streaming resume session %s: %r", thread_id, body.response[:80])
 
     async def event_stream():
+        yield ": connected\n\n"  # flush immediately so the browser sees open connection
         try:
             async for event in graph.astream_events(
                 Command(resume=body.response),
@@ -860,7 +891,11 @@ async def stream_resume_session(
             logger.exception("SSE stream failed for session %s", thread_id)
             yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ---------------------------------------------------------------------------

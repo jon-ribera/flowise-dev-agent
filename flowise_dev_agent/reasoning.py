@@ -83,6 +83,8 @@ class EngineResponse:
     content: str | None
     tool_calls: list[ToolCall] = field(default_factory=list)
     stop_reason: str = "end_turn"  # "end_turn" | "tool_use" | "max_tokens"
+    input_tokens: int = 0    # prompt tokens consumed
+    output_tokens: int = 0   # completion tokens generated
 
     @property
     def has_tool_calls(self) -> bool:
@@ -214,6 +216,8 @@ class ClaudeEngine(ReasoningEngine):
             content=content_text,
             tool_calls=tool_calls,
             stop_reason=response.stop_reason or "end_turn",
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
         )
 
 
@@ -340,10 +344,13 @@ class OpenAIEngine(ReasoningEngine):
                     arguments=json.loads(tc.function.arguments),
                 ))
 
+        usage = response.usage
         return EngineResponse(
             content=msg.content,
             tool_calls=tool_calls,
             stop_reason="tool_use" if tool_calls else "end_turn",
+            input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+            output_tokens=getattr(usage, "completion_tokens", 0) or 0,
         )
 
 

@@ -32,6 +32,11 @@ def _append_messages(existing: list[Message], incoming: list[Message] | None) ->
     return existing + (incoming or [])
 
 
+def _sum_int(existing: int, incoming: int) -> int:
+    """Accumulate an integer counter across node updates (used for token totals)."""
+    return (existing or 0) + (incoming or 0)
+
+
 # ---------------------------------------------------------------------------
 # State schema
 # ---------------------------------------------------------------------------
@@ -116,6 +121,22 @@ class AgentState(TypedDict):
     developer_feedback: str | None
 
     # -----------------------------------------------------------------------
+    # Webhook callbacks (DD-037)
+    # -----------------------------------------------------------------------
+
+    # Optional URL to POST interrupt payloads to.
+    # None = no webhook. Set via StartSessionRequest.webhook_url.
+    webhook_url: str | None
+
+    # -----------------------------------------------------------------------
+    # Requirement clarification (DD-033)
+    # -----------------------------------------------------------------------
+
+    # Clarifying answers provided by developer before discover.
+    # None = no clarification needed or SKIP_CLARIFICATION=true.
+    clarification: str | None
+
+    # -----------------------------------------------------------------------
     # Credential status (set once during discover, persists across iterations)
     # -----------------------------------------------------------------------
 
@@ -146,6 +167,14 @@ class AgentState(TypedDict):
     test_trials: int
 
     # -----------------------------------------------------------------------
+    # Multi-instance routing (DD-032)
+    # -----------------------------------------------------------------------
+
+    # ID of the Flowise instance this session targets (from FlowiseClientPool).
+    # None = use the default instance. Set at session start; never changed.
+    flowise_instance_id: str | None
+
+    # -----------------------------------------------------------------------
     # Multi-domain context (extensibility for Workday v2)
     # -----------------------------------------------------------------------
 
@@ -153,3 +182,11 @@ class AgentState(TypedDict):
     # Keys: domain name ("flowise", "workday"). Values: domain-specific summary.
     # Each discover iteration merges into this dict.
     domain_context: dict[str, str]
+
+    # -----------------------------------------------------------------------
+    # Token usage (accumulated across all LLM calls in this session)
+    # -----------------------------------------------------------------------
+
+    # Uses _sum_int reducer — each node adds its delta; LangGraph accumulates.
+    total_input_tokens: Annotated[int, _sum_int]
+    total_output_tokens: Annotated[int, _sum_int]

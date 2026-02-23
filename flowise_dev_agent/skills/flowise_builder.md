@@ -254,6 +254,89 @@ seqStart → supervisor → worker_1
 Always call `get_node` on each AGENTFLOW node type before building — their inputAnchors
 and outputAnchors differ from standard Chatflow nodes.
 
+### Rule 11: RAG — Upsert Before Query
+
+For any RAG flow with a VectorStore, always upsert documents BEFORE testing predictions.
+A new VectorStore is empty — queries return empty results until data is loaded.
+
+**Upsert pattern**:
+1. After creating or modifying the chatflow, call `upsert_vector(chatflow_id)` to load documents
+2. Verify upsert succeeded (check response for document count or success status)
+3. Then run `create_prediction` to test retrieval
+
+**When to upsert**:
+- After creating a new RAG chatflow
+- After changing the DocumentLoader source URL/file
+- After changing chunk size or embeddings model
+- Any time you suspect the vector store is stale
+
+**Error patterns**:
+- `"No vector node found"` → the chatflow has no VectorStore node (wrong flow type, skip upsert)
+- Empty prediction response after upsert → check embeddings model credential binding
+
+### Rule 12: OpenAI Assistant Node
+
+The `openAIAssistant` node wraps the OpenAI Assistants API. It requires:
+
+- `details` field MUST be a JSON string, not a nested object:
+  ```json
+  {"details": "{\"assistantId\": \"asst_...\"}"}
+  ```
+  Sending `details` as a dict causes `"[object Object]" is not valid JSON`.
+- The assistant must already exist in your OpenAI account.
+  Use `get_node("openAIAssistant")` to verify the exact `inputs` schema before building.
+- Credential: `openAIApi` — bind at BOTH `data.credential` AND `data.inputs.credential`.
+
+**When to use**: The requirement explicitly asks for OpenAI Assistants (file search,
+code interpreter, or a pre-configured assistant personality). For general conversation,
+use `conversationChain` + `chatOpenAI` instead (simpler, cheaper).
+
+### Rule 13: Custom Tool Node
+
+Custom tools let agents call external APIs. Required fields:
+
+- `color`: MUST be a hex color string (e.g. `"#4CAF50"`).
+  Missing color causes `NOT NULL constraint failed: tool.color` (HTTP 500).
+- `schema`: JSON Schema string describing the tool's input parameters.
+- `func`: JavaScript function body that calls the external API.
+
+**Example node data**:
+```json
+{
+  "name": "getWeather",
+  "description": "Get current weather for a city",
+  "color": "#4CAF50",
+  "schema": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}",
+  "func": "const resp = await fetch(`https://api.weather.com/v1/${city}`); return resp.json();"
+}
+```
+
+Call `get_node("customTool")` to verify exact schema before building.
+
+### Rule 14: Pattern Library — Reuse Before Building
+
+At the start of every Discover phase, call `search_patterns(keywords)` with
+3–5 key terms from the requirement before doing any other discovery.
+
+**Why**: Patterns are proven working flowData from past successful sessions.
+Reusing a pattern skips the list_nodes/get_node/validate cycle and produces
+a higher-confidence result on the first iteration.
+
+**Decision tree**:
+1. `search_patterns("customer support GPT-4o memory")` → returns match
+2. If `success_count ≥ 2`: strongly prefer this pattern; note it in the plan
+3. Call `use_pattern(id)` to record reuse
+4. In Patch: use the pattern's `flow_data` as the base; modify only what differs
+5. If no match: proceed with normal discovery
+
+**When NOT to reuse**:
+- The requirement explicitly asks for a different model, memory type, or architecture
+- The pattern's requirement_text differs significantly (different domain/purpose)
+- The pattern has no `flow_data` (legacy record)
+
+**Pattern save**: After every DONE verdict the agent automatically saves the
+new pattern. You do not need to call any tool to save it.
+
 ### After patching
 Confirm:
 - The chatflow_id of the created/updated flow
@@ -292,6 +375,25 @@ Final line must be:
 ### Multi-turn conversation testing
 To simulate a real conversation, use the same sessionId across multiple
 `create_prediction` calls sequentially. Verify the chatflow remembers context.
+
+### Rule 15: Your Role in the Test Phase Is Evaluation Only (DD-040)
+
+The agent does **not** invoke `create_prediction` itself in the Test phase.
+Predictions are dispatched in parallel by the framework before you receive this context.
+You will be given the raw API responses for:
+
+- **Happy-path trial(s)**: requirement-driven input, sessionId `test-<id>-happy-t<N>`
+- **Edge-case trial(s)**: empty/boundary input, sessionId `test-<id>-edge-t<N>`
+
+Your job is to **evaluate** these responses, not to call any tools.
+
+Evaluation criteria:
+1. Did the response address the input meaningfully? (not empty, not an error trace)
+2. Does the response satisfy the SUCCESS CRITERIA from the approved plan?
+3. If `test_trials > 1`, ALL trials must pass for the test to count as PASS.
+
+Do **not** call `create_prediction`, `get_chatflow`, or any other tool.
+Produce only your evaluation report ending with the required RESULT line.
 
 ---
 

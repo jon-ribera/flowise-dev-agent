@@ -38,6 +38,7 @@ See DESIGN_DECISIONS.md — DD-007 through DD-010.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -159,9 +160,11 @@ NON-NEGOTIABLE RULES:
    create_chatflow or update_chatflow. Fix ALL reported errors before proceeding.
    Never write invalid flowData to Flowise.
 
-After completing the change, confirm:
-- What was changed (brief)
-- The chatflow_id of the updated/created flow
+After completing the change, your final response MUST include this exact line:
+CHATFLOW_ID: <the-exact-uuid-of-the-created-or-updated-chatflow>
+
+Replace <the-exact-uuid...> with the real UUID from the create_chatflow response
+or the chatflow_id you used in update_chatflow. Do not omit this line.
 """
 
 _TEST_BASE = """\
@@ -225,6 +228,98 @@ Use INCOMPLETE when tests were not run or produced no results.
 """
 
 
+async def _fire_webhook(url: str, payload: dict) -> None:
+    """POST an interrupt payload to a developer-supplied webhook URL (DD-037).
+
+    Retries up to 3 times with exponential back-off (1s, 2s, 4s).
+    Failures are logged but never propagate — the webhook is best-effort.
+    """
+    import httpx
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=10) as http:
+                r = await http.post(url, json=payload)
+                r.raise_for_status()
+            logger.debug("Webhook delivered to %s", url)
+            return
+        except Exception as exc:
+            wait = 2 ** attempt
+            logger.warning(
+                "Webhook attempt %d failed (%s); retrying in %ds", attempt + 1, exc, wait
+            )
+            await asyncio.sleep(wait)
+    logger.error("Webhook delivery failed after 3 attempts: %s", url)
+
+
+_CLARIFY_SYSTEM = """
+You are a requirements analyst. Read the developer's requirement and decide if it is
+specific enough to build a correct Flowise chatflow without further information.
+
+Score ambiguity 0–10 (0 = fully specified, 10 = completely unclear).
+If score >= 5, output exactly 2–3 YES/NO or short-answer questions that would resolve
+the ambiguity. Focus on: LLM provider, memory requirements, new vs modify, RAG needed.
+If score < 5, output: CLEAR
+
+Format:
+SCORE: N
+QUESTIONS:
+1. ...
+2. ...
+"""
+
+
+def _make_clarify_node(engine: ReasoningEngine):
+    async def clarify(state: AgentState) -> dict:
+        """Pre-discover: ask clarifying questions if requirement is ambiguous (DD-033).
+
+        Scores requirement ambiguity 0-10. If score >= 5, issues a HITL interrupt
+        with 2-3 targeted questions. Bypassed when SKIP_CLARIFICATION=true.
+        """
+        import os
+        if os.getenv("SKIP_CLARIFICATION", "").lower() in ("true", "1", "yes"):
+            return {"clarification": None}
+
+        response = await engine.complete(
+            messages=[Message(role="user", content=state["requirement"])],
+            system=_CLARIFY_SYSTEM,
+            tools=None,
+        )
+        text = (response.content or "").strip()
+
+        if text.upper().startswith("SCORE"):
+            score_line = text.splitlines()[0]
+            try:
+                score = int(score_line.split(":")[1].strip())
+            except (IndexError, ValueError):
+                score = 0
+        else:
+            score = 0
+
+        if score >= 5:
+            interrupt_payload = {
+                "type": "clarification",
+                "prompt": text,
+                "requirement": state["requirement"],
+                "iteration": 0,
+            }
+            if state.get("webhook_url"):
+                asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
+            developer_response: str = interrupt(interrupt_payload)
+            return {
+                "clarification": developer_response,
+                "total_input_tokens": response.input_tokens,
+                "total_output_tokens": response.output_tokens,
+            }
+
+        return {
+            "clarification": None,
+            "total_input_tokens": response.input_tokens,
+            "total_output_tokens": response.output_tokens,
+        }
+
+    return clarify
+
+
 def _build_system_prompt(base: str, domains: list[DomainTools], phase: str) -> str:
     """Combine the base system prompt with all domain-specific context additions."""
     extra = merge_context(domains, phase)
@@ -245,7 +340,7 @@ async def _react(
     tools: list[ToolDef],
     executor: dict[str, Any],
     max_rounds: int = 8,
-) -> tuple[str, list[Message]]:
+) -> tuple[str, list[Message], int, int]:
     """Run the LLM in a ReAct loop until it produces a text response.
 
     Each round:
@@ -262,10 +357,13 @@ async def _react(
         max_rounds: Safety cap to prevent runaway loops.
 
     Returns:
-        (final_text, new_messages_produced_in_this_loop)
+        (final_text, new_messages_produced_in_this_loop, input_tokens, output_tokens)
         new_messages includes assistant turns and tool result turns.
+        input_tokens/output_tokens are the cumulative totals across all rounds.
     """
     new_msgs: list[Message] = []
+    total_in = 0
+    total_out = 0
 
     for round_num in range(max_rounds):
         response = await engine.complete(
@@ -273,13 +371,15 @@ async def _react(
             system=system,
             tools=tools or None,
         )
+        total_in += response.input_tokens
+        total_out += response.output_tokens
 
         if not response.has_tool_calls:
             # LLM gave a text answer — loop complete
             final_text = response.content or ""
             new_msgs.append(Message(role="assistant", content=final_text))
-            logger.debug("ReAct complete after %d round(s)", round_num + 1)
-            return final_text, new_msgs
+            logger.debug("ReAct complete after %d round(s): in=%d out=%d", round_num + 1, total_in, total_out)
+            return final_text, new_msgs, total_in, total_out
 
         # LLM requested tool calls
         logger.debug("ReAct round %d: %d tool call(s)", round_num + 1, len(response.tool_calls))
@@ -305,7 +405,7 @@ async def _react(
     )
     new_msgs.append(Message(role="assistant", content=timeout_msg))
     logger.warning("ReAct loop hit max_rounds (%d)", max_rounds)
-    return timeout_msg, new_msgs
+    return timeout_msg, new_msgs, total_in, total_out
 
 
 # ---------------------------------------------------------------------------
@@ -313,12 +413,26 @@ async def _react(
 # ---------------------------------------------------------------------------
 
 
-def _extract_chatflow_id(messages: list[Message]) -> str | None:
-    """Scan recent tool results for a chatflow 'id' field.
+_CHATFLOW_UUID_RE = re.compile(
+    r'CHATFLOW[_\s-]*ID[:\s]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+    re.IGNORECASE,
+)
 
-    Used by the patch node to capture the chatflow_id when a new chatflow
-    is created or when the existing id needs to be confirmed.
+
+def _extract_chatflow_id(messages: list[Message]) -> str | None:
+    """Scan recent messages for a chatflow id using three fallback passes.
+
+    Pass 1 (highest confidence): tool_result dict with "id" key.
+              Catches create_chatflow and get_chatflow responses.
+    Pass 2: assistant tool_call arguments containing "chatflow_id".
+              Catches update_chatflow calls where the LLM already knew the id
+              (e.g. found via list_chatflows and called update_chatflow directly).
+    Pass 3: LLM final text containing "CHATFLOW_ID: <uuid>".
+              Catches the explicit confirmation line the patch prompt requests.
+
+    The reverse scan means the most recent matching message wins.
     """
+    # Pass 1: tool result dict with "id" field (create_chatflow, get_chatflow responses)
     for msg in reversed(messages):
         if msg.role == "tool_result" and msg.content:
             try:
@@ -327,6 +441,22 @@ def _extract_chatflow_id(messages: list[Message]) -> str | None:
                     return str(data["id"])
             except (json.JSONDecodeError, TypeError):
                 pass
+
+    # Pass 2: chatflow_id passed as argument to update_chatflow / snapshot_chatflow
+    for msg in reversed(messages):
+        if msg.role == "assistant" and msg.tool_calls:
+            for tc in msg.tool_calls:
+                cid = tc.arguments.get("chatflow_id")
+                if cid and isinstance(cid, str):
+                    return cid
+
+    # Pass 3: LLM mentioned "CHATFLOW_ID: <uuid>" in its final text response
+    for msg in reversed(messages):
+        if msg.role == "assistant" and msg.content:
+            m = _CHATFLOW_UUID_RE.search(msg.content)
+            if m:
+                return m.group(1)
+
     return None
 
 
@@ -346,6 +476,8 @@ def _make_discover_node(engine: ReasoningEngine, domains: list[DomainTools]):
         logger.info("[DISCOVER] iteration=%d", iteration)
 
         user_content = f"My requirement:\n{state['requirement']}"
+        if state.get("clarification"):
+            user_content += f"\n\nClarifications provided:\n{state['clarification']}"
         if state.get("developer_feedback"):
             user_content += f"\n\nDeveloper feedback from previous iteration:\n{state['developer_feedback']}"
 
@@ -353,7 +485,9 @@ def _make_discover_node(engine: ReasoningEngine, domains: list[DomainTools]):
         # Discover runs with only the current user message — tool call responses
         # from list_nodes / list_marketplace_templates can be 500k+ tokens and must
         # not accumulate in state["messages"] for downstream phases to inherit.
-        summary, new_msgs = await _react(engine, [user_msg], system, tool_defs, executor)
+        # max_rounds=20: a 13-node chatflow requires get_node for each type plus
+        # list_chatflows / list_credentials / list_marketplace_templates = 10+ calls.
+        summary, new_msgs, in_tok, out_tok = await _react(engine, [user_msg], system, tool_defs, executor, max_rounds=20)
 
         # Build a per-domain context summary (stored for extensibility / debugging)
         domain_context = dict(state.get("domain_context") or {})
@@ -379,13 +513,15 @@ def _make_discover_node(engine: ReasoningEngine, domains: list[DomainTools]):
             "discovery_summary": summary,
             "domain_context": domain_context,
             "credentials_missing": credentials_missing,
+            "total_input_tokens": in_tok,
+            "total_output_tokens": out_tok,
         }
 
     return discover
 
 
 def _make_check_credentials_node():
-    def check_credentials(state: AgentState) -> dict:
+    async def check_credentials(state: AgentState) -> dict:
         """HITL checkpoint: prompt developer if required credentials are missing.
 
         Runs between discover and plan. If credentials_missing is non-empty,
@@ -401,21 +537,22 @@ def _make_check_credentials_node():
         if missing:
             missing_list = "\n".join(f"  - {c}" for c in missing)
             logger.info("[CHECK_CREDENTIALS] missing=%r — issuing credential_check interrupt", missing)
-            response: str = interrupt(
-                {
-                    "type": "credential_check",
-                    "prompt": (
-                        f"The following credential types are required but were not found in Flowise:\n"
-                        f"{missing_list}\n\n"
-                        "Please create them in Flowise (Settings → Credentials → Add New), "
-                        "then reply with the credential ID(s) to use.\n"
-                        "Example reply: 'openAIApi credential ID is 513db410-c4c3-4818-a716-6f386aba8a82'\n"
-                        "Or reply 'skip' to proceed without credentials "
-                        "(you can add them manually before testing)."
-                    ),
-                    "missing_credentials": missing,
-                }
-            )
+            interrupt_payload = {
+                "type": "credential_check",
+                "prompt": (
+                    f"The following credential types are required but were not found in Flowise:\n"
+                    f"{missing_list}\n\n"
+                    "Please create them in Flowise (Settings → Credentials → Add New), "
+                    "then reply with the credential ID(s) to use.\n"
+                    "Example reply: 'openAIApi credential ID is 513db410-c4c3-4818-a716-6f386aba8a82'\n"
+                    "Or reply 'skip' to proceed without credentials "
+                    "(you can add them manually before testing)."
+                ),
+                "missing_credentials": missing,
+            }
+            if state.get("webhook_url"):
+                asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
+            response: str = interrupt(interrupt_payload)
             # Store the developer's reply as feedback for the plan node.
             return {"developer_feedback": response}
 
@@ -423,6 +560,32 @@ def _make_check_credentials_node():
         return {}
 
     return check_credentials
+
+
+_ERROR_PLAYBOOK: dict[str, str] = {
+    "CREDENTIAL": (
+        "RECOVERY: The failure is a missing or mis-bound credential. "
+        "In the next Patch: verify the credential ID is set at BOTH data.credential "
+        "AND data.inputs.credential for every node that requires an API key. "
+        "Re-check list_credentials before patching."
+    ),
+    "STRUCTURE": (
+        "RECOVERY: The failure is a structural flowData issue. "
+        "In the next Patch: call validate_flow_data and fix ALL reported errors before "
+        "calling update_chatflow. Ensure every node has inputAnchors, inputParams, "
+        "outputAnchors, and outputs. Ensure minimum flow_data is {'nodes':[],'edges':[]}."
+    ),
+    "LOGIC": (
+        "RECOVERY: The failure is a logic error (wrong prompt, wrong model config, "
+        "incorrect chain/agent type). Review the test failure message carefully "
+        "and change only the specific node/param that caused it."
+    ),
+    "INCOMPLETE": (
+        "RECOVERY: The chatflow is incomplete or untestable. "
+        "Verify the chatflow was deployed (deployed:true) and the correct chatflow_id "
+        "was used in predictions. Re-run list_chatflows if unsure."
+    ),
+}
 
 
 def _make_plan_node(engine: ReasoningEngine, domains: list[DomainTools]):
@@ -473,6 +636,13 @@ def _make_plan_node(engine: ReasoningEngine, domains: list[DomainTools]):
                     + (fixes_text if fixes_text else "")
                 ).strip(),
             ))
+            # Inject error recovery playbook hint (DD-038).
+            # Maps failure category → targeted repair instructions so the plan node
+            # gets concrete, pre-validated fix guidance rather than reasoning from scratch.
+            category = cv.get("category", "INCOMPLETE")
+            playbook_hint = _ERROR_PLAYBOOK.get(category, "")
+            if playbook_hint:
+                ctx.append(Message(role="user", content=playbook_hint))
 
         response = await engine.complete(
             messages=ctx + [user_msg],
@@ -486,13 +656,15 @@ def _make_plan_node(engine: ReasoningEngine, domains: list[DomainTools]):
             "messages": [user_msg, assistant_msg],
             "plan": plan_text,
             "developer_feedback": None,  # consumed; clear it
+            "total_input_tokens": response.input_tokens,
+            "total_output_tokens": response.output_tokens,
         }
 
     return plan
 
 
 def _make_human_plan_approval_node():
-    def human_plan_approval(state: AgentState) -> dict:
+    async def human_plan_approval(state: AgentState) -> dict:
         """INTERRUPT: surface plan to developer and wait for approval or feedback.
 
         The graph pauses here. The calling application receives the interrupt
@@ -505,7 +677,7 @@ def _make_human_plan_approval_node():
         """
         logger.info("[HUMAN PLAN APPROVAL] waiting for developer input")
 
-        developer_response: str = interrupt({
+        interrupt_payload = {
             "type": "plan_approval",
             "plan": state["plan"],
             "iteration": state.get("iteration", 0),
@@ -514,7 +686,10 @@ def _make_human_plan_approval_node():
                 "Reply 'approved' to proceed with implementation, "
                 "or describe what needs to change."
             ),
-        })
+        }
+        if state.get("webhook_url"):
+            asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
+        developer_response: str = interrupt(interrupt_payload)
 
         approved = developer_response.strip().lower() in (
             "approved", "approve", "yes", "y", "ok", "looks good", "lgtm", "proceed"
@@ -560,67 +735,145 @@ def _make_patch_node(engine: ReasoningEngine, domains: list[DomainTools]):
             ),
             Message(role="assistant", content=f"Approved plan:\n{state.get('plan') or ''}"),
         ]
-        _, new_msgs = await _react(
+        # max_rounds=15: patch may need list_chatflows + validate_flow_data +
+        # create_chatflow + verify round + final text = 4–5 rounds normally,
+        # but complex 13-node chatflows may require extra validation loops.
+        _, new_msgs, in_tok, out_tok = await _react(
             engine,
             ctx + [user_msg],
             system,
             tool_defs,
             executor,
+            max_rounds=15,
         )
 
         # Try to pick up the chatflow_id from tool results (e.g. after create_chatflow)
         chatflow_id = state.get("chatflow_id") or _extract_chatflow_id(new_msgs)
+        logger.info(
+            "[PATCH] chatflow_id=%s (from_state=%s, from_messages=%s)",
+            chatflow_id,
+            state.get("chatflow_id"),
+            _extract_chatflow_id(new_msgs),
+        )
 
         return {
             "messages": [user_msg] + new_msgs,
             "chatflow_id": chatflow_id,
+            "total_input_tokens": in_tok,
+            "total_output_tokens": out_tok,
         }
 
     return patch
 
 
 def _make_test_node(engine: ReasoningEngine, domains: list[DomainTools]):
-    tool_defs, executor = merge_tools(domains, "test")
+    _, executor = merge_tools(domains, "test")
     system = _build_system_prompt(_TEST_BASE, domains, "test")
 
     async def test(state: AgentState) -> dict:
-        """Phase 4: Run happy-path and edge-case predictions."""
-        iteration = state.get("iteration", 0)
-        logger.info("[TEST] iteration=%d chatflow_id=%s", iteration, state.get("chatflow_id"))
+        """Phase 4: Run happy-path and edge-case predictions in parallel (DD-040).
 
-        chatflow_id = state.get("chatflow_id", "unknown — extract from recent tool results")
+        Predictions are dispatched concurrently via asyncio.gather() — the LLM
+        is not used to invoke tools; it is called once at the end to evaluate
+        the raw API responses.  This removes one full ReAct round-trip and
+        eliminates the risk of the LLM choosing the wrong sessionId format.
+
+        When test_trials > 1 all (happy × trials) + (edge × trials) tasks are
+        gathered in a single batch, giving maximum parallelism.
+        """
+        iteration = state.get("iteration", 0)
+        chatflow_id = state.get("chatflow_id")
         trials = state.get("test_trials", 1)
-        trials_instruction = (
-            f"Run each test {trials} time(s) with different sessionIds. "
-            f"A test PASSES only if ALL {trials} trial(s) pass (pass^{trials} reliability). "
-            "Report each trial result separately."
-            if trials > 1
-            else "Run each test once."
+        logger.info("[TEST] iteration=%d chatflow_id=%s trials=%d", iteration, chatflow_id, trials)
+
+        # Guard: cannot run predictions without a valid chatflow ID.
+        # Return a clear failure string so converge is forced to ITERATE.
+        if not chatflow_id:
+            logger.warning("[TEST] chatflow_id is not set — skipping predictions")
+            no_id_msg = (
+                "Chatflow: (not created)\n\n"
+                "TEST: HAPPY PATH\n"
+                "  Trial 1: SKIPPED — chatflow_id is None; the patch phase did not create or "
+                "capture the chatflow ID. create_chatflow must be called and its returned id "
+                "stored before predictions can run.\n\n"
+                "TEST: EDGE CASE\n"
+                "  Trial 1: SKIPPED — same reason as above.\n\n"
+                "RESULT: HAPPY PATH [FAIL] | EDGE CASE [FAIL]"
+            )
+            return {
+                "messages": [],
+                "test_results": no_id_msg,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+            }
+
+        async def _run_trial(label: str, question: str, trial_num: int) -> str:
+            session_id = f"test-{chatflow_id}-{label}-t{trial_num}"
+            result = await execute_tool(
+                "create_prediction",
+                {
+                    "chatflow_id": chatflow_id,
+                    "question": question,
+                    "override_config": json.dumps({"sessionId": session_id}),
+                },
+                executor,
+            )
+            return result_to_str(result)
+
+        happy_question = state["requirement"][:100]
+        edge_question = ""  # empty input is the boundary / edge case
+
+        happy_tasks = [_run_trial("happy", happy_question, i + 1) for i in range(trials)]
+        edge_tasks  = [_run_trial("edge",  edge_question,  i + 1) for i in range(trials)]
+
+        # Dispatch all predictions in parallel; exceptions are captured, not raised.
+        all_results = await asyncio.gather(*happy_tasks, *edge_tasks, return_exceptions=True)
+        happy_results: list = list(all_results[:trials])
+        edge_results:  list = list(all_results[trials:])
+
+        def _format_trials(label: str, results: list) -> str:
+            lines = [f"TEST: {label.upper()} PATH"]
+            for i, r in enumerate(results):
+                prefix = f"  Trial {i + 1}: "
+                if isinstance(r, Exception):
+                    lines.append(f"{prefix}ERROR — {r}")
+                else:
+                    lines.append(f"{prefix}{str(r)[:500]}")
+            return "\n".join(lines)
+
+        raw_results = (
+            f"Chatflow: {chatflow_id}\n\n"
+            f"{_format_trials('happy', happy_results)}\n\n"
+            f"{_format_trials('edge', edge_results)}"
         )
-        user_msg = Message(
+
+        # LLM used only for evaluation — no tool access (tools=None).
+        eval_msg = Message(
             role="user",
             content=(
-                f"Chatflow to test: {chatflow_id}\n\n"
-                "Run the happy-path test and the edge-case test. "
-                "Use unique sessionIds in override_config for both. "
-                f"{trials_instruction} "
-                "Report PASS/FAIL for each."
+                f"Evaluate these test results for requirement:\n{state['requirement']}\n\n"
+                f"{raw_results}\n\n"
+                f"Trials per test: {trials}. "
+                f"A test PASSES only if ALL {trials} trial(s) pass (pass^{trials} reliability).\n"
+                "Report PASS/FAIL for each test with brief reasoning.\n"
+                "Final line must be: RESULT: HAPPY PATH [PASS/FAIL] | EDGE CASE [PASS/FAIL]"
             ),
         )
-
-        # Test only needs the chatflow_id (already in user_msg). No prior tool
-        # call history required — _react will make its own create_prediction calls.
-        text, new_msgs = await _react(
-            engine,
-            [user_msg],
-            system,
-            tool_defs,
-            executor,
+        response = await engine.complete(
+            messages=[eval_msg],
+            system=system,
+            tools=None,
         )
+        eval_text = response.content or ""
+
+        user_msg   = Message(role="user",      content=raw_results)
+        asst_msg   = Message(role="assistant", content=eval_text)
 
         return {
-            "messages": [user_msg] + new_msgs,
-            "test_results": text,
+            "messages": [user_msg, asst_msg],
+            "test_results": eval_text,
+            "total_input_tokens":  response.input_tokens,
+            "total_output_tokens": response.output_tokens,
         }
 
     return test
@@ -649,7 +902,11 @@ def _parse_converge_verdict(text: str) -> dict:
     return v
 
 
-def _make_converge_node(engine: ReasoningEngine):
+def _make_converge_node(
+    engine: ReasoningEngine,
+    client: "FlowiseClient | None" = None,
+    pattern_store=None,
+):
     async def converge(state: AgentState) -> dict:
         """Phase 5: Evaluate Definition of Done. Returns done=True or loops.
 
@@ -657,6 +914,9 @@ def _make_converge_node(engine: ReasoningEngine):
           {"verdict": "DONE"|"ITERATE", "category": ..., "reason": ..., "fixes": [...]}
         The plan node reads converge_verdict to inject specific repair instructions
         into the next planning context (evaluator-optimizer feedback loop).
+
+        When the verdict is DONE and a pattern_store is provided, the agent
+        auto-saves the successful chatflow pattern for future reuse (DD-031).
         """
         iteration = state.get("iteration", 0)
         logger.info("[CONVERGE] iteration=%d", iteration)
@@ -686,21 +946,74 @@ def _make_converge_node(engine: ReasoningEngine):
         verdict_dict = _parse_converge_verdict(raw_verdict)
         is_done = verdict_dict["verdict"] == "DONE"
 
+        # Safety net 1: no chatflow → cannot be DONE
+        if is_done and not state.get("chatflow_id"):
+            logger.warning("[CONVERGE] LLM said DONE but chatflow_id is missing — forcing ITERATE")
+            is_done = False
+            verdict_dict = {
+                "verdict": "ITERATE",
+                "category": "INCOMPLETE",
+                "reason": "chatflow_id is not set — patch phase did not create/capture the chatflow",
+                "fixes": [
+                    "Call create_chatflow with the full node graph from the plan",
+                    "Extract the id field from the API response and use it in all predict calls",
+                ],
+            }
+
+        # Safety net 2: explicit [FAIL] markers in test results → cannot be DONE
+        if is_done and state.get("test_results"):
+            tr_upper = state["test_results"].upper()
+            if "[FAIL]" in tr_upper or "SKIPPED" in tr_upper:
+                logger.warning("[CONVERGE] LLM said DONE but test_results contain [FAIL] — forcing ITERATE")
+                is_done = False
+                verdict_dict = {
+                    "verdict": "ITERATE",
+                    "category": "LOGIC",
+                    "reason": "Test results contain explicit [FAIL] — DoD not met",
+                    "fixes": [
+                        "Verify the chatflow ID is correct and the chatflow is deployed",
+                        "Re-run predictions using the captured chatflow ID",
+                    ],
+                }
+
         assistant_msg = Message(role="assistant", content=raw_verdict)
         logger.info("[CONVERGE] verdict=%r done=%s", verdict_dict, is_done)
+
+        # Auto-save pattern when DONE (DD-031)
+        if is_done and pattern_store and client:
+            chatflow_id = state.get("chatflow_id")
+            requirement = state.get("requirement", "")
+            if chatflow_id and requirement:
+                try:
+                    chatflow = await client.get_chatflow(chatflow_id)
+                    flow_data = chatflow.get("flowData", "") if isinstance(chatflow, dict) else ""
+                    name = (
+                        chatflow.get("name") if isinstance(chatflow, dict) else None
+                    ) or requirement[:60]
+                    await pattern_store.save_pattern(
+                        name=name,
+                        requirement_text=requirement,
+                        flow_data=flow_data,
+                        chatflow_id=chatflow_id,
+                    )
+                    logger.info("[CONVERGE] Pattern saved for chatflow %s", chatflow_id)
+                except Exception as exc:
+                    logger.warning("[CONVERGE] Pattern save failed (non-fatal): %s", exc)
 
         return {
             "messages": [user_msg, assistant_msg],
             "done": is_done,
             "iteration": iteration + 1,
             "converge_verdict": verdict_dict if not is_done else None,
+            "total_input_tokens": response.input_tokens,
+            "total_output_tokens": response.output_tokens,
         }
 
     return converge
 
 
 def _make_human_result_review_node():
-    def human_result_review(state: AgentState) -> dict:
+    async def human_result_review(state: AgentState) -> dict:
         """INTERRUPT: surface test results to developer. Accept or iterate.
 
         Resume values:
@@ -709,7 +1022,7 @@ def _make_human_result_review_node():
         """
         logger.info("[HUMAN RESULT REVIEW] waiting for developer input")
 
-        developer_response: str = interrupt({
+        interrupt_payload = {
             "type": "result_review",
             "test_results": state.get("test_results"),
             "chatflow_id": state.get("chatflow_id"),
@@ -719,7 +1032,10 @@ def _make_human_result_review_node():
                 "Review the test results above.\n"
                 "Reply 'accepted' to finish, or describe what to change for another iteration."
             ),
-        })
+        }
+        if state.get("webhook_url"):
+            asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
+        developer_response: str = interrupt(interrupt_payload)
 
         accepted = developer_response.strip().lower() in (
             "accepted", "accept", "done", "yes", "y", "looks good", "lgtm", "ship it"
@@ -775,17 +1091,24 @@ def build_graph(
     engine: ReasoningEngine,
     domains: list[DomainTools],
     checkpointer=None,
+    client: "FlowiseClient | None" = None,
+    pattern_store=None,
 ):
     """Construct and compile the Flowise Builder co-pilot LangGraph.
 
     Args:
-        engine:       Reasoning engine (LLM provider). Use create_engine(settings).
-        domains:      List of DomainTools plugins. v1: [FloviseDomain(client)].
-                      v2 (Workday): [FloviseDomain(client), WorkdayDomain(workday_client)].
-        checkpointer: LangGraph checkpointer for persistence + HITL support.
-                      Defaults to MemorySaver (in-memory, suitable for development).
-                      For production: use SqliteSaver or PostgresSaver.
-                      See DESIGN_DECISIONS.md — DD-010.
+        engine:        Reasoning engine (LLM provider). Use create_engine(settings).
+        domains:       List of DomainTools plugins. v1: [FloviseDomain(client)].
+                       v2 (Workday): [FloviseDomain(client), WorkdayDomain(workday_client)].
+        checkpointer:  LangGraph checkpointer for persistence + HITL support.
+                       Defaults to MemorySaver (in-memory, suitable for development).
+                       For production: use SqliteSaver or PostgresSaver.
+                       See DESIGN_DECISIONS.md — DD-010.
+        client:        Optional FlowiseClient passed to converge for pattern auto-save.
+                       Required when pattern_store is provided (DD-031).
+        pattern_store: Optional PatternStore for pattern library (DD-031).
+                       When provided, PatternDomain is auto-appended to domains,
+                       and converge auto-saves patterns after DONE verdicts.
 
     Returns:
         Compiled LangGraph graph ready for ainvoke() / invoke().
@@ -795,20 +1118,28 @@ def build_graph(
         checkpointer = MemorySaver()
         logger.info("Using MemorySaver checkpointer (in-memory, dev mode)")
 
+    # Auto-inject PatternDomain when a pattern_store is provided (DD-031)
+    if pattern_store is not None:
+        from flowise_dev_agent.agent.tools import PatternDomain
+        domains = list(domains) + [PatternDomain(pattern_store)]
+        logger.info("PatternDomain injected into domains list")
+
     builder = StateGraph(AgentState)
 
     # Register all nodes
+    builder.add_node("clarify",             _make_clarify_node(engine))
     builder.add_node("discover",            _make_discover_node(engine, domains))
     builder.add_node("check_credentials",   _make_check_credentials_node())
     builder.add_node("plan",                _make_plan_node(engine, domains))
     builder.add_node("human_plan_approval", _make_human_plan_approval_node())
     builder.add_node("patch",               _make_patch_node(engine, domains))
     builder.add_node("test",                _make_test_node(engine, domains))
-    builder.add_node("converge",            _make_converge_node(engine))
+    builder.add_node("converge",            _make_converge_node(engine, client=client, pattern_store=pattern_store))
     builder.add_node("human_result_review", _make_human_result_review_node())
 
     # Fixed edges (always taken)
-    builder.add_edge(START, "discover")
+    builder.add_edge(START, "clarify")
+    builder.add_edge("clarify", "discover")
     builder.add_edge("discover", "check_credentials")  # credential gate before plan
     builder.add_edge("check_credentials", "plan")
     builder.add_edge("plan", "human_plan_approval")

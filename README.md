@@ -475,4 +475,6 @@ of context bloat at the tool execution boundary.
 - [cursorwise](https://github.com/jon-ribera/cursorwise) — Flowise MCP server for Cursor IDE (dependency)
 - [Flowise](https://github.com/FlowiseAI/Flowise) — the chatflow platform this agent builds on
 - [ROADMAP2.md](ROADMAP2.md) — next-wave enhancement backlog
-- [roadmap3_architecture_optimization.md](roadmap3_architecture_optimization.md) — Architecture blueprint: M1 ToolResult + ToolRegistry + DomainCapability (complete), M2 Patch IR + deterministic compiler + WriteGuard (complete), M3 Workday + cross-domain (future)
+- [roadmap3_architecture_optimization.md](roadmap3_architecture_optimization.md) — Architecture blueprint: M1 ToolResult + ToolRegistry + DomainCapability (complete), M2 Patch IR + deterministic compiler + WriteGuard (complete)
+- [roadmap4_workday_cross_domain.md](roadmap4_workday_cross_domain.md) — M4.1 Workday MCP wiring, M4.2 cross-domain planner, M4.3 PatternCapability (planning)
+- [roadmap5_embedded_ux.md](roadmap5_embedded_ux.md) — M5.1 `/sessions/complete` + auto_approve, M5.2 Custom Tool template, M5.3 TypeScript Custom Node (planning; independent of R4)

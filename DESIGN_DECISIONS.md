@@ -936,3 +936,302 @@ remove the extra ReAct round-trips, and cut test-phase latency roughly in half.
   ignored and predictions would still run sequentially.
 - Running happy and edge tests as separate graph nodes: would complicate the graph
   topology for a problem that is cleanly solved at the Python level with gather.
+
+---
+
+## DD-046 — DomainCapability ABC (Behavioral Domain Plugin Contract)
+
+**Date**: 2026-02-23
+**Decision**: Introduce `DomainCapability` as the primary abstraction boundary for
+domain plugins. It wraps a `DomainTools` data descriptor and adds a typed behavioral
+lifecycle: `discover()`, `compile_ops()`, `validate()`, `generate_tests()`, `evaluate()`.
+Concrete implementations: `FlowiseCapability` (in `graph.py`, co-located with `_react`)
+and `WorkdayCapability` (in `agent/domains/workday.py`).
+
+**Reason**: `DomainTools` is a data descriptor (list of ToolDef + executor dict). Adding
+Workday with only `DomainTools` would require duplicating the ReAct loop, result routing,
+and state update logic inside the graph. `DomainCapability` defines a contract that any
+domain must implement; the orchestrator calls `cap.discover(context)` and receives a typed
+`DomainDiscoveryResult` without knowing anything about how the domain works internally.
+
+**Key design choices**:
+- `DomainCapability` wraps `DomainTools`; it does not replace it. `domain_tools` property
+  preserves backwards compatibility for graph nodes that still call `merge_tools(domains)`.
+- `FlowiseCapability` lives in `graph.py` to avoid circular imports (`_react()` and
+  `_parse_converge_verdict()` must stay in `graph.py`; moving `FlowiseCapability` to
+  `domains/flowise.py` would require importing from `graph.py` which imports from `domain.py`).
+- `compile_ops()` and `validate()` are abstract stubs in Milestone 1 (must return
+  `DomainPatchResult(stub=True)` / `ValidationReport(stub=True)`). This keeps the interface
+  complete and testable while deferring Patch IR to Milestone 2.
+- `build_graph(capabilities=None)` → all behaviour identical to pre-refactor. The
+  capability path is fully opt-in.
+
+**Files added**: `flowise_dev_agent/agent/domain.py`, `flowise_dev_agent/agent/domains/__init__.py`
+
+**Rejected alternatives**:
+- Subclassing `DomainTools` for behaviour: mixes data and behaviour into one class,
+  makes testing harder (cannot mock the executor independently of the lifecycle).
+- Protocol instead of ABC: ABCs give clearer instantiation errors and allow `super()` calls.
+  Protocol would require structural subtyping which is harder to enforce statically.
+
+---
+
+## DD-047 — WorkdayCapability Stub-First Approach
+
+**Date**: 2026-02-23
+**Decision**: Implement `WorkdayCapability` in `agent/domains/workday.py` as a full
+`DomainCapability` subclass with all five lifecycle methods returning typed stubs.
+Tool definitions exist (`get_worker`, `list_business_processes`) but the executor
+returns synthetic placeholder data without any real Workday API calls.
+
+**Reason**: The stub establishes the full domain interface before any Workday API is
+available. This serves two purposes: (1) it proves the `DomainCapability` contract
+is implementable end-to-end without needing live infrastructure; (2) it gives a
+concrete target for the Milestone 3 activation checklist — every change required to
+go from stub to real is documented in the module docstring.
+
+**Activation checklist** (in `workday.py` docstring):
+1. Replace `_WORKDAY_DISCOVER_TOOLS` with real Workday MCP `ToolDef`s.
+2. Replace `_stub_get_worker` / `_stub_list_business_processes` with real async callables.
+3. Replace `WorkdayCapability.discover()` body with a `_react()` loop call.
+4. Update `workday_extend.md` with real discovery rules.
+5. Pass `WorkdayCapability()` to `build_graph(capabilities=[..., WorkdayCapability()])`.
+
+**No other files need to change when the stub is activated.**
+
+**Rejected alternatives**:
+- Skip stub, implement only when Workday API is available: loses the architectural
+  proof-of-concept and delays identifying any interface gaps until Milestone 3.
+- Inline stub in `graph.py`: violates the domain isolation principle; Workday code
+  belongs in `agent/domains/`, not in the Flowise orchestrator.
+
+---
+
+## DD-048 — ToolResult Envelope (Compact Context Enforcement)
+
+**Date**: 2026-02-23
+**Decision**: Add a `ToolResult` dataclass as the single return type of `execute_tool()`.
+All executor callables still return raw `Any`; `_wrap_result(tool_name, raw)` wraps the
+raw output at the `execute_tool()` boundary. `result_to_str(ToolResult)` returns only
+`result.summary` — this is the sole enforcement point for the compact context policy.
+
+**ToolResult fields**:
+- `ok: bool` — success/failure flag
+- `summary: str` — compact, prompt-safe; injected into `msg.content` / LLM context
+- `facts: dict` — structured deltas destined for `state['facts']`
+- `data: Any` — raw output destined for `state['debug']`; **never** injected into LLM context
+- `error: dict | None` — `{type, message, detail}` when `ok=False`
+- `artifacts: dict | None` — persistent refs (`chatflow_ids`, snapshot labels) for `state['artifacts']`
+
+**`_wrap_result` priority rules** (applied in order):
+1. `{"error": ...}` dict → `ok=False`, summary = error message
+2. `{"valid": ...}` dict (validate_flow_data) → pass/fail with error count
+3. `{"id": ...}` dict (chatflow) → `"Chatflow '{name}' (id={id})."` + `artifacts`
+4. `{"snapshotted": True}` dict → snapshot summary with version label
+5. `list` → `"{tool_name} returned {N} item(s)."`
+6. other `dict` → first 200 chars of JSON
+7. scalar/string → first 300 chars
+
+**Test node special case**: `_run_trial` uses `result.data` (not `result.summary`) when
+passing prediction responses to the evaluator LLM. The evaluator needs the full chatbot
+response to judge PASS/FAIL; the compact summary is too lossy for evaluation purposes.
+Error paths still use `result.summary`.
+
+**Invariant**: `result_to_str(ToolResult)` → `result.summary` always. Raw data never
+enters LLM context through any code path in graph.py or tools.py.
+
+**Backwards compatibility**: All 21 existing executor callables are unchanged. Wrapping
+happens entirely inside `execute_tool()`. Callers that checked `isinstance(result, dict)`
+now check `isinstance(result, ToolResult)`.
+
+**Rejected alternatives**:
+- Truncating raw JSON at 500 chars: truncation is lossy and still allows large blobs for
+  most responses. Summary generation requires understanding the tool's semantics.
+- Per-tool result formatting inside each executor: duplicates formatting logic, hard to
+  enforce consistently as new tools are added.
+- Enforcing compact context in the system prompt only: instruction-following is unreliable
+  for size constraints; code enforcement is the only reliable guarantee.
+
+---
+
+## DD-049 — ToolRegistry v2 (Namespaced, Phase-Gated, Dual-Key)
+
+**Date**: 2026-02-23
+**Decision**: Add `ToolRegistry` in `agent/registry.py`. Tools are registered with a
+`namespace` (e.g. `"flowise"`), a `ToolDef`, a `phases` set (`{"discover"}`, `{"patch"}`,
+etc.), and an async callable. The registry's `executor(phase)` returns a **dual-keyed**
+dict: both `"flowise.get_node"` and `"get_node"` map to the same callable.
+
+**Reason**: Without namespacing, adding Workday creates an immediate collision:
+`get_node` (Flowise) vs. `get_worker` (Workday) are unambiguous today, but future
+tools may share names. Namespacing to `flowise.get_node` / `workday.get_worker` makes
+the identity canonical. Phase gating prevents discover-only tools from appearing in the
+patch executor (reducing the LLM's tool surface at each phase).
+
+**Dual-key executor** invariant: `executor()` always includes BOTH the namespaced key
+(`"flowise.get_node"`) AND the simple key (`"get_node"`). This means:
+- The LLM, which receives namespaced `ToolDef` names, calls the right tool.
+- Existing Python code that looks up `executor["get_node"]` still works without changes.
+- Zero regression risk on the legacy code path.
+
+**`register_domain(domain: DomainTools)` convenience method**: registers all of
+`domain.discover`, `domain.patch`, and `domain.test` tools in one call, inferring the
+phase set from which list each tool appears in. Tools in multiple lists get merged phases.
+
+**Files added**: `flowise_dev_agent/agent/registry.py`
+
+**Rejected alternatives**:
+- Flat global tool registry: doesn't support multi-domain or phase gating; adding any
+  domain risks name collisions.
+- Namespace prefix only in `tool_defs()`, not in `executor()`: breaks the LLM's ability
+  to call `flowise.get_node` — the name in the tool definition must match the executor key.
+- Separate executor dicts per namespace: callers would need to know the namespace of
+  every tool call, coupling all call sites to the namespace scheme.
+
+---
+
+## DD-050 — AgentState Trifurcation (Transcript / Artifacts / Debug)
+
+**Date**: 2026-02-23
+**Decision**: Add three new domain-keyed fields to `AgentState`, all using a new
+`_merge_domain_dict` reducer (last-writer-wins per domain key):
+
+- `artifacts: dict[str, Any]` — persistent references produced during a phase
+  (chatflow IDs, snapshot labels). Written by discover/patch nodes; read by test/converge.
+- `facts: dict[str, Any]` — structured deltas extracted from tool results
+  (chatflow_id, node names, credential types). Written per tool call; read by plan.
+- `debug: dict[str, Any]` — raw tool output, keyed by iteration and tool name.
+  **Never injected into LLM context.** Exists solely for introspection and unit testing.
+
+**Reason**: The `messages` list serves two incompatible purposes: LLM context (messages
+must be compact) and audit trail (raw data is useful for debugging). Separating these
+into distinct state fields with explicit semantics removes the temptation to inject
+`debug` content into LLM prompts, and makes it trivial to find structured data (look in
+`facts`) vs. raw API output (look in `debug`) without scanning the full message history.
+
+**`_merge_domain_dict` reducer semantics**:
+```python
+_merge_domain_dict({"flowise": {...}}, {"workday": {...}})
+→ {"flowise": {...}, "workday": {...}}   # domain keys are merged
+```
+Each domain owns its key. One domain's discover phase cannot overwrite another domain's
+facts or artifacts. LangGraph calls the reducer on every state update.
+
+**State separation invariant**:
+- `messages` — transcript: tool *summaries* (compact), plan text, user messages
+- `artifacts` — canonical refs: chatflow IDs, snapshot labels; survives iteration boundary
+- `facts` — structured deltas: tool-specific typed data; updated each discover cycle
+- `debug` — raw: full API responses; NOT LLM context; reset or accumulated per session
+
+**`_initial_state()` in api.py** was updated to include `"artifacts": {}, "facts": {}, "debug": {}`
+so existing sessions started without these fields don't fail with `KeyError`.
+
+**Rejected alternatives**:
+- Single `domain_context: dict` field for everything: mixes compact summaries with raw data,
+  making it impossible to enforce the "no raw blobs in LLM context" invariant.
+- Append-list reducer (same as `messages`): domain data is replaced each iteration, not
+  appended; a merge reducer matches the actual write pattern.
+- Separate top-level TypedDict per domain: requires changing `AgentState` every time a
+  new domain is added; the domain-keyed dict is open to extension without schema changes.
+
+---
+
+## DD-051 — Patch IR Schema (AddNode / SetParam / Connect / BindCredential)
+
+**Date**: 2026-02-23
+**Decision**: Replace "LLM writes full flowData JSON" with a typed Intermediate Representation
+(IR) where the LLM produces a list of atomic operation objects and a deterministic compiler
+translates them to the final Flowise API payload.
+
+**Four op types:**
+| Op | Purpose |
+|----|---------|
+| `AddNode` | Add a new Flowise node (type name + unique ID + optional params) |
+| `SetParam` | Set a single `data.inputs` parameter on an existing node |
+| `Connect` | Connect two nodes by anchor *names* (not raw handle strings) |
+| `BindCredential` | Bind a credential ID at both `data.credential` levels |
+
+**JSON discriminator:** each op carries `"op_type"` so deserialisation is unambiguous.
+
+**Implementation** (`flowise_dev_agent/agent/patch_ir.py`):
+- All four ops are `@dataclass` objects (consistent with existing codebase style)
+- `validate_patch_ops(ops, base_node_ids)` catches: empty required fields,
+  duplicate node IDs in AddNode ops, refs to non-existent nodes in Connect/SetParam/BindCredential
+- `ops_from_json(s)` strips `\`\`\`json...\`\`\`` fences from LLM output before parsing
+- `PatchIRValidationError` for programmatic error handling
+
+**Compiler** (`flowise_dev_agent/agent/compiler.py`):
+- `GraphIR` — canonical in-memory graph (nodes + edges)
+- `GraphIR.from_flow_data(raw)` — parse existing Flowise flowData into GraphIR
+- `compile_patch_ops(base_graph, ops, schema_cache)` — applies ops, returns `CompileResult`
+- `CompileResult` carries: `flow_data`, `flow_data_str`, `payload_hash`, `diff_summary`, `errors`
+- Anchor IDs derived deterministically from `_get_node_processed()` schemas (substitutes
+  `{nodeId}` placeholder with actual node ID)
+- Edge IDs: `"{src_node_id}-{src_anchor}-{tgt_node_id}-{tgt_anchor}"` — stable, no randomness
+- Auto-layout: places new nodes in a 300px × 200px grid right of existing nodes
+
+**Reason**: LLM-generated raw flowData JSON caused three recurring failure categories:
+1. Wrong handle string format (LLM guesses anchor IDs that don't match schema)
+2. Missing `data.credential` at both required levels (LLM sets only one)
+3. Invalid JSON structure (`{}` instead of `{"nodes":[],"edges":[]}`)
+By shrinking the LLM's output to anchor *names* (not handles) and credential *IDs* (not
+both locations), each category is eliminated at compile time, not discovered at Flowise-write time.
+
+**Key invariant**: The LLM NEVER writes handle IDs or edge IDs. The compiler derives them from
+`_get_node_processed()` schemas. This eliminates the most common source of Flowise HTTP 500s.
+
+**Backwards compatibility**: `build_graph(capabilities=None)` still uses the original
+LLM-driven `_make_patch_node()`. The IR path is only active when capabilities are provided.
+
+**Rejected alternatives**:
+- Strict typed output (Pydantic structured output): adds a Pydantic round-trip and LLM-side
+  schema compliance pressure; `ops_from_json` with fence stripping is simpler and equally safe.
+- Keep full flowData LLM-generated but post-process: you'd need a second LLM call to "fix"
+  bad handle strings, losing the determinism benefit entirely.
+
+---
+
+## DD-052 — WriteGuard: Same-Iteration Hash Enforcement
+
+**Date**: 2026-02-23
+**Decision**: Any Flowise write (`create_chatflow` / `update_chatflow`) is blocked by code
+unless the exact payload that was written also passed `validate_flow_data` in the same iteration.
+
+**Mechanism** (`flowise_dev_agent/agent/tools.py — WriteGuard`):
+1. `guard.authorize(flow_data_str)` — called after `_validate_flow_data()` succeeds.
+   Computes SHA-256 of `flow_data_str` and stores it as the authorized hash.
+2. `guard.check(flow_data_str)` — called inside guarded `create_chatflow` / `update_chatflow`
+   wrappers before the Flowise API call. Raises `PermissionError` if:
+   - `authorize()` was never called → `"ValidationRequired"` error
+   - payload differs from the authorized one → `"HashMismatch"` error
+3. `guard.revoke()` — called after a successful write. One-shot: re-authorization required
+   before any subsequent write.
+
+**`_make_flowise_executor(client, guard=None)`** — updated to accept an optional `WriteGuard`.
+When `guard is not None`, the three tools `validate_flow_data`, `create_chatflow`,
+`update_chatflow` are replaced with guarded wrappers. When `guard=None` (default), behaviour
+is identical to pre-M2 (no guard, full backwards compat).
+
+**State field** `validated_payload_hash: str | None` in `AgentState` — the patch node
+stores the authorized hash after a successful write for audit trail purposes.
+
+**In the v2 patch node** (`_make_patch_node_v2`), the guard is built locally per iteration:
+the compiler produces `CompileResult.payload_hash`, `guard.authorize(flow_data_str)` is called
+explicitly, and write tools are wrapped with the guard. This means even if a future refactor
+accidentally modifies the payload between validation and write, the guard raises at call time.
+
+**Reason**: The primary risk in a code-driven patch system is "drift" between the flowData
+that the structural validator checked and the flowData that is actually written. A hash-match
+gate makes this physically impossible: the compiler's output is the validator's input is the
+write's input, all the same bytes.
+
+**Error types returned by the guard** (both as `PermissionError`):
+- `"ValidationRequired"` — write called before validation; tells caller to call `validate_flow_data` first
+- `"HashMismatch"` — payload was modified after validation; caller must re-validate
+
+**Rejected alternatives**:
+- Re-running validation inside the write wrapper: expensive; validation already happened at
+  the compile step. A hash check is O(n) on payload size — trivially fast.
+- Requiring an explicit `authorized_hash` parameter on `create_chatflow` / `update_chatflow`:
+  changes tool signatures; requires LLM to pass the hash it doesn't know. The guard closure
+  is transparent to callers.

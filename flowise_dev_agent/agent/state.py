@@ -12,7 +12,7 @@ See DESIGN_DECISIONS.md — DD-007.
 
 from __future__ import annotations
 
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from flowise_dev_agent.reasoning import Message
 
@@ -35,6 +35,34 @@ def _append_messages(existing: list[Message], incoming: list[Message] | None) ->
 def _sum_int(existing: int, incoming: int) -> int:
     """Accumulate an integer counter across node updates (used for token totals)."""
     return (existing or 0) + (incoming or 0)
+
+
+def _merge_domain_dict(existing: dict, incoming: dict | None) -> dict:
+    """Merge domain-keyed dicts. Last-writer-wins per domain key.
+
+    LangGraph calls this reducer when a node returns {"artifacts": {...}},
+    {"facts": {...}}, or {"debug": {...}}. Each node returns only its own
+    domain key (e.g. {"flowise": {...}}), which is merged without overwriting
+    other domains' entries.
+
+    Examples:
+        _merge_domain_dict({"flowise": 1}, {"workday": 2})
+        → {"flowise": 1, "workday": 2}
+
+        _merge_domain_dict({"flowise": {"old": 1}}, {"flowise": {"new": 2}})
+        → {"flowise": {"new": 2}}     # flowise key replaced by latest update
+
+    The None guard handles two cases:
+      - A node that returns {} for these fields (no update)
+      - Old checkpointed sessions that predate these fields (existing=None)
+
+    See DD-050 (State trifurcation: transcript / artifacts / debug).
+    """
+    if not incoming:
+        return existing or {}
+    merged = dict(existing or {})
+    merged.update(incoming)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +210,41 @@ class AgentState(TypedDict):
     # Keys: domain name ("flowise", "workday"). Values: domain-specific summary.
     # Each discover iteration merges into this dict.
     domain_context: dict[str, str]
+
+    # -----------------------------------------------------------------------
+    # Structured domain outputs (v2 DomainCapability results — DD-050)
+    # -----------------------------------------------------------------------
+
+    # Persistent references produced by tools during discover/patch, per domain.
+    # Domain-keyed: {"flowise": {"chatflow_ids": ["abc123"], "snapshot_labels": ["v1.0"]}}
+    # Uses _merge_domain_dict: writing {"flowise": ...} preserves "workday" entries.
+    artifacts: Annotated[dict[str, Any], _merge_domain_dict]
+
+    # Extracted structured facts per domain (latest iteration wins per domain key).
+    # Domain-keyed: {"flowise": {"chatflow_id": "abc123", "node_count": 5}}
+    # Read by orchestrator nodes for structured reasoning; avoids re-parsing summaries.
+    facts: Annotated[dict[str, Any], _merge_domain_dict]
+
+    # Raw tool outputs per domain, organized by iteration. NOT LLM context — debug only.
+    # Domain-keyed: {"flowise": {0: {"list_chatflows": "...", "get_node": "..."}}}
+    # Written by discover node when DomainCapability path is active.
+    debug: Annotated[dict[str, Any], _merge_domain_dict]
+
+    # -----------------------------------------------------------------------
+    # Deterministic patching (Milestone 2 — DD-051, DD-052)
+    # -----------------------------------------------------------------------
+
+    # Current iteration's Patch IR ops as a list of JSON-serializable dicts.
+    # Set by the patch node after the LLM emits ops and they are IR-validated.
+    # Consumed by converge for audit trail; cleared each iteration.
+    # None = Patch IR not used this iteration (old LLM-driven path).
+    patch_ir: list[dict] | None
+
+    # SHA-256 hex digest of the flowData payload that passed validate_flow_data
+    # in the current patch iteration.  The WriteGuard refuses to write unless
+    # the payload hash matches this value exactly (same-iteration enforcement).
+    # None = no validated payload yet this iteration.
+    validated_payload_hash: str | None
 
     # -----------------------------------------------------------------------
     # Token usage (accumulated across all LLM calls in this session)

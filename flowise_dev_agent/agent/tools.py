@@ -11,15 +11,22 @@ so the LLM sees all available tools from all domains simultaneously.
 
 Current domains:
   FloviseDomain — wraps FlowiseClient (Cursorwise MCP, 50 tools)
+  PatternDomain — wraps PatternStore (pattern library search)
 
 Planned domains:
   WorkdayDomain — will wrap Workday Agent Gateway MCP client (v2)
+  See agent/domains/workday.py for the stub and activation checklist.
 
-See DESIGN_DECISIONS.md — DD-008.
+Tool results are normalized through the ToolResult envelope. Only the compact
+.summary field is injected into LLM context; raw .data is stored in state['debug'].
+See DD-048 (ToolResult as single transformation point).
+
+See DESIGN_DECISIONS.md — DD-008, DD-048.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time as _time
@@ -725,11 +732,68 @@ def _cached(key: str, ttl: float, fn: Callable) -> Callable:
     return wrapper
 
 
-def _make_flowise_executor(client: FlowiseClient) -> dict[str, Callable[..., Any]]:
-    """Return tool_name → async callable mapping for the FlowiseClient."""
+def _make_flowise_executor(
+    client: FlowiseClient,
+    guard: "WriteGuard | None" = None,
+) -> dict[str, Callable[..., Any]]:
+    """Return tool_name → async callable mapping for the FlowiseClient.
+
+    guard: optional WriteGuard instance.  When provided, three tools are
+           wrapped with enforcement logic (DD-052):
+             validate_flow_data → records authorized hash on success
+             create_chatflow    → blocked if payload hash does not match
+             update_chatflow    → blocked if flow_data hash does not match
+
+           When guard is None (default), behaviour is identical to pre-M2:
+           no hash tracking, no write blocking.  Backwards-compatible.
+    """
     import os as _os
     _cache_ttl = float(_os.getenv("DISCOVER_CACHE_TTL_SECS", "300"))
     _client_key = id(client)
+
+    # Base (unguarded) implementations
+    def _validate_raw(flow_data_str: str) -> dict:
+        return _validate_flow_data(flow_data_str)
+
+    async def _create_raw(**kwargs: Any) -> Any:
+        return await client.create_chatflow(**kwargs)
+
+    async def _update_raw(**kwargs: Any) -> Any:
+        return await client.update_chatflow(**kwargs)
+
+    # Guarded wrappers (only active when guard is provided)
+    if guard is not None:
+        def _validate_guarded(flow_data_str: str) -> dict:
+            result = _validate_flow_data(flow_data_str)
+            if result.get("valid"):
+                guard.authorize(flow_data_str)
+            return result
+
+        async def _create_guarded(**kwargs: Any) -> Any:
+            flow_data = kwargs.get("flow_data", "")
+            if flow_data:
+                guard.check(str(flow_data))
+            result = await client.create_chatflow(**kwargs)
+            if flow_data:
+                guard.revoke()
+            return result
+
+        async def _update_guarded(**kwargs: Any) -> Any:
+            flow_data = kwargs.get("flow_data", "")
+            if flow_data:
+                guard.check(str(flow_data))
+            result = await client.update_chatflow(**kwargs)
+            if flow_data:
+                guard.revoke()
+            return result
+
+        validate_fn: Callable = _validate_guarded
+        create_fn: Callable = _create_guarded
+        update_fn: Callable = _update_guarded
+    else:
+        validate_fn = _validate_raw
+        create_fn = _create_raw
+        update_fn = _update_raw
 
     return {
         # Discovery tools
@@ -745,16 +809,92 @@ def _make_flowise_executor(client: FlowiseClient) -> dict[str, Callable[..., Any
             f"list_marketplace_templates:{_client_key}", _cache_ttl,
             lambda: _list_marketplace_templates_slim(client),
         ),
-        # Patch tools
-        "validate_flow_data": lambda flow_data_str: _validate_flow_data(flow_data_str),
+        # Patch tools (validate/write are optionally guarded)
+        "validate_flow_data": validate_fn,
         "snapshot_chatflow": lambda chatflow_id, session_id, version_label=None: _snapshot_chatflow(client, chatflow_id, session_id, version_label),
         "rollback_chatflow": lambda chatflow_id, session_id, version_label=None: _rollback_chatflow(client, chatflow_id, session_id, version_label),
-        "create_chatflow": client.create_chatflow,
-        "update_chatflow": client.update_chatflow,
+        "create_chatflow": create_fn,
+        "update_chatflow": update_fn,
         # Test tools
         "create_prediction": client.create_prediction,
         "upsert_vector": client.upsert_vector,
     }
+
+
+# ---------------------------------------------------------------------------
+# Write guard — same-iteration hash enforcement (DD-052)
+# ---------------------------------------------------------------------------
+
+
+class WriteGuard:
+    """Enforces same-iteration validation before any Flowise write.
+
+    Lifecycle (one guard instance per patch iteration):
+      1. A validated payload is registered via ``authorize(flow_data_str)``
+         (called automatically by the guarded validate_flow_data wrapper when
+         validation passes).
+      2. The guarded create_chatflow / update_chatflow wrappers call
+         ``check(flow_data_str)`` before writing.  If the payload changed
+         since validation the write is blocked with a PermissionError.
+      3. After a successful write ``revoke()`` is called so the guard cannot
+         be reused for a second write without re-validation.
+
+    Invariant: No Flowise write can succeed unless the exact payload that
+    was written also passed ``validate_flow_data`` in the same iteration.
+
+    See DD-052 and roadmap3_architecture_optimization.md — Milestone 2.
+    """
+
+    def __init__(self) -> None:
+        self._authorized_hash: str | None = None
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def authorize(self, flow_data_str: str) -> str:
+        """Record that this payload passed validation.
+
+        Computes SHA-256 of ``flow_data_str`` and stores it as the
+        authorized hash.  Any subsequent write with a different payload
+        will be blocked by ``check()``.
+
+        Returns the hash string (for recording in state).
+        """
+        h = hashlib.sha256(flow_data_str.encode("utf-8")).hexdigest()
+        self._authorized_hash = h
+        return h
+
+    def check(self, flow_data_str: str) -> None:
+        """Assert the payload matches the authorized hash.
+
+        Raises PermissionError when:
+          - ``authorize()`` was never called (ValidationRequired)
+          - The payload hash differs from what was authorized (HashMismatch)
+        """
+        if self._authorized_hash is None:
+            raise PermissionError(
+                "ValidationRequired: flow_data has not been validated this iteration. "
+                "Call validate_flow_data(flow_data) before create_chatflow or "
+                "update_chatflow to register the authorized payload."
+            )
+        actual = hashlib.sha256(flow_data_str.encode("utf-8")).hexdigest()
+        if actual != self._authorized_hash:
+            raise PermissionError(
+                "HashMismatch: the flow_data payload changed since validate_flow_data "
+                "was called. Re-validate the new payload before writing. "
+                f"(authorized={self._authorized_hash[:16]}…, "
+                f"received={actual[:16]}…)"
+            )
+
+    def revoke(self) -> None:
+        """Revoke write authorization (one-shot: resets after a successful write)."""
+        self._authorized_hash = None
+
+    @property
+    def authorized_hash(self) -> str | None:
+        """The hash of the currently authorized payload (None = not yet validated)."""
+        return self._authorized_hash
 
 
 # ---------------------------------------------------------------------------
@@ -775,46 +915,250 @@ def _stream_write(payload: dict) -> None:
         pass
 
 
+
+# ---------------------------------------------------------------------------
+# ToolResult envelope (DD-048)
+# Normalizes every tool execution result into a typed container.
+# Only .summary is injected into LLM context; .data is stored to state['debug'].
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolResult:
+    """Normalized envelope for every tool execution result.
+
+    ok:        True if the tool completed without error.
+    summary:   Compact, prompt-safe string injected into LLM context.
+               Written for an LLM reader: concise, no raw JSON blobs.
+               This is the ONLY field that goes into message history.
+    facts:     Structured key→value deltas extracted from the result.
+               Stored in state['facts'][domain], keyed by domain name.
+               Examples:
+                 {"chatflow_id": "abc123", "node_count": 5}
+                 {"missing_credentials": ["openAIApi"]}
+    data:      Raw output from the underlying tool callable.
+               NOT injected into the LLM by default. Stored in state['debug'].
+    error:     Present when ok=False. Dict with keys:
+                 type:    Exception class name or error category.
+                 message: Human-readable summary.
+                 detail:  Original exception message or API error body.
+    artifacts: Optional domain-specific references produced by the tool.
+               Stored in state['artifacts'][domain].
+               Examples:
+                 {"chatflow_ids": ["abc123"], "snapshot_labels": ["v1.0"]}
+
+    See DD-048 and roadmap3_architecture_optimization.md.
+    """
+
+    ok: bool
+    summary: str
+    facts: dict
+    data: Any
+    error: dict | None
+    artifacts: dict | None
+
+
+def _wrap_result(tool_name: str, raw: Any) -> "ToolResult":
+    """Wrap a raw tool callable result into a ToolResult envelope.
+
+    This is the single transformation point between the raw-result world and the
+    typed ToolResult world. The 21 existing tool functions are NOT changed — wrapping
+    happens here at the execute_tool() boundary.
+
+    Summary generation rules (priority order):
+      1. dict with "error" key          → ok=False, summary from error message
+      2. dict with "valid" key          → validate_flow_data result
+      3. dict with "id" + "name" keys   → chatflow create/get/update result
+      4. dict with "snapshotted" key    → snapshot result
+      5. list                           → count summary
+      6. other dict                     → first 200 chars of JSON
+      7. scalar / string                → first 300 chars
+    """
+    # Rule 1: explicit error dict
+    if isinstance(raw, dict) and "error" in raw:
+        msg = str(raw["error"])
+        return ToolResult(
+            ok=False,
+            summary=f"{tool_name} failed: {msg}",
+            facts={},
+            data=raw,
+            error={"type": "ToolError", "message": msg, "detail": None},
+            artifacts=None,
+        )
+
+    # Rule 2: validate_flow_data result
+    if isinstance(raw, dict) and "valid" in raw:
+        if raw["valid"]:
+            return ToolResult(
+                ok=True,
+                summary=(
+                    f"Flow data valid: {raw.get('node_count', 0)} nodes, "
+                    f"{raw.get('edge_count', 0)} edges."
+                ),
+                facts={
+                    "node_count": raw.get("node_count"),
+                    "edge_count": raw.get("edge_count"),
+                },
+                data=raw,
+                error=None,
+                artifacts=None,
+            )
+        errors = raw.get("errors", [])
+        first_error = errors[0] if errors else "unknown"
+        return ToolResult(
+            ok=False,
+            summary=f"Flow data invalid: {len(errors)} error(s). First: {first_error}",
+            facts={"validation_errors": errors},
+            data=raw,
+            error={
+                "type": "ValidationError",
+                "message": f"{len(errors)} validation error(s)",
+                "detail": str(errors[:3]),
+            },
+            artifacts=None,
+        )
+
+    # Rule 3: chatflow create/get/update — extract ID as artifact
+    if isinstance(raw, dict) and "id" in raw:
+        cid = str(raw["id"])
+        name = raw.get("name", cid)
+        return ToolResult(
+            ok=True,
+            summary=f"Chatflow '{name}' (id={cid}).",
+            facts={"chatflow_id": cid, "chatflow_name": name},
+            data=raw,
+            error=None,
+            artifacts={"chatflow_ids": [cid]},
+        )
+
+    # Rule 4: snapshot result
+    if isinstance(raw, dict) and "snapshotted" in raw:
+        label = raw.get("version_label", "unknown")
+        count = raw.get("snapshot_count", 1)
+        return ToolResult(
+            ok=True,
+            summary=f"Snapshot saved as {label} (total: {count}).",
+            facts={"snapshot_label": label},
+            data=raw,
+            error=None,
+            artifacts={"snapshot_labels": [label]},
+        )
+
+    # Rule 5: list result
+    if isinstance(raw, list):
+        return ToolResult(
+            ok=True,
+            summary=f"{tool_name} returned {len(raw)} item(s).",
+            facts={"count": len(raw)},
+            data=raw,
+            error=None,
+            artifacts=None,
+        )
+
+    # Rule 6: other dict
+    if isinstance(raw, dict):
+        try:
+            preview = json.dumps(raw, default=str)[:200]
+        except Exception:
+            preview = str(raw)[:200]
+        return ToolResult(
+            ok=True,
+            summary=f"{tool_name}: {preview}",
+            facts={},
+            data=raw,
+            error=None,
+            artifacts=None,
+        )
+
+    # Rule 7: scalar / string
+    return ToolResult(
+        ok=True,
+        summary=str(raw)[:300],
+        facts={},
+        data=raw,
+        error=None,
+        artifacts=None,
+    )
+
+
 async def execute_tool(
     tool_name: str,
     arguments: dict[str, Any],
     executor: dict[str, Callable[..., Any]],
-) -> Any:
-    """Execute a named tool with the given arguments.
+) -> "ToolResult":
+    """Execute a named tool with the given arguments. Returns a ToolResult envelope.
 
     Emits tool_call / tool_result custom events via get_stream_writer() so
     the SSE stream receives live tool badges for each Flowise API call.
 
-    Returns the raw result from the tool callable, or an error dict if the
-    tool is unknown or raises an exception.
+    The summary field of the returned ToolResult is safe for LLM injection.
+    The data field is raw output suitable only for debug storage.
+
+    See DD-048 (ToolResult as single transformation point).
     """
     _stream_write({"type": "tool_call", "name": tool_name})
 
     fn = executor.get(tool_name)
     if fn is None:
         logger.warning("Unknown tool requested: %r", tool_name)
-        result: Any = {"error": f"Unknown tool: {tool_name!r}. Check available tools for this phase."}
-        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
+        result = ToolResult(
+            ok=False,
+            summary=f"Unknown tool: {tool_name!r}. Check available tools for this phase.",
+            facts={},
+            data=None,
+            error={
+                "type": "UnknownTool",
+                "message": f"Tool {tool_name!r} not found in executor",
+                "detail": None,
+            },
+            artifacts=None,
+        )
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": result.summary[:200]})
         return result
     try:
-        result = await fn(**arguments)
-        logger.debug("Tool %s(%s) → OK", tool_name, list(arguments.keys()))
-        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
+        raw = await fn(**arguments)
+        result = _wrap_result(tool_name, raw)
+        logger.debug("Tool %s(%s) → ok=%s", tool_name, list(arguments.keys()), result.ok)
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": result.summary[:200]})
         return result
     except TypeError as e:
         logger.warning("Tool %s called with wrong arguments %s: %s", tool_name, arguments, e)
-        result = {"error": f"Wrong arguments for {tool_name}: {e}"}
-        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
+        result = ToolResult(
+            ok=False,
+            summary=f"Wrong arguments for {tool_name}: {e}",
+            facts={},
+            data=None,
+            error={"type": "TypeError", "message": str(e), "detail": None},
+            artifacts=None,
+        )
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": result.summary[:200]})
         return result
     except Exception as e:
         logger.warning("Tool %s failed: %s", tool_name, e)
-        result = {"error": str(e)}
-        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
+        result = ToolResult(
+            ok=False,
+            summary=f"{tool_name} error: {e}",
+            facts={},
+            data=None,
+            error={"type": type(e).__name__, "message": str(e), "detail": None},
+            artifacts=None,
+        )
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": result.summary[:200]})
         return result
 
 
 def result_to_str(result: Any) -> str:
-    """Serialize a tool result to a string for the message history."""
+    """Serialize a tool result to a string for the message history.
+
+    When given a ToolResult, returns result.summary (compact, prompt-safe).
+    This is the enforcement point for the compact context policy (DD-048):
+    raw JSON blobs from tool calls are NEVER injected into LLM context.
+
+    Legacy path: accepts raw values (str, dict, list) for any code that has
+    not yet been updated to use ToolResult.
+    """
+    if isinstance(result, ToolResult):
+        return result.summary
     if isinstance(result, str):
         return result
     try:

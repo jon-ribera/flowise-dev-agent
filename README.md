@@ -31,7 +31,7 @@ POST /sessions/stream  {"requirement": "Build a customer support chatbot with GP
   ⏸ INTERRUPT: plan_approval  ← Developer reviews and approves (or requests changes)
          │
   ┌──────▼──────┐
-  │    PATCH    │  Minimal write: snapshot → get_chatflow → create/update_chatflow
+  │    PATCH    │  Snapshot → Patch IR ops → deterministic compiler → WriteGuard → write
   └──────┬──────┘
          │
   ┌──────▼──────┐
@@ -263,10 +263,23 @@ curl http://localhost:8000/instances
 | `check_credentials` | Validation | HITL interrupt if required credentials are missing from Flowise |
 | `plan` | Planning | Creates structured plan (Goal/Inputs/Outputs/Constraints/Success Criteria) |
 | `human_plan_approval` | HITL | Developer reviews and approves plan before any writes |
-| `patch` | Write | Snapshots existing chatflow, validates flowData, creates/updates chatflow |
+| `patch` | Write | Snapshot → compile Patch IR ops → WriteGuard → create/update chatflow (DD-051, DD-052) |
 | `test` | Validation | Runs happy-path and edge-case predictions with unique sessionIds |
 | `converge` | Evaluation | Structured verdict: DONE or ITERATE with Category/Reason/Fix |
 | `human_result_review` | HITL | Developer accepts result or requests another iteration |
+
+### Patch IR + Deterministic Compiler (DD-051, DD-052)
+
+The `patch` node pipeline when `build_graph(capabilities=[FlowiseCapability(...)])`:
+
+1. **Snapshot** — save existing chatflow before any changes
+2. **LLM emits ops only** — `AddNode / SetParam / Connect / BindCredential` in JSON; no handle IDs, no edge IDs
+3. **IR validation** — `validate_patch_ops()` catches dangling refs and duplicate node IDs before compilation
+4. **Deterministic compiler** — `compile_patch_ops()` reads the existing chatflow as a `GraphIR`, resolves anchor handle IDs from node schemas, and produces `flowData + payload_hash + diff_summary`
+5. **Structural gate** — `_validate_flow_data()` must pass (same poka-yoke check as the legacy path)
+6. **WriteGuard** — `create_chatflow` / `update_chatflow` are blocked unless the payload hash matches the hash recorded at validation time; prevents any mutation between validation and write
+
+When `capabilities=None` (default), the original LLM-JSON patch path runs unchanged.
 
 ### Evaluator-Optimizer Feedback Loop
 
@@ -338,6 +351,24 @@ No build step, no Node.js, no dependencies. Single HTML file served by FastAPI.
 │  ├── converge node (DD-019)                 │
 │  └── human_result_review (HITL)             │
 │       │                                     │
+│  DomainCapability layer (DD-046)            │
+│  ├── FlowiseCapability  ← ToolRegistry      │
+│  │   discover + compile_ops + validate      │
+│  │   (namespaced, DD-049)                   │
+│  └── WorkdayCapability (stub, DD-047)       │
+│                                             │
+│  Patch IR + compiler (DD-051)               │
+│  ├── patch_ir.py  — AddNode/SetParam/       │
+│  │                  Connect/BindCredential  │
+│  └── compiler.py  — GraphIR + compile_      │
+│                     patch_ops() → hash      │
+│                                             │
+│  WriteGuard (DD-052)                        │
+│  └── SHA-256 gate before every write        │
+│                                             │
+│  ToolResult envelope (DD-048)               │
+│  └── execute_tool() → compact summary only  │
+│                                             │
 │  ReasoningEngine (Claude / OpenAI)          │
 │       │                                     │
 │  SQLite (AsyncSqliteSaver, DD-024)          │
@@ -389,7 +420,7 @@ No Python changes or server restart required.
 ## Design Decisions
 
 See [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) for the full architectural rationale,
-covering 40 decisions from LangGraph topology to the evaluator-optimizer feedback loop.
+covering 52 decisions from LangGraph topology to the deterministic patch compiler.
 
 Key decisions:
 
@@ -416,14 +447,26 @@ Key decisions:
 | DD-038 | Error recovery playbook |
 | DD-039 | Chatflow version tags (full rollback history) |
 | DD-040 | Parallel test execution |
+| DD-046 | DomainCapability ABC — behavioral contract for domain plugins |
+| DD-047 | WorkdayCapability stub — interface-complete before API is connected |
+| DD-048 | ToolResult envelope — compact context enforcement at execute_tool boundary |
+| DD-049 | ToolRegistry v2 — namespaced, phase-gated, dual-key executor |
+| DD-050 | AgentState trifurcation — artifacts/facts/debug separated from transcript |
+| DD-051 | Patch IR schema — LLM emits ops, compiler derives handle IDs deterministically |
+| DD-052 | WriteGuard — same-iteration SHA-256 hash enforcement before any Flowise write |
 
 ---
 
 ## Performance
 
 See [PERFORMANCE.md](PERFORMANCE.md) for observed token costs and the root cause
-analysis of quadratic context accumulation. A ~70% token cost reduction is available
-with two targeted changes to `tools.py` (tracked in branch `feat/cost-optimization`).
+analysis of quadratic context accumulation.
+
+**Compact context (shipped — DD-048):** `execute_tool()` now returns a `ToolResult`;
+`result_to_str(ToolResult)` injects only the compact `.summary` into LLM context.
+Raw API responses (previously up to 162k tokens for `list_nodes`) are stored in
+`state['debug']` only and never reach the prompt. This eliminates the primary source
+of context bloat at the tool execution boundary.
 
 ---
 
@@ -432,3 +475,6 @@ with two targeted changes to `tools.py` (tracked in branch `feat/cost-optimizati
 - [cursorwise](https://github.com/jon-ribera/cursorwise) — Flowise MCP server for Cursor IDE (dependency)
 - [Flowise](https://github.com/FlowiseAI/Flowise) — the chatflow platform this agent builds on
 - [ROADMAP2.md](ROADMAP2.md) — next-wave enhancement backlog
+- [roadmap3_architecture_optimization.md](roadmap3_architecture_optimization.md) — Architecture blueprint: M1 ToolResult + ToolRegistry + DomainCapability (complete), M2 Patch IR + deterministic compiler + WriteGuard (complete)
+- [roadmap4_workday_cross_domain.md](roadmap4_workday_cross_domain.md) — M4.1 Workday MCP wiring, M4.2 cross-domain planner, M4.3 PatternCapability (planning)
+- [roadmap5_embedded_ux.md](roadmap5_embedded_ux.md) — M5.1 `/sessions/complete` + auto_approve, M5.2 Custom Tool template, M5.3 TypeScript Custom Node (planning; independent of R4)

@@ -96,7 +96,7 @@ async def lifespan(app: FastAPI):
 
     logger.info(
         "Starting Flowise Dev Agent | Flowise: %s | Engine: %s | DB: %s",
-        settings.api_endpoint,
+        os.getenv("FLOWISE_API_ENDPOINT", "(from env)"),
         reasoning_settings.provider,
         db_path,
     )
@@ -131,7 +131,6 @@ async def lifespan(app: FastAPI):
     await pool.close_all()
 
     logger.info("Shutting down Flowise Dev Agent")
-    await client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +477,7 @@ async def list_instances(request: Request) -> dict:
 @app.get("/health", tags=["system"], dependencies=[Depends(_verify_api_key)])
 async def health(request: Request) -> dict:
     """Health check. Verifies the API and Flowise connection are both up."""
-    client = request.app.state.client
+    client = _get_client(request)
     try:
         result = await client.ping()
         flowise_ok = "error" not in result

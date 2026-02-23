@@ -696,14 +696,36 @@ async def delete_session(thread_id: str, request: Request) -> dict:
     return {"deleted": True, "thread_id": thread_id}
 
 
+@app.get("/sessions/{thread_id}/versions", tags=["sessions"], dependencies=[Depends(_verify_api_key)])
+async def list_session_versions(thread_id: str, request: Request) -> dict:
+    """List all chatflow version snapshots taken during this session (DD-039).
+
+    Returns snapshot metadata (chatflow_id, name, version_label, timestamp)
+    without the bulky flowData payload.  Use the version_label from this list
+    with POST /sessions/{id}/rollback?version=<label> to restore a specific version.
+
+    Snapshots are ordered oldest-first (append order).
+    """
+    from flowise_dev_agent.agent.tools import list_session_snapshots
+
+    versions = list_session_snapshots(thread_id)
+    return {"thread_id": thread_id, "versions": versions, "count": len(versions)}
+
+
 @app.post("/sessions/{thread_id}/rollback", response_model=SessionResponse, tags=["sessions"], dependencies=[Depends(_verify_api_key)])
-async def rollback_session(thread_id: str, request: Request) -> SessionResponse:
-    """Rollback the chatflow to the last snapshot taken during this session.
+async def rollback_session(
+    thread_id: str,
+    request: Request,
+    version: str | None = None,
+) -> SessionResponse:
+    """Rollback the chatflow to a specific (or the latest) snapshot (DD-039).
 
-    Calls rollback_chatflow on the snapshot saved most recently by the agent's
-    snapshot_chatflow tool call. Requires at least one patch to have run.
+    Pass ?version=<label> (e.g. ?version=v2.0) to restore a named snapshot.
+    Omit the query parameter to roll back to the most recent snapshot.
 
-    See DESIGN_DECISIONS.md — DD-026.
+    Use GET /sessions/{id}/versions to see available version labels.
+
+    See DESIGN_DECISIONS.md — DD-026, DD-039.
     """
     from flowise_dev_agent.agent.tools import rollback_session_chatflow
 
@@ -725,8 +747,11 @@ async def rollback_session(thread_id: str, request: Request) -> SessionResponse:
     instance_id = snapshot.values.get("flowise_instance_id")
     client = _get_client(request, instance_id)
 
-    logger.info("Rolling back chatflow %s for session %s", chatflow_id, thread_id)
-    result = await rollback_session_chatflow(client, chatflow_id, thread_id)
+    logger.info(
+        "Rolling back chatflow %s for session %s (version=%s)",
+        chatflow_id, thread_id, version or "latest",
+    )
+    result = await rollback_session_chatflow(client, chatflow_id, thread_id, version)
     if "error" in result:
         raise HTTPException(status_code=409, detail=result["error"])
 

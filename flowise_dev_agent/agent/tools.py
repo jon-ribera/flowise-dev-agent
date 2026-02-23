@@ -282,13 +282,15 @@ _FLOWISE_PATCH_TOOLS: list[ToolDef] = [
     _td(
         "snapshot_chatflow",
         (
-            "Save the current chatflow state as a snapshot before making changes. "
+            "Save the current chatflow state as a versioned snapshot before making changes. "
             "REQUIRED before every update_chatflow — this enables rollback if the patch breaks the flow. "
-            "Use the session thread_id as session_id."
+            "Use the session thread_id as session_id. "
+            "version_label is auto-generated (v1.0, v2.0, …) when omitted."
         ),
         {
             "chatflow_id": {"type": "string"},
             "session_id": {"type": "string", "description": "The session thread_id (used to scope snapshots)"},
+            "version_label": {"type": "string", "description": "Optional label (e.g. 'v2.0'). Auto-assigned if omitted."},
         },
         ["chatflow_id", "session_id"],
     ),
@@ -621,12 +623,13 @@ _snapshots: dict[str, list[dict]] = {}
 
 
 async def _snapshot_chatflow(
-    client: FlowiseClient, chatflow_id: str, session_id: str
+    client: FlowiseClient, chatflow_id: str, session_id: str, version_label: str | None = None
 ) -> dict:
-    """Save the current chatflow flowData as a snapshot before patching.
+    """Save the current chatflow flowData as a versioned snapshot before patching.
 
     Call this before every update_chatflow so rollback is available if the
-    patch breaks the flow.
+    patch breaks the flow.  version_label is auto-generated as "v{N}.0" when
+    not supplied (DD-039).
     """
     import time
 
@@ -634,41 +637,61 @@ async def _snapshot_chatflow(
     if "error" in chatflow:
         return chatflow
 
+    existing = _snapshots.get(session_id, [])
+    label = version_label or f"v{len(existing) + 1}.0"
     snap = {
         "chatflow_id": chatflow_id,
         "name": chatflow.get("name"),
         "flow_data": chatflow.get("flowData", ""),
+        "version_label": label,
         "timestamp": time.time(),
     }
     _snapshots.setdefault(session_id, []).append(snap)
     logger.debug(
-        "Snapshot saved for chatflow %s (session %s, count=%d)",
+        "Snapshot saved for chatflow %s (session %s, label=%s, count=%d)",
         chatflow_id,
         session_id,
+        label,
         len(_snapshots[session_id]),
     )
-    return {"snapshotted": True, "snapshot_count": len(_snapshots[session_id])}
+    return {"snapshotted": True, "version_label": label, "snapshot_count": len(_snapshots[session_id])}
 
 
 async def _rollback_chatflow(
-    client: FlowiseClient, chatflow_id: str, session_id: str
+    client: FlowiseClient, chatflow_id: str, session_id: str, version_label: str | None = None
 ) -> dict:
-    """Restore the last snapshot for a chatflow within this session."""
+    """Restore a specific (or the latest) snapshot for a chatflow within this session.
+
+    If version_label is provided, the snapshot with that label is restored.
+    If not, the most recent snapshot is used (DD-039).
+    """
     snaps = _snapshots.get(session_id, [])
     if not snaps:
         return {"error": "No snapshots found for this session"}
 
-    snap = snaps[-1]
+    if version_label:
+        matching = [s for s in snaps if s.get("version_label") == version_label]
+        if not matching:
+            available = [s.get("version_label") for s in snaps]
+            return {"error": f"Snapshot '{version_label}' not found. Available: {available}"}
+        snap = matching[-1]
+    else:
+        snap = snaps[-1]
+
     logger.info(
-        "Rolling back chatflow %s to snapshot at %.0f (session %s)",
+        "Rolling back chatflow %s to snapshot %s at %.0f (session %s)",
         chatflow_id,
+        snap.get("version_label"),
         snap["timestamp"],
         session_id,
     )
-    return await client.update_chatflow(
+    result = await client.update_chatflow(
         chatflow_id=chatflow_id,
         flow_data=snap["flow_data"],
     )
+    if "error" not in result:
+        result["rolled_back_to"] = snap.get("version_label")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -724,8 +747,8 @@ def _make_flowise_executor(client: FlowiseClient) -> dict[str, Callable[..., Any
         ),
         # Patch tools
         "validate_flow_data": lambda flow_data_str: _validate_flow_data(flow_data_str),
-        "snapshot_chatflow": lambda chatflow_id, session_id: _snapshot_chatflow(client, chatflow_id, session_id),
-        "rollback_chatflow": lambda chatflow_id, session_id: _rollback_chatflow(client, chatflow_id, session_id),
+        "snapshot_chatflow": lambda chatflow_id, session_id, version_label=None: _snapshot_chatflow(client, chatflow_id, session_id, version_label),
+        "rollback_chatflow": lambda chatflow_id, session_id, version_label=None: _rollback_chatflow(client, chatflow_id, session_id, version_label),
         "create_chatflow": client.create_chatflow,
         "update_chatflow": client.update_chatflow,
         # Test tools
@@ -776,10 +799,26 @@ def result_to_str(result: Any) -> str:
 
 
 async def rollback_session_chatflow(
-    client: FlowiseClient, chatflow_id: str, session_id: str
+    client: FlowiseClient, chatflow_id: str, session_id: str, version_label: str | None = None
 ) -> dict:
-    """Public wrapper for the rollback API endpoint in api.py."""
-    return await _rollback_chatflow(client, chatflow_id, session_id)
+    """Public wrapper for the rollback API endpoint in api.py (DD-039).
+
+    Rolls back to the snapshot identified by version_label, or the latest
+    snapshot when version_label is None.
+    """
+    return await _rollback_chatflow(client, chatflow_id, session_id, version_label)
+
+
+def list_session_snapshots(session_id: str) -> list[dict]:
+    """Return snapshot metadata for a session without the bulky flow_data field (DD-039).
+
+    Each entry has: chatflow_id, name, version_label, timestamp.
+    The list is ordered oldest-first (append order).
+    """
+    return [
+        {k: v for k, v in snap.items() if k != "flow_data"}
+        for snap in _snapshots.get(session_id, [])
+    ]
 
 
 # ---------------------------------------------------------------------------

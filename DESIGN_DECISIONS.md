@@ -856,3 +856,83 @@ repeating the same mistake.
   keeping the playbook in the plan node respects the evaluator-optimizer separation.
 - Per-failure-message prompting (not categorised): the existing category classification
   already provides the right granularity; the playbook just adds the action to take.
+
+---
+
+## DD-039 — Chatflow Version Tags (Full Rollback History)
+
+**Date**: 2026-02-22
+**Decision**: Extend the in-memory snapshot store (`_snapshots` in `tools.py`) to
+record a `version_label` (e.g. `"v1.0"`, `"v2.0"`) with every snapshot. Labels
+are auto-generated as `f"v{len(existing)+1}.0"` when not supplied by the caller.
+Rollback accepts an optional `version_label` to restore a specific version instead
+of always using the latest snapshot. Two new public API surfaces are added:
+`GET /sessions/{id}/versions` and an updated `POST /sessions/{id}/rollback?version=<label>`.
+
+**Reason**: The original rollback always restored the most recent snapshot, making
+it impossible to recover to a known-good state from two or more iterations ago without
+manually capturing version numbers. By tagging snapshots with version labels the
+developer can audit the full edit history via the API and roll back to any prior state,
+not just the last one.
+
+**Implementation**:
+- `_snapshot_chatflow()` in `tools.py`: adds `version_label: str | None = None` param.
+  Auto-generates `f"v{len(existing)+1}.0"` when not supplied. Stores `version_label`
+  in the snap dict. Returns `{"snapshotted": True, "version_label": label, "snapshot_count": N}`.
+- `_rollback_chatflow()` in `tools.py`: adds `version_label: str | None = None`. When
+  supplied, filters snaps by label (error if not found, returns available labels in error
+  message). When omitted, falls back to `snaps[-1]` (existing behaviour). Adds
+  `"rolled_back_to": label` to the Flowise API result.
+- Executor lambdas in `_make_flowise_executor()` updated to forward `version_label=None`.
+- `snapshot_chatflow` tool definition: `version_label` added as optional parameter.
+- `rollback_session_chatflow()` public wrapper updated to accept and forward `version_label`.
+- `list_session_snapshots(session_id)` new public function: returns snapshot metadata
+  (chatflow_id, name, version_label, timestamp) without the bulky `flow_data` field.
+- `GET /sessions/{thread_id}/versions` endpoint in `api.py`: calls `list_session_snapshots`.
+- `POST /sessions/{thread_id}/rollback` in `api.py`: accepts optional `version: str | None`
+  query parameter; passes it through to `rollback_session_chatflow`.
+
+**Rejected alternatives**:
+- Persisting snapshots to SQLite: the in-memory store is already sufficient for the
+  session lifetime; adding DB persistence would complicate the schema and the lifespan
+  for minimal gain — snapshots are advisory, not authoritative.
+- Incrementing version numbers as integers: semantic labels (`v1.0`) are more legible
+  in the API response and give room for minor-version semantics in a future extension.
+
+---
+
+## DD-040 — Parallel Test Execution
+
+**Date**: 2026-02-22
+**Decision**: Refactor `_make_test_node()` in `graph.py` to dispatch all
+`create_prediction` calls concurrently via `asyncio.gather()` instead of delegating
+to the `_react()` ReAct loop. The LLM is called exactly once at the end — with
+`tools=None` — to evaluate the raw API responses. All (happy × `test_trials`) +
+(edge × `test_trials`) tasks are gathered in a single batch for maximum parallelism.
+
+**Reason**: The previous test node ran a full ReAct loop where the LLM would make
+sequential `create_prediction` tool calls. This had two problems: (1) latency —
+happy and edge predictions ran serially, doubling the wall-clock time when both are
+independent; (2) non-determinism — the LLM chose the sessionId format and test inputs,
+which occasionally deviated from the expected pattern. By dispatching predictions
+directly from Python we guarantee consistent sessionId format (`test-<id>-happy-t<N>`),
+remove the extra ReAct round-trips, and cut test-phase latency roughly in half.
+
+**Implementation**:
+- `_make_test_node()` now calls `_, executor = merge_tools(domains, "test")` (drops
+  `tool_defs` since `_react()` is no longer used).
+- Inner `_run_trial(label, question, trial_num)` coroutine calls `execute_tool(
+  "create_prediction", {..., "override_config": json.dumps({"sessionId": ...})}, executor)`.
+- `asyncio.gather(*happy_tasks, *edge_tasks, return_exceptions=True)` fires all trials.
+- Results are formatted into a `raw_results` string, then passed to a single LLM
+  `engine.complete(tools=None)` call for evaluation.
+- `flowise_builder.md` **Rule 15** added to the Test Context explaining that the LLM's
+  role is evaluation-only and that `create_prediction` must not be called.
+- `_react()` helper remains in `graph.py` — still used by discover, patch, and future phases.
+
+**Rejected alternatives**:
+- Keeping `_react()` and instructing the LLM to run predictions in parallel: LangGraph
+  LLMs cannot natively fan out tool calls across coroutines; the instruction would be
+  ignored and predictions would still run sequentially.
+- Running happy and edge tests as separate graph nodes: would complicate the graph
+  topology for a problem that is cleanly solved at the Python level with gather.

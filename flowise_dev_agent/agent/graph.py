@@ -723,49 +723,92 @@ def _make_patch_node(engine: ReasoningEngine, domains: list[DomainTools]):
 
 
 def _make_test_node(engine: ReasoningEngine, domains: list[DomainTools]):
-    tool_defs, executor = merge_tools(domains, "test")
+    _, executor = merge_tools(domains, "test")
     system = _build_system_prompt(_TEST_BASE, domains, "test")
 
     async def test(state: AgentState) -> dict:
-        """Phase 4: Run happy-path and edge-case predictions."""
-        iteration = state.get("iteration", 0)
-        logger.info("[TEST] iteration=%d chatflow_id=%s", iteration, state.get("chatflow_id"))
+        """Phase 4: Run happy-path and edge-case predictions in parallel (DD-040).
 
-        chatflow_id = state.get("chatflow_id", "unknown — extract from recent tool results")
+        Predictions are dispatched concurrently via asyncio.gather() — the LLM
+        is not used to invoke tools; it is called once at the end to evaluate
+        the raw API responses.  This removes one full ReAct round-trip and
+        eliminates the risk of the LLM choosing the wrong sessionId format.
+
+        When test_trials > 1 all (happy × trials) + (edge × trials) tasks are
+        gathered in a single batch, giving maximum parallelism.
+        """
+        iteration = state.get("iteration", 0)
+        chatflow_id = state.get("chatflow_id") or "unknown"
         trials = state.get("test_trials", 1)
-        trials_instruction = (
-            f"Run each test {trials} time(s) with different sessionIds. "
-            f"A test PASSES only if ALL {trials} trial(s) pass (pass^{trials} reliability). "
-            "Report each trial result separately."
-            if trials > 1
-            else "Run each test once."
+        logger.info("[TEST] iteration=%d chatflow_id=%s trials=%d", iteration, chatflow_id, trials)
+
+        async def _run_trial(label: str, question: str, trial_num: int) -> str:
+            session_id = f"test-{chatflow_id}-{label}-t{trial_num}"
+            result = await execute_tool(
+                "create_prediction",
+                {
+                    "chatflow_id": chatflow_id,
+                    "question": question,
+                    "override_config": json.dumps({"sessionId": session_id}),
+                },
+                executor,
+            )
+            return result_to_str(result)
+
+        happy_question = state["requirement"][:100]
+        edge_question = ""  # empty input is the boundary / edge case
+
+        happy_tasks = [_run_trial("happy", happy_question, i + 1) for i in range(trials)]
+        edge_tasks  = [_run_trial("edge",  edge_question,  i + 1) for i in range(trials)]
+
+        # Dispatch all predictions in parallel; exceptions are captured, not raised.
+        all_results = await asyncio.gather(*happy_tasks, *edge_tasks, return_exceptions=True)
+        happy_results: list = list(all_results[:trials])
+        edge_results:  list = list(all_results[trials:])
+
+        def _format_trials(label: str, results: list) -> str:
+            lines = [f"TEST: {label.upper()} PATH"]
+            for i, r in enumerate(results):
+                prefix = f"  Trial {i + 1}: "
+                if isinstance(r, Exception):
+                    lines.append(f"{prefix}ERROR — {r}")
+                else:
+                    lines.append(f"{prefix}{str(r)[:500]}")
+            return "\n".join(lines)
+
+        raw_results = (
+            f"Chatflow: {chatflow_id}\n\n"
+            f"{_format_trials('happy', happy_results)}\n\n"
+            f"{_format_trials('edge', edge_results)}"
         )
-        user_msg = Message(
+
+        # LLM used only for evaluation — no tool access (tools=None).
+        eval_msg = Message(
             role="user",
             content=(
-                f"Chatflow to test: {chatflow_id}\n\n"
-                "Run the happy-path test and the edge-case test. "
-                "Use unique sessionIds in override_config for both. "
-                f"{trials_instruction} "
-                "Report PASS/FAIL for each."
+                f"Evaluate these test results for requirement:\n{state['requirement']}\n\n"
+                f"{raw_results}\n\n"
+                f"Trials per test: {trials}. "
+                f"A test PASSES only if ALL {trials} trial(s) pass (pass^{trials} reliability).\n"
+                "Report PASS/FAIL for each test with brief reasoning.\n"
+                "Final line must be: RESULT: HAPPY PATH [PASS/FAIL] | EDGE CASE [PASS/FAIL]"
             ),
         )
-
-        # Test only needs the chatflow_id (already in user_msg). No prior tool
-        # call history required — _react will make its own create_prediction calls.
-        text, new_msgs, in_tok, out_tok = await _react(
-            engine,
-            [user_msg],
-            system,
-            tool_defs,
-            executor,
+        response = await engine.complete(
+            messages=[eval_msg],
+            system=system,
+            tools=None,
         )
+        eval_text = response.content or ""
+
+        user_msg   = Message(role="user",      content=raw_results)
+        asst_msg   = Message(role="assistant", content=eval_text)
 
         return {
-            "messages": [user_msg] + new_msgs,
-            "test_results": text,
-            "total_input_tokens": in_tok,
-            "total_output_tokens": out_tok,
+            "messages": [user_msg, asst_msg],
+            "test_results": eval_text,
+            "total_input_tokens":  response.input_tokens,
+            "total_output_tokens": response.output_tokens,
         }
 
     return test

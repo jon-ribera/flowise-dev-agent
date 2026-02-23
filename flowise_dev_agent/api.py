@@ -407,6 +407,8 @@ def _initial_state(
         "artifacts": {},
         "facts": {},
         "debug": {},
+        "patch_ir": None,
+        "validated_payload_hash": None,
         "total_input_tokens": 0,
         "total_output_tokens": 0,
     }

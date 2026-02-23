@@ -202,10 +202,18 @@ class WorkdayCapability(DomainCapability):
         )
 
     async def compile_ops(self, plan: str) -> DomainPatchResult:
-        return DomainPatchResult()
+        """Stub — Workday patch operations are not implemented (Milestone 3)."""
+        return DomainPatchResult(
+            stub=True,
+            message="compile_ops is not implemented for WorkdayCapability (Patch IR deferred to M3).",
+        )
 
     async def validate(self, artifacts: dict) -> ValidationReport:
-        return ValidationReport()
+        """Stub — Workday validation is not implemented (Milestone 3)."""
+        return ValidationReport(
+            stub=True,
+            message="validate is not implemented for WorkdayCapability (M3).",
+        )
 
     async def generate_tests(self, plan: str) -> TestSuite:
         return TestSuite(

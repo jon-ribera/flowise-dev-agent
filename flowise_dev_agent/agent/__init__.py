@@ -13,10 +13,19 @@ v2 abstractions (DD-046, DD-048, DD-049):
     Result models     — DomainDiscoveryResult, DomainPatchResult, ValidationReport,
                         TestSuite, Verdict
 
-See DESIGN_DECISIONS.md — DD-007 through DD-010, DD-046–DD-050.
+Milestone 2 — Patch IR + deterministic compiler (DD-051, DD-052):
+    AddNode, SetParam, Connect, BindCredential — Patch IR op dataclasses
+    PatchIRValidationError — raised when ops fail structural validation
+    ops_to_json / ops_from_json — JSON roundtrip for Patch IR ops
+    GraphIR, CompileResult — canonical graph IR and compiler output
+    compile_patch_ops — deterministic flowData compiler
+    WriteGuard — same-iteration hash enforcement at write time
+
+See DESIGN_DECISIONS.md — DD-007 through DD-010, DD-046–DD-052.
 See roadmap3_architecture_optimization.md for the milestone plan.
 """
 
+from flowise_dev_agent.agent.compiler import CompileResult, GraphIR, compile_patch_ops
 from flowise_dev_agent.agent.domain import (
     DomainCapability,
     DomainDiscoveryResult,
@@ -26,9 +35,19 @@ from flowise_dev_agent.agent.domain import (
     Verdict,
 )
 from flowise_dev_agent.agent.graph import FlowiseCapability, build_graph, create_agent
+from flowise_dev_agent.agent.patch_ir import (
+    AddNode,
+    BindCredential,
+    Connect,
+    PatchIRValidationError,
+    SetParam,
+    ops_from_json,
+    ops_to_json,
+    validate_patch_ops,
+)
 from flowise_dev_agent.agent.registry import ToolRegistry
 from flowise_dev_agent.agent.state import AgentState
-from flowise_dev_agent.agent.tools import DomainTools, FloviseDomain, ToolResult
+from flowise_dev_agent.agent.tools import DomainTools, FloviseDomain, ToolResult, WriteGuard
 
 __all__ = [
     # Core graph / agent entry points
@@ -52,4 +71,19 @@ __all__ = [
     "TestSuite",
     "ValidationReport",
     "Verdict",
+    # M2 Patch IR schema (DD-051)
+    "AddNode",
+    "SetParam",
+    "Connect",
+    "BindCredential",
+    "PatchIRValidationError",
+    "validate_patch_ops",
+    "ops_to_json",
+    "ops_from_json",
+    # M2 deterministic compiler (DD-051)
+    "GraphIR",
+    "CompileResult",
+    "compile_patch_ops",
+    # M2 write guard (DD-052)
+    "WriteGuard",
 ]

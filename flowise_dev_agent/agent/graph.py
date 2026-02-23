@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
+from flowise_dev_agent.agent.compiler import GraphIR, compile_patch_ops
 from flowise_dev_agent.agent.domain import (
     DomainCapability,
     DomainDiscoveryResult,
@@ -55,9 +56,24 @@ from flowise_dev_agent.agent.domain import (
     ValidationReport,
     Verdict,
 )
+from flowise_dev_agent.agent.patch_ir import (
+    AddNode,
+    op_to_dict,
+    ops_from_json,
+    validate_patch_ops,
+)
 from flowise_dev_agent.agent.registry import ToolRegistry
 from flowise_dev_agent.agent.state import AgentState
-from flowise_dev_agent.agent.tools import DomainTools, ToolResult, execute_tool, merge_context, merge_tools, result_to_str
+from flowise_dev_agent.agent.tools import (
+    DomainTools,
+    ToolResult,
+    WriteGuard,
+    _validate_flow_data,
+    execute_tool,
+    merge_context,
+    merge_tools,
+    result_to_str,
+)
 from cursorwise.client import FlowiseClient
 from cursorwise.config import Settings
 from flowise_dev_agent.reasoning import Message, ReasoningEngine, ReasoningSettings, ToolDef, create_engine
@@ -174,6 +190,37 @@ CHATFLOW_ID: <the-exact-uuid-of-the-created-or-updated-chatflow>
 
 Replace <the-exact-uuid...> with the real UUID from the create_chatflow response
 or the chatflow_id you used in update_chatflow. Do not omit this line.
+"""
+
+_PATCH_IR_SYSTEM = """\
+You are a Flowise co-pilot in the PATCH phase.
+
+Your task: output a JSON array of Patch IR operations that implement the approved plan.
+DO NOT include any explanation, markdown fences, or text outside the JSON array.
+
+AVAILABLE OPERATIONS:
+
+1. AddNode — add a new Flowise node
+   {"op_type":"add_node","node_name":"<flowise_type>","node_id":"<unique_id>","label":"<display>","params":{"modelName":"gpt-4o"}}
+
+2. SetParam — update a configurable parameter on an existing node
+   {"op_type":"set_param","node_id":"<id>","param_name":"<key>","value":"<val>"}
+
+3. Connect — connect two nodes by anchor name (NOT handle IDs — the compiler derives them)
+   {"op_type":"connect","source_node_id":"<id>","source_anchor":"<output_name>","target_node_id":"<id>","target_anchor":"<input_type>"}
+
+4. BindCredential — bind a credential ID at BOTH data.credential levels
+   {"op_type":"bind_credential","node_id":"<id>","credential_id":"<uuid>","credential_type":"<type>"}
+
+RULES:
+1. node_id: unique within the flow — use "<node_name>_<index>" e.g. "chatOpenAI_0"
+2. source_anchor: output anchor name — usually the node_name itself (e.g. "chatOpenAI")
+3. target_anchor: input anchor TYPE — the baseClass it accepts (e.g. "BaseChatModel", "BaseMemory")
+4. EVERY credential-bearing node (LLM, embedding, etc.) MUST have a BindCredential op
+5. Include ALL required nodes + connections for a working flow — never omit the chain/agent node
+6. Do NOT write handle strings, edge IDs, or raw flowData JSON — the compiler derives all of that
+
+OUTPUT: A single JSON array only, nothing else.
 """
 
 _TEST_BASE = """\
@@ -898,6 +945,304 @@ def _make_patch_node(engine: ReasoningEngine, domains: list[DomainTools]):
     return patch
 
 
+# ---------------------------------------------------------------------------
+# Patch node v2 — deterministic IR compiler path (DD-051, DD-052)
+# ---------------------------------------------------------------------------
+
+
+_CHATFLOW_NAME_RE = re.compile(
+    r'CREATE\s+["\']?([^"\'\\n]+)["\']?',
+    re.IGNORECASE,
+)
+
+
+def _extract_chatflow_name_from_plan(plan: str) -> str:
+    """Try to extract a chatflow name from the ACTION section of a plan.
+
+    Looks for a line like 'CREATE a new chatflow named "Support Bot"' or
+    '- CREATE "Customer Service Flow"'. Falls back to 'New Chatflow'.
+    """
+    for line in plan.splitlines():
+        if "create" in line.lower():
+            m = re.search(r'"([^"]+)"', line)
+            if not m:
+                m = re.search(r"'([^']+)'", line)
+            if m:
+                return m.group(1).strip()
+    return "New Chatflow"
+
+
+def _make_patch_node_v2(
+    engine: ReasoningEngine,
+    domains: list[DomainTools],
+    capabilities: "list[DomainCapability]",
+):
+    """Patch node Milestone 2: LLM emits Patch IR ops, compiler builds flowData.
+
+    Workflow per iteration:
+      Phase A — Read base graph from Flowise (get_chatflow) or start empty
+      Phase B — Single LLM call: outputs Patch IR JSON ops list (no tool loop)
+      Phase C — Parse + structural IR validation (no dangling node refs)
+      Phase D — Fetch node schemas for all AddNode ops (get_node per type)
+      Phase E — Deterministic compile: ops + schemas → flowData + payload_hash
+      Phase F — Structural validation: _validate_flow_data (hard gate)
+      Phase G — WriteGuard: authorize exact hash, write with guarded executor
+
+    Backwards-compatible: only used when build_graph(capabilities=[...]) is set.
+    The original _make_patch_node() still handles the capabilities=None path.
+
+    See DD-051 (Patch IR schema), DD-052 (write guard).
+    """
+    system = _build_system_prompt(_PATCH_IR_SYSTEM, domains, "patch")
+    _, patch_executor = merge_tools(domains, "patch")
+
+    # Find the Flowise capability for schema fetching
+    flowise_cap: "DomainCapability | None" = next(
+        (cap for cap in capabilities if cap.name == "flowise"), None
+    )
+
+    async def patch(state: AgentState) -> dict:
+        iteration = state.get("iteration", 0)
+        logger.info("[PATCH v2] iteration=%d", iteration)
+
+        plan = state.get("plan") or ""
+        discovery_summary = state.get("discovery_summary") or "(none)"
+        chatflow_id = state.get("chatflow_id")
+        requirement = state.get("requirement", "")
+        in_tok = 0
+        out_tok = 0
+
+        # ---- Phase A: Read base graph ----------------------------------------
+        base_graph = GraphIR()
+        discover_executor = (
+            flowise_cap.tools.executor("discover") if flowise_cap else patch_executor
+        )
+        if chatflow_id:
+            cf_result = await execute_tool(
+                "get_chatflow", {"chatflow_id": chatflow_id}, discover_executor
+            )
+            if cf_result.ok and isinstance(cf_result.data, dict):
+                fd = cf_result.data.get("flowData") or cf_result.data.get("flow_data")
+                if fd:
+                    base_graph = GraphIR.from_flow_data(fd)
+                    logger.debug(
+                        "[PATCH v2] Loaded base graph: %d nodes, %d edges",
+                        len(base_graph.nodes), len(base_graph.edges),
+                    )
+
+        # ---- Phase B: LLM generates ops JSON ---------------------------------
+        chatflow_summary: str
+        if base_graph.nodes:
+            node_lines = [
+                f"  - {n.id} ({n.node_name}): {n.label}"
+                for n in base_graph.nodes
+            ]
+            chatflow_summary = "Existing nodes:\n" + "\n".join(node_lines)
+        else:
+            chatflow_summary = "(creating new chatflow)"
+
+        user_msg = Message(
+            role="user",
+            content=(
+                f"Requirement:\n{requirement}\n\n"
+                f"Discovery summary:\n{discovery_summary}\n\n"
+                f"Approved plan:\n{plan}\n\n"
+                f"Current chatflow state:\n{chatflow_summary}\n\n"
+                "Output the JSON array of Patch IR operations to implement this plan."
+            ),
+        )
+        response = await engine.complete(
+            messages=[user_msg],
+            system=system,
+            tools=None,   # Ops generation — no tool calls
+        )
+        in_tok += response.input_tokens
+        out_tok += response.output_tokens
+        raw_ops_text = (response.content or "[]").strip()
+
+        new_msgs: list[Message] = [
+            user_msg,
+            Message(role="assistant", content=raw_ops_text),
+        ]
+
+        # ---- Phase C: Parse + validate IR ops --------------------------------
+        ops: list = []
+        ir_errors: list[str] = []
+        try:
+            ops = ops_from_json(raw_ops_text)
+            ir_errors = validate_patch_ops(ops, base_graph.node_ids())
+        except Exception as e:
+            ir_errors = [f"Failed to parse Patch IR JSON: {e}"]
+            logger.warning("[PATCH v2] Ops parse failed: %s", e)
+
+        if ir_errors:
+            logger.warning("[PATCH v2] IR validation errors: %s", ir_errors[:3])
+            new_msgs.append(Message(
+                role="tool_result",
+                content=(
+                    "Patch IR validation failed: "
+                    + "; ".join(ir_errors[:3])
+                ),
+            ))
+            return {
+                "messages": new_msgs,
+                "patch_ir": [op_to_dict(op) for op in ops] if ops else None,
+                "total_input_tokens": in_tok,
+                "total_output_tokens": out_tok,
+            }
+
+        # ---- Phase D: Fetch schemas for new node types -----------------------
+        schema_cache: dict[str, dict] = {}
+        new_node_names = {
+            op.node_name for op in ops
+            if isinstance(op, AddNode) and op.node_name
+        }
+        if new_node_names:
+            schema_tasks = [
+                execute_tool("get_node", {"name": name}, discover_executor)
+                for name in new_node_names
+            ]
+            schema_results = await asyncio.gather(*schema_tasks, return_exceptions=True)
+            for name, result in zip(new_node_names, schema_results):
+                if isinstance(result, ToolResult) and result.ok and isinstance(result.data, dict):
+                    schema_cache[name] = result.data
+                else:
+                    logger.warning("[PATCH v2] Schema fetch for '%s' failed: %s", name, result)
+
+        # ---- Phase E: Deterministic compile ----------------------------------
+        compile_result = compile_patch_ops(base_graph, ops, schema_cache)
+
+        if not compile_result.ok:
+            logger.warning("[PATCH v2] Compile errors: %s", compile_result.errors)
+            new_msgs.append(Message(
+                role="tool_result",
+                content=(
+                    "Compilation failed: "
+                    + "; ".join(compile_result.errors[:3])
+                ),
+            ))
+            return {
+                "messages": new_msgs,
+                "patch_ir": [op_to_dict(op) for op in ops],
+                "total_input_tokens": in_tok,
+                "total_output_tokens": out_tok,
+            }
+
+        # ---- Phase F: Structural validation (hard gate) ----------------------
+        validation_raw = _validate_flow_data(compile_result.flow_data_str)
+
+        if not validation_raw.get("valid"):
+            val_errors = validation_raw.get("errors", [])
+            logger.warning("[PATCH v2] Flow data invalid after compile: %s", val_errors[:3])
+            new_msgs.append(Message(
+                role="tool_result",
+                content=(
+                    "Flow data structurally invalid after compilation: "
+                    + "; ".join(val_errors[:3])
+                ),
+            ))
+            return {
+                "messages": new_msgs,
+                "patch_ir": [op_to_dict(op) for op in ops],
+                "total_input_tokens": in_tok,
+                "total_output_tokens": out_tok,
+            }
+
+        validated_hash = compile_result.payload_hash
+
+        # ---- Phase G: WriteGuard + write -------------------------------------
+        guard = WriteGuard()
+        guard.authorize(compile_result.flow_data_str)
+
+        # Build a guarded executor that wraps the write tools
+        orig_create = patch_executor.get("create_chatflow")
+        orig_update = patch_executor.get("update_chatflow")
+
+        async def _guarded_create(**kwargs: Any) -> Any:
+            flow_data = kwargs.get("flow_data", "")
+            if flow_data:
+                guard.check(str(flow_data))
+            result = await orig_create(**kwargs) if orig_create else {"error": "create_chatflow not available"}
+            if flow_data:
+                guard.revoke()
+            return result
+
+        async def _guarded_update(**kwargs: Any) -> Any:
+            flow_data = kwargs.get("flow_data", "")
+            if flow_data:
+                guard.check(str(flow_data))
+            result = await orig_update(**kwargs) if orig_update else {"error": "update_chatflow not available"}
+            if flow_data:
+                guard.revoke()
+            return result
+
+        guarded_executor = dict(patch_executor)
+        guarded_executor["create_chatflow"] = _guarded_create
+        guarded_executor["update_chatflow"] = _guarded_update
+
+        write_result: ToolResult
+        new_chatflow_id: str | None = chatflow_id
+
+        if chatflow_id:
+            # Snapshot before update
+            session_id = f"v2-patch-iter{iteration}"
+            await execute_tool(
+                "snapshot_chatflow",
+                {"chatflow_id": chatflow_id, "session_id": session_id},
+                guarded_executor,
+            )
+            # Write update
+            write_result = await execute_tool(
+                "update_chatflow",
+                {"chatflow_id": chatflow_id, "flow_data": compile_result.flow_data_str},
+                guarded_executor,
+            )
+        else:
+            # Create new chatflow
+            chatflow_name = _extract_chatflow_name_from_plan(plan) or requirement[:50]
+            write_result = await execute_tool(
+                "create_chatflow",
+                {"name": chatflow_name, "flow_data": compile_result.flow_data_str},
+                guarded_executor,
+            )
+            if write_result.ok and write_result.artifacts:
+                ids = write_result.artifacts.get("chatflow_ids", [])
+                if ids:
+                    new_chatflow_id = ids[0]
+            elif write_result.ok and isinstance(write_result.data, dict):
+                new_chatflow_id = write_result.data.get("id")
+
+        # Capture chatflow_id from write result (handles create case)
+        final_chatflow_id = new_chatflow_id or _extract_chatflow_id(new_msgs)
+
+        # Compose a human-readable summary message
+        diff_msg = Message(
+            role="assistant",
+            content=(
+                f"Patch IR applied ({len(ops)} op(s)):\n{compile_result.diff_summary}\n\n"
+                f"Write result: {result_to_str(write_result)}\n"
+                f"CHATFLOW_ID: {final_chatflow_id or '(unknown)'}"
+            ),
+        )
+        new_msgs.append(diff_msg)
+
+        logger.info(
+            "[PATCH v2] chatflow_id=%s ok=%s hash=%s...",
+            final_chatflow_id, write_result.ok, validated_hash[:12],
+        )
+
+        return {
+            "messages": new_msgs,
+            "chatflow_id": final_chatflow_id,
+            "patch_ir": [op_to_dict(op) for op in ops],
+            "validated_payload_hash": validated_hash,
+            "total_input_tokens": in_tok,
+            "total_output_tokens": out_tok,
+        }
+
+    return patch
+
+
 def _make_test_node(engine: ReasoningEngine, domains: list[DomainTools]):
     _, executor = merge_tools(domains, "test")
     system = _build_system_prompt(_TEST_BASE, domains, "test")
@@ -1153,12 +1498,81 @@ class FlowiseCapability(DomainCapability):
         )
 
     async def compile_ops(self, plan: str) -> DomainPatchResult:
-        """Stub — Patch IR not implemented in Milestone 1."""
-        return DomainPatchResult()
+        """Call the LLM with the ops-only prompt to produce Patch IR from plan text.
+
+        Uses the _PATCH_IR_SYSTEM prompt so the LLM outputs only a JSON array.
+        Returns a DomainPatchResult with the parsed ops list.
+
+        Note: The caller is responsible for schema fetching and compilation.
+        _make_patch_node_v2() uses this via direct orchestration.
+        """
+        user_msg = Message(role="user", content=plan)
+        response = await self._engine.complete(
+            messages=[user_msg],
+            system=_PATCH_IR_SYSTEM,
+            tools=None,
+        )
+        raw_text = (response.content or "[]").strip()
+        try:
+            ops = ops_from_json(raw_text)
+            errors = validate_patch_ops(ops)
+            return DomainPatchResult(
+                stub=False,
+                ops=ops,
+                message=(
+                    f"{len(ops)} op(s) parsed"
+                    + (f"; {len(errors)} IR validation error(s)" if errors else "")
+                ),
+            )
+        except Exception as e:
+            return DomainPatchResult(
+                stub=False,
+                ops=[],
+                message=f"Failed to parse Patch IR from LLM output: {e}",
+            )
 
     async def validate(self, artifacts: dict) -> ValidationReport:
-        """Stub — deterministic compiler not implemented in Milestone 1."""
-        return ValidationReport()
+        """Run structural validation on a compiled flowData payload.
+
+        artifacts must contain "flow_data_str" (the exact JSON string to validate).
+        Returns a ValidationReport with valid, validated_payload_hash, and errors.
+        """
+        import hashlib as _hashlib
+
+        flow_data_str = artifacts.get("flow_data_str", "")
+        if not flow_data_str:
+            return ValidationReport(
+                stub=False,
+                valid=False,
+                message="No flow_data_str provided to validate()",
+            )
+
+        raw = _validate_flow_data(flow_data_str)
+
+        if raw.get("valid"):
+            h = _hashlib.sha256(flow_data_str.encode("utf-8")).hexdigest()
+            return ValidationReport(
+                stub=False,
+                valid=True,
+                validated_payload_hash=h,
+                node_count=raw.get("node_count", 0),
+                edge_count=raw.get("edge_count", 0),
+                message=(
+                    f"Valid: {raw.get('node_count', 0)} nodes, "
+                    f"{raw.get('edge_count', 0)} edges."
+                ),
+            )
+        else:
+            errors = raw.get("errors", [])
+            return ValidationReport(
+                stub=False,
+                valid=False,
+                errors=errors,
+                message=(
+                    f"Invalid: {len(errors)} error(s). "
+                    f"First: {errors[0] if errors else '(none)'}"
+                ),
+            )
 
     async def generate_tests(self, plan: str) -> TestSuite:
         """Return test configuration matching existing test node logic."""
@@ -1384,11 +1798,15 @@ def build_graph(
                        When provided, PatternDomain is auto-appended to domains,
                        and converge auto-saves patterns after DONE verdicts.
         capabilities:  Optional list of DomainCapability instances (DD-046).
-                       When provided, the discover node uses DomainCapability.discover()
-                       for structured result routing (artifacts, facts, debug state fields).
-                       When None (default), the discover node uses the legacy DomainTools
-                       merge path — all behavior is identical to pre-refactor.
-                       All other nodes (plan, patch, test, converge) are unaffected.
+                       When provided:
+                         - discover node uses DomainCapability.discover() for structured
+                           result routing (artifacts, facts, debug state fields).
+                         - patch node switches to the M2 deterministic IR compiler path
+                           (DD-051, DD-052): LLM emits Patch IR ops; compiler builds
+                           flowData deterministically; WriteGuard enforces hash match.
+                       When None (default), all behavior is identical to pre-refactor:
+                         - discover uses legacy DomainTools merge path
+                         - patch uses legacy LLM-driven full flowData generation
 
     Returns:
         Compiled LangGraph graph ready for ainvoke() / invoke().
@@ -1407,12 +1825,20 @@ def build_graph(
     builder = StateGraph(AgentState)
 
     # Register all nodes
+    # Select patch node implementation:
+    #   capabilities=None → legacy LLM-driven full flowData path (unchanged)
+    #   capabilities=[...] → M2 deterministic IR compiler path (DD-051, DD-052)
+    if capabilities:
+        patch_node = _make_patch_node_v2(engine, domains, capabilities)
+    else:
+        patch_node = _make_patch_node(engine, domains)
+
     builder.add_node("clarify",             _make_clarify_node(engine))
     builder.add_node("discover",            _make_discover_node(engine, domains, capabilities))
     builder.add_node("check_credentials",   _make_check_credentials_node())
     builder.add_node("plan",                _make_plan_node(engine, domains))
     builder.add_node("human_plan_approval", _make_human_plan_approval_node())
-    builder.add_node("patch",               _make_patch_node(engine, domains))
+    builder.add_node("patch",               patch_node)
     builder.add_node("test",                _make_test_node(engine, domains))
     builder.add_node("converge",            _make_converge_node(engine, client=client, pattern_store=pattern_store))
     builder.add_node("human_result_review", _make_human_result_review_node())

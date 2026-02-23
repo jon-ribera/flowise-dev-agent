@@ -231,6 +231,22 @@ class AgentState(TypedDict):
     debug: Annotated[dict[str, Any], _merge_domain_dict]
 
     # -----------------------------------------------------------------------
+    # Deterministic patching (Milestone 2 — DD-051, DD-052)
+    # -----------------------------------------------------------------------
+
+    # Current iteration's Patch IR ops as a list of JSON-serializable dicts.
+    # Set by the patch node after the LLM emits ops and they are IR-validated.
+    # Consumed by converge for audit trail; cleared each iteration.
+    # None = Patch IR not used this iteration (old LLM-driven path).
+    patch_ir: list[dict] | None
+
+    # SHA-256 hex digest of the flowData payload that passed validate_flow_data
+    # in the current patch iteration.  The WriteGuard refuses to write unless
+    # the payload hash matches this value exactly (same-iteration enforcement).
+    # None = no validated payload yet this iteration.
+    validated_payload_hash: str | None
+
+    # -----------------------------------------------------------------------
     # Token usage (accumulated across all LLM calls in this session)
     # -----------------------------------------------------------------------
 

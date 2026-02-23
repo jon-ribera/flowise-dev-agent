@@ -4,8 +4,8 @@ DomainCapability is the primary abstraction for v2 of the agent architecture.
 It wraps a DomainTools (data descriptor) and adds behavioral lifecycle methods:
 
   discover()       — structured discovery producing DomainDiscoveryResult
-  compile_ops()    — STUB (Patch IR, NOT implemented per hard constraints M1)
-  validate()       — STUB (deterministic validation, NOT implemented M1)
+  compile_ops()    — compile plan into typed PatchOp list + CompileResult (M2)
+  validate()       — structural validation of compiled flowData (M2)
   generate_tests() — returns TestSuite using existing test logic
   evaluate()       — returns Verdict using existing converge logic
 
@@ -73,30 +73,49 @@ class DomainDiscoveryResult:
 class DomainPatchResult:
     """Result from DomainCapability.compile_ops().
 
-    STUB in Milestone 1 — not implemented per hard constraints (no Patch IR).
-    Placeholder so the DomainCapability interface is complete and testable.
+    ops:               The validated list of PatchOp objects.
+    compile_result:    CompileResult from the deterministic compiler
+                       (flow_data, flow_data_str, payload_hash, diff_summary).
+                       None when compilation was not attempted (error path).
+    validation_report: ValidationReport from the structural validator.
+                       None when not yet validated.
+    message:           Human-readable summary (error message or success note).
+    stub:              True only when the implementation is not yet available
+                       (kept for WorkdayCapability until Milestone 3).
 
-    Milestone 2 will replace this stub with a real PatchIR-carrying result.
     See roadmap3_architecture_optimization.md — Milestone 2.
     """
 
-    stub: bool = True
-    message: str = "compile_ops is not implemented in Milestone 1 (Patch IR deferred)."
+    stub: bool = False
+    ops: list[Any] = field(default_factory=list)
+    compile_result: Any = None     # CompileResult | None
+    validation_report: Any = None  # ValidationReport | None
+    message: str = ""
 
 
 @dataclass
 class ValidationReport:
     """Result from DomainCapability.validate().
 
-    STUB in Milestone 1 — not implemented per hard constraints (no deterministic compiler).
-    Placeholder so the DomainCapability interface is complete and testable.
+    valid:                  True when the payload passed structural validation.
+    validated_payload_hash: SHA-256 hex of the payload that was validated.
+                            The WriteGuard requires this exact hash before writing.
+    errors:                 List of validation error strings (empty when valid=True).
+    node_count:             Number of nodes in the validated flowData.
+    edge_count:             Number of edges in the validated flowData.
+    message:                Human-readable summary.
+    stub:                   True only when the implementation is not yet available.
 
-    Milestone 2 will replace this stub with real structural validation.
     See roadmap3_architecture_optimization.md — Milestone 2.
     """
 
-    stub: bool = True
-    message: str = "validate is not implemented in Milestone 1 (deterministic compiler deferred)."
+    stub: bool = False
+    valid: bool = False
+    validated_payload_hash: str | None = None
+    errors: list[str] = field(default_factory=list)
+    node_count: int = 0
+    edge_count: int = 0
+    message: str = ""
 
 
 @dataclass
@@ -253,24 +272,33 @@ class DomainCapability(ABC):
 
     @abstractmethod
     async def compile_ops(self, plan: str) -> DomainPatchResult:
-        """STUB — Compile plan text into patch operations.
+        """Compile plan text into Patch IR operations.
 
-        NOT IMPLEMENTED in Milestone 1 (no Patch IR per hard constraints).
-        Concrete implementations must return DomainPatchResult(stub=True).
+        Implemented in Milestone 2 by FlowiseCapability:
+          1. LLM is called once with ops-only prompt to produce JSON patch ops.
+          2. Ops are parsed, IR-validated (no dangling refs), and compiled via
+             the deterministic compiler (compiler.compile_patch_ops).
+          3. Returns DomainPatchResult with ops + CompileResult.
 
-        Milestone 2 will implement this with a real PatchIR schema.
+        Stub implementations (WorkdayCapability) should return
+        DomainPatchResult(stub=True).
+
         See roadmap3_architecture_optimization.md — Milestone 2.
         """
         ...
 
     @abstractmethod
     async def validate(self, artifacts: dict[str, Any]) -> ValidationReport:
-        """STUB — Validate artifacts against domain rules.
+        """Validate compiled flowData against structural rules.
 
-        NOT IMPLEMENTED in Milestone 1 (no deterministic compiler per hard constraints).
-        Concrete implementations must return ValidationReport(stub=True).
+        Implemented in Milestone 2 by FlowiseCapability:
+          - Runs _validate_flow_data() on the compiled payload.
+          - Records the SHA-256 hash that the WriteGuard will require.
+          - Returns ValidationReport with valid, validated_payload_hash, errors.
 
-        Milestone 2 will implement this with real structural validation.
+        Stub implementations (WorkdayCapability) should return
+        ValidationReport(stub=True).
+
         See roadmap3_architecture_optimization.md — Milestone 2.
         """
         ...

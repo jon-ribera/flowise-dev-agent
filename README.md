@@ -398,7 +398,7 @@ No Python changes or server restart required.
 ## Design Decisions
 
 See [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) for the full architectural rationale,
-covering 40 decisions from LangGraph topology to the evaluator-optimizer feedback loop.
+covering 52 decisions from LangGraph topology to the deterministic patch compiler.
 
 Key decisions:
 
@@ -430,6 +430,8 @@ Key decisions:
 | DD-048 | ToolResult envelope — compact context enforcement at execute_tool boundary |
 | DD-049 | ToolRegistry v2 — namespaced, phase-gated, dual-key executor |
 | DD-050 | AgentState trifurcation — artifacts/facts/debug separated from transcript |
+| DD-051 | Patch IR schema — LLM emits ops, compiler derives handle IDs deterministically |
+| DD-052 | WriteGuard — same-iteration SHA-256 hash enforcement before any Flowise write |
 
 ---
 

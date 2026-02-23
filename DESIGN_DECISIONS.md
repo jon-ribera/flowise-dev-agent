@@ -1133,3 +1133,105 @@ so existing sessions started without these fields don't fail with `KeyError`.
   appended; a merge reducer matches the actual write pattern.
 - Separate top-level TypedDict per domain: requires changing `AgentState` every time a
   new domain is added; the domain-keyed dict is open to extension without schema changes.
+
+---
+
+## DD-051 — Patch IR Schema (AddNode / SetParam / Connect / BindCredential)
+
+**Date**: 2026-02-23
+**Decision**: Replace "LLM writes full flowData JSON" with a typed Intermediate Representation
+(IR) where the LLM produces a list of atomic operation objects and a deterministic compiler
+translates them to the final Flowise API payload.
+
+**Four op types:**
+| Op | Purpose |
+|----|---------|
+| `AddNode` | Add a new Flowise node (type name + unique ID + optional params) |
+| `SetParam` | Set a single `data.inputs` parameter on an existing node |
+| `Connect` | Connect two nodes by anchor *names* (not raw handle strings) |
+| `BindCredential` | Bind a credential ID at both `data.credential` levels |
+
+**JSON discriminator:** each op carries `"op_type"` so deserialisation is unambiguous.
+
+**Implementation** (`flowise_dev_agent/agent/patch_ir.py`):
+- All four ops are `@dataclass` objects (consistent with existing codebase style)
+- `validate_patch_ops(ops, base_node_ids)` catches: empty required fields,
+  duplicate node IDs in AddNode ops, refs to non-existent nodes in Connect/SetParam/BindCredential
+- `ops_from_json(s)` strips `\`\`\`json...\`\`\`` fences from LLM output before parsing
+- `PatchIRValidationError` for programmatic error handling
+
+**Compiler** (`flowise_dev_agent/agent/compiler.py`):
+- `GraphIR` — canonical in-memory graph (nodes + edges)
+- `GraphIR.from_flow_data(raw)` — parse existing Flowise flowData into GraphIR
+- `compile_patch_ops(base_graph, ops, schema_cache)` — applies ops, returns `CompileResult`
+- `CompileResult` carries: `flow_data`, `flow_data_str`, `payload_hash`, `diff_summary`, `errors`
+- Anchor IDs derived deterministically from `_get_node_processed()` schemas (substitutes
+  `{nodeId}` placeholder with actual node ID)
+- Edge IDs: `"{src_node_id}-{src_anchor}-{tgt_node_id}-{tgt_anchor}"` — stable, no randomness
+- Auto-layout: places new nodes in a 300px × 200px grid right of existing nodes
+
+**Reason**: LLM-generated raw flowData JSON caused three recurring failure categories:
+1. Wrong handle string format (LLM guesses anchor IDs that don't match schema)
+2. Missing `data.credential` at both required levels (LLM sets only one)
+3. Invalid JSON structure (`{}` instead of `{"nodes":[],"edges":[]}`)
+By shrinking the LLM's output to anchor *names* (not handles) and credential *IDs* (not
+both locations), each category is eliminated at compile time, not discovered at Flowise-write time.
+
+**Key invariant**: The LLM NEVER writes handle IDs or edge IDs. The compiler derives them from
+`_get_node_processed()` schemas. This eliminates the most common source of Flowise HTTP 500s.
+
+**Backwards compatibility**: `build_graph(capabilities=None)` still uses the original
+LLM-driven `_make_patch_node()`. The IR path is only active when capabilities are provided.
+
+**Rejected alternatives**:
+- Strict typed output (Pydantic structured output): adds a Pydantic round-trip and LLM-side
+  schema compliance pressure; `ops_from_json` with fence stripping is simpler and equally safe.
+- Keep full flowData LLM-generated but post-process: you'd need a second LLM call to "fix"
+  bad handle strings, losing the determinism benefit entirely.
+
+---
+
+## DD-052 — WriteGuard: Same-Iteration Hash Enforcement
+
+**Date**: 2026-02-23
+**Decision**: Any Flowise write (`create_chatflow` / `update_chatflow`) is blocked by code
+unless the exact payload that was written also passed `validate_flow_data` in the same iteration.
+
+**Mechanism** (`flowise_dev_agent/agent/tools.py — WriteGuard`):
+1. `guard.authorize(flow_data_str)` — called after `_validate_flow_data()` succeeds.
+   Computes SHA-256 of `flow_data_str` and stores it as the authorized hash.
+2. `guard.check(flow_data_str)` — called inside guarded `create_chatflow` / `update_chatflow`
+   wrappers before the Flowise API call. Raises `PermissionError` if:
+   - `authorize()` was never called → `"ValidationRequired"` error
+   - payload differs from the authorized one → `"HashMismatch"` error
+3. `guard.revoke()` — called after a successful write. One-shot: re-authorization required
+   before any subsequent write.
+
+**`_make_flowise_executor(client, guard=None)`** — updated to accept an optional `WriteGuard`.
+When `guard is not None`, the three tools `validate_flow_data`, `create_chatflow`,
+`update_chatflow` are replaced with guarded wrappers. When `guard=None` (default), behaviour
+is identical to pre-M2 (no guard, full backwards compat).
+
+**State field** `validated_payload_hash: str | None` in `AgentState` — the patch node
+stores the authorized hash after a successful write for audit trail purposes.
+
+**In the v2 patch node** (`_make_patch_node_v2`), the guard is built locally per iteration:
+the compiler produces `CompileResult.payload_hash`, `guard.authorize(flow_data_str)` is called
+explicitly, and write tools are wrapped with the guard. This means even if a future refactor
+accidentally modifies the payload between validation and write, the guard raises at call time.
+
+**Reason**: The primary risk in a code-driven patch system is "drift" between the flowData
+that the structural validator checked and the flowData that is actually written. A hash-match
+gate makes this physically impossible: the compiler's output is the validator's input is the
+write's input, all the same bytes.
+
+**Error types returned by the guard** (both as `PermissionError`):
+- `"ValidationRequired"` — write called before validation; tells caller to call `validate_flow_data` first
+- `"HashMismatch"` — payload was modified after validation; caller must re-validate
+
+**Rejected alternatives**:
+- Re-running validation inside the write wrapper: expensive; validation already happened at
+  the compile step. A hash check is O(n) on payload size — trivially fast.
+- Requiring an explicit `authorized_hash` parameter on `create_chatflow` / `update_chatflow`:
+  changes tool signatures; requires LLM to pass the hash it doesn't know. The guard closure
+  is transparent to callers.

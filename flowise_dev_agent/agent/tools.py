@@ -26,6 +26,7 @@ See DESIGN_DECISIONS.md — DD-008, DD-048.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time as _time
@@ -731,11 +732,68 @@ def _cached(key: str, ttl: float, fn: Callable) -> Callable:
     return wrapper
 
 
-def _make_flowise_executor(client: FlowiseClient) -> dict[str, Callable[..., Any]]:
-    """Return tool_name → async callable mapping for the FlowiseClient."""
+def _make_flowise_executor(
+    client: FlowiseClient,
+    guard: "WriteGuard | None" = None,
+) -> dict[str, Callable[..., Any]]:
+    """Return tool_name → async callable mapping for the FlowiseClient.
+
+    guard: optional WriteGuard instance.  When provided, three tools are
+           wrapped with enforcement logic (DD-052):
+             validate_flow_data → records authorized hash on success
+             create_chatflow    → blocked if payload hash does not match
+             update_chatflow    → blocked if flow_data hash does not match
+
+           When guard is None (default), behaviour is identical to pre-M2:
+           no hash tracking, no write blocking.  Backwards-compatible.
+    """
     import os as _os
     _cache_ttl = float(_os.getenv("DISCOVER_CACHE_TTL_SECS", "300"))
     _client_key = id(client)
+
+    # Base (unguarded) implementations
+    def _validate_raw(flow_data_str: str) -> dict:
+        return _validate_flow_data(flow_data_str)
+
+    async def _create_raw(**kwargs: Any) -> Any:
+        return await client.create_chatflow(**kwargs)
+
+    async def _update_raw(**kwargs: Any) -> Any:
+        return await client.update_chatflow(**kwargs)
+
+    # Guarded wrappers (only active when guard is provided)
+    if guard is not None:
+        def _validate_guarded(flow_data_str: str) -> dict:
+            result = _validate_flow_data(flow_data_str)
+            if result.get("valid"):
+                guard.authorize(flow_data_str)
+            return result
+
+        async def _create_guarded(**kwargs: Any) -> Any:
+            flow_data = kwargs.get("flow_data", "")
+            if flow_data:
+                guard.check(str(flow_data))
+            result = await client.create_chatflow(**kwargs)
+            if flow_data:
+                guard.revoke()
+            return result
+
+        async def _update_guarded(**kwargs: Any) -> Any:
+            flow_data = kwargs.get("flow_data", "")
+            if flow_data:
+                guard.check(str(flow_data))
+            result = await client.update_chatflow(**kwargs)
+            if flow_data:
+                guard.revoke()
+            return result
+
+        validate_fn: Callable = _validate_guarded
+        create_fn: Callable = _create_guarded
+        update_fn: Callable = _update_guarded
+    else:
+        validate_fn = _validate_raw
+        create_fn = _create_raw
+        update_fn = _update_raw
 
     return {
         # Discovery tools
@@ -751,16 +809,92 @@ def _make_flowise_executor(client: FlowiseClient) -> dict[str, Callable[..., Any
             f"list_marketplace_templates:{_client_key}", _cache_ttl,
             lambda: _list_marketplace_templates_slim(client),
         ),
-        # Patch tools
-        "validate_flow_data": lambda flow_data_str: _validate_flow_data(flow_data_str),
+        # Patch tools (validate/write are optionally guarded)
+        "validate_flow_data": validate_fn,
         "snapshot_chatflow": lambda chatflow_id, session_id, version_label=None: _snapshot_chatflow(client, chatflow_id, session_id, version_label),
         "rollback_chatflow": lambda chatflow_id, session_id, version_label=None: _rollback_chatflow(client, chatflow_id, session_id, version_label),
-        "create_chatflow": client.create_chatflow,
-        "update_chatflow": client.update_chatflow,
+        "create_chatflow": create_fn,
+        "update_chatflow": update_fn,
         # Test tools
         "create_prediction": client.create_prediction,
         "upsert_vector": client.upsert_vector,
     }
+
+
+# ---------------------------------------------------------------------------
+# Write guard — same-iteration hash enforcement (DD-052)
+# ---------------------------------------------------------------------------
+
+
+class WriteGuard:
+    """Enforces same-iteration validation before any Flowise write.
+
+    Lifecycle (one guard instance per patch iteration):
+      1. A validated payload is registered via ``authorize(flow_data_str)``
+         (called automatically by the guarded validate_flow_data wrapper when
+         validation passes).
+      2. The guarded create_chatflow / update_chatflow wrappers call
+         ``check(flow_data_str)`` before writing.  If the payload changed
+         since validation the write is blocked with a PermissionError.
+      3. After a successful write ``revoke()`` is called so the guard cannot
+         be reused for a second write without re-validation.
+
+    Invariant: No Flowise write can succeed unless the exact payload that
+    was written also passed ``validate_flow_data`` in the same iteration.
+
+    See DD-052 and roadmap3_architecture_optimization.md — Milestone 2.
+    """
+
+    def __init__(self) -> None:
+        self._authorized_hash: str | None = None
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def authorize(self, flow_data_str: str) -> str:
+        """Record that this payload passed validation.
+
+        Computes SHA-256 of ``flow_data_str`` and stores it as the
+        authorized hash.  Any subsequent write with a different payload
+        will be blocked by ``check()``.
+
+        Returns the hash string (for recording in state).
+        """
+        h = hashlib.sha256(flow_data_str.encode("utf-8")).hexdigest()
+        self._authorized_hash = h
+        return h
+
+    def check(self, flow_data_str: str) -> None:
+        """Assert the payload matches the authorized hash.
+
+        Raises PermissionError when:
+          - ``authorize()`` was never called (ValidationRequired)
+          - The payload hash differs from what was authorized (HashMismatch)
+        """
+        if self._authorized_hash is None:
+            raise PermissionError(
+                "ValidationRequired: flow_data has not been validated this iteration. "
+                "Call validate_flow_data(flow_data) before create_chatflow or "
+                "update_chatflow to register the authorized payload."
+            )
+        actual = hashlib.sha256(flow_data_str.encode("utf-8")).hexdigest()
+        if actual != self._authorized_hash:
+            raise PermissionError(
+                "HashMismatch: the flow_data payload changed since validate_flow_data "
+                "was called. Re-validate the new payload before writing. "
+                f"(authorized={self._authorized_hash[:16]}…, "
+                f"received={actual[:16]}…)"
+            )
+
+    def revoke(self) -> None:
+        """Revoke write authorization (one-shot: resets after a successful write)."""
+        self._authorized_hash = None
+
+    @property
+    def authorized_hash(self) -> str | None:
+        """The hash of the currently authorized payload (None = not yet validated)."""
+        return self._authorized_hash
 
 
 # ---------------------------------------------------------------------------

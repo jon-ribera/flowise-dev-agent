@@ -1,6 +1,6 @@
 # Roadmap 3: Architecture Optimization — Multi-Domain Abstraction Layer
 
-**Status:** Milestone 1 in progress
+**Status:** Milestone 2 complete — Milestone 3 (real Workday MCP) is next
 **Created:** 2026-02-23
 **Branch:** feat/strategic-architecture-optimization
 
@@ -196,7 +196,7 @@ The `converge_verdict` state field continues to receive `.to_dict()` output for 
 
 ## Phased Implementation Plan
 
-### Milestone 1 — Scaffolding (This Prompt) ✅ IN PROGRESS
+### Milestone 1 — Scaffolding ✅ COMPLETE
 
 **Scope:**
 - `ToolResult` envelope in `tools.py`
@@ -222,7 +222,7 @@ The `converge_verdict` state field continues to receive `.to_dict()` output for 
 
 ---
 
-### Milestone 2 — Patch IR + Compiler (Next Prompt)
+### Milestone 2 — Patch IR + Compiler ✅ COMPLETE
 
 **Scope:**
 - `PatchIR` schema: typed representation of a chatflow delta (node add/remove/update, edge add/remove)
@@ -233,10 +233,11 @@ The `converge_verdict` state field continues to receive `.to_dict()` output for 
 - `patch` node updated to execute `compile_ops()` then apply validated PatchIR
 - `DomainCapability.validate()` — replaces stubs with real structural checks
 
-**Checkpoints:**
-- `compile_ops()` returns typed PatchIR for a simple single-node addition
-- Applying invalid PatchIR raises `PatchValidationError` (never reaches Flowise)
-- LLM-driven patch fallback still available as escape hatch
+**Checkpoints (all verified):**
+- `compile_patch_ops()` returns `CompileResult` for single-node and multi-node ops
+- `validate_patch_ops()` raises errors for invalid Connect refs (never reaches Flowise)
+- LLM-driven patch fallback still available when `capabilities=None` (unchanged)
+- 28/28 tests pass in `tests/test_patch_ir.py`
 
 ---
 
@@ -278,11 +279,11 @@ The `converge_verdict` state field continues to receive `.to_dict()` output for 
 | WorkdayCapability (stub) | ✅ | | |
 | State: artifacts/facts/debug | ✅ | | |
 | Compact context enforcement | ✅ | | |
-| Patch IR schema | | ✅ | |
-| Deterministic compiler | | ✅ | |
-| Compiler guard rails | | ✅ | |
-| DomainCapability.validate() | | ✅ | |
-| DomainCapability.compile_ops() | | ✅ | |
+| Patch IR schema | | ✅ Complete | |
+| Deterministic compiler | | ✅ Complete | |
+| Compiler guard rails | | ✅ Complete | |
+| DomainCapability.validate() | | ✅ Complete | |
+| DomainCapability.compile_ops() | | ✅ Complete | |
 | Real Workday MCP | | | ✅ |
 | Cross-domain planner | | | ✅ |
 | Embedded UX | | | ✅ |
@@ -303,10 +304,23 @@ Quick reference:
 
 ---
 
-## Design Decisions Added in This Milestone
+## Design Decisions Added in Milestone 1
 
 - **DD-046** — `DomainCapability` as primary abstraction boundary (wraps DomainTools, adds behavioral contract)
 - **DD-047** — `WorkdayCapability` stub-first approach (interface complete before API is connected)
 - **DD-048** — `ToolResult` as single transformation point (`_wrap_result()` in tools.py, enforced via `result_to_str()`)
 - **DD-049** — Dual-key executor (namespaced + simple) for zero-regression backwards compatibility
 - **DD-050** — State trifurcation: transcript / canonical artifacts / debug
+
+## Design Decisions Added in Milestone 2
+
+- **DD-051** — Patch IR schema (`AddNode` / `SetParam` / `Connect` / `BindCredential`) + deterministic compiler
+  - LLM outputs anchor *names*, not handle strings; compiler derives all handle IDs from schemas
+  - Edge IDs are deterministic: `"{src}-{src_anchor}-{tgt}-{tgt_anchor}"`
+  - `validate_patch_ops()` catches structural errors (dangling refs, duplicates) before compilation
+  - `compile_patch_ops()` returns `CompileResult` with `flow_data`, `payload_hash`, `diff_summary`
+- **DD-052** — `WriteGuard` same-iteration hash enforcement
+  - `authorize(flow_data_str)` records SHA-256 after `_validate_flow_data()` passes
+  - `check(flow_data_str)` blocks write if payload changed since validation (`HashMismatch`) or was never validated (`ValidationRequired`)
+  - `_make_flowise_executor(client, guard=None)` — guard=None preserves full backwards compat
+  - `_make_patch_node_v2()` selects when `build_graph(capabilities=[...])` — original patch node unchanged for `capabilities=None`

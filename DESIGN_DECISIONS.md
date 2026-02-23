@@ -381,3 +381,392 @@ flowise-dev-agent (this repo)
 
 **What lives here**: LangGraph graph, FastAPI API, ReasoningEngine, skill files,
 HITL interrupt nodes, converge evaluator.
+
+---
+
+## DD-024 — SQLite Session Persistence via AsyncSqliteSaver
+
+**Date**: 2026-02-22
+**Decision**: Replace the development-only `MemorySaver` checkpointer with
+`AsyncSqliteSaver` as the default production checkpointer. The database path
+is configured via `SESSIONS_DB_PATH` (default: `sessions.db`).
+
+**Reason**: Sessions must survive server restarts for any production use.
+`MemorySaver` loses all session state on process exit, making it impossible
+to resume a session after a deployment or crash. `AsyncSqliteSaver` requires
+no external infrastructure (no Redis, no Postgres) and is sufficient for
+single-instance deployments.
+
+**Implementation**: `api.py` lifespan now opens an `AsyncSqliteSaver` context
+manager and injects the checkpointer into `build_graph()`. The `build_graph()`
+signature was already designed to accept a `checkpointer=` argument (DD-004).
+
+**Rejected alternatives**:
+- `PostgresSaver`: correct for multi-instance/HA deployments but adds infra overhead
+  not needed for v1. Can be swapped in by changing `SESSIONS_DB_PATH` to a Postgres
+  connection string and updating the import when needed.
+- Keeping `MemorySaver` with a warning: not acceptable for production — any restart
+  orphans all in-flight sessions with no recovery path.
+
+---
+
+## DD-027 — LangSmith Tracing (Optional, Zero-Code-Change)
+
+**Date**: 2026-02-22
+**Decision**: Activate LangSmith distributed tracing by setting `LANGCHAIN_API_KEY`
+in the environment. When the key is present, the lifespan sets
+`LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_PROJECT` before the graph is created.
+No other code changes are needed.
+
+**Reason**: LangGraph auto-instruments all LLM calls, tool calls, and token counts
+when `LANGCHAIN_TRACING_V2` is set. This gives full per-session observability
+(latency, token cost, node-by-node traces) at zero implementation cost. The feature
+is opt-in — omitting the API key leaves the agent unchanged.
+
+**Rejected alternatives**:
+- Always-on tracing: forces a LangSmith account on every developer, adds network
+  overhead even in local dev.
+- Custom span instrumentation: significant effort for the same data LangGraph already
+  emits automatically.
+
+---
+
+## DD-025 — Streaming SSE Endpoints
+
+**Date**: 2026-02-22
+**Decision**: Add `POST /sessions/stream` and `POST /sessions/{thread_id}/stream`
+as streaming variants of the existing create and resume endpoints. Both return
+`text/event-stream` responses using LangGraph's `astream_events(version="v2")`.
+
+**Event types**:
+- `token` — LLM output token (from `on_chat_model_stream`)
+- `tool_call` — tool being invoked (from `on_tool_start`)
+- `tool_result` — tool result preview (from `on_tool_end`)
+- `interrupt` — HITL pause reached (emitted as the final event)
+- `done` — session complete (emitted as the final event)
+- `error` — unhandled exception
+
+**Reason**: The discover and patch phases take 30–60 seconds. Without streaming,
+clients wait in silence. Streaming tokens and tool call events give live feedback
+that a long-running phase is progressing normally, dramatically improving DX.
+
+**Design choices**:
+- `aget_state()` (async) is used at the end of the stream instead of `get_state()`
+  since the stream runs in an async context and the SQLite checkpointer is async.
+- Anthropic content blocks (list of dicts) are flattened to text in `_sse_from_event`.
+- The blocking `/sessions` and `/sessions/{id}/resume` endpoints are preserved
+  unchanged — streaming is opt-in for clients that support SSE.
+
+**Rejected alternatives**:
+- WebSockets: more complex client setup, stateful connection required. SSE is
+  simpler for one-way server-to-client streaming and works with `curl -N`.
+- Long-polling: requires the client to repeatedly re-connect; adds server overhead.
+
+---
+
+## DD-026 — Chatflow Snapshot / Rollback
+
+**Date**: 2026-02-22
+**Decision**: Before every `update_chatflow`, the agent calls `snapshot_chatflow`
+to save the current `flowData` to an in-memory store keyed by `session_id`.
+A new `POST /sessions/{thread_id}/rollback` endpoint restores the last snapshot
+by calling `update_chatflow` with the saved `flowData`.
+
+**Reason**: Patches are irreversible in Flowise — once `update_chatflow` is called
+there is no undo. A snapshot taken before every write gives the developer a
+one-click rollback path if a patch breaks the flow or produces wrong behavior.
+
+**Implementation**: `_snapshots: dict[str, list[dict]]` in `tools.py` holds snapshots
+in-process. The session `thread_id` is used as `session_id` to scope snapshots.
+
+**Limitations / future work**:
+- In-memory store: snapshots are lost on server restart. A future version should
+  persist snapshots to the SQLite sessions database (same file as DD-024).
+- Only the last snapshot per session is used by rollback (simple stack pop).
+
+**Rejected alternatives**:
+- No-op (relying on developers to manually re-read and re-apply): too error-prone
+  when patches break flows mid-iteration.
+- Flowise version history API: Flowise doesn't expose one.
+
+---
+
+## DD-028 — API Key Authentication (Optional Bearer Token)
+
+**Date**: 2026-02-22
+**Decision**: Add an optional `_verify_api_key` FastAPI dependency injected into
+every route via `dependencies=[Depends(_verify_api_key)]`. When `AGENT_API_KEY`
+is set, all requests must include `Authorization: Bearer <key>`. When the env var
+is absent, the API is open (dev mode).
+
+**Reason**: The agent API can trigger writes to Flowise (create/update chatflows).
+Without auth, any process with network access to the server can trigger these writes.
+A simple Bearer token is the minimum viable protection for non-localhost deployments.
+
+**Rejected alternatives**:
+- Always-required auth: breaks zero-config local development. The opt-in pattern
+  matches twelve-factor app conventions and requires no change to dev workflows.
+- OAuth/JWT: significant complexity for an internal developer tool. Simple Bearer
+  token is appropriate for single-tenant use.
+
+---
+
+## DD-029 — Token Budget Tracking
+
+**Date**: 2026-02-22
+**Decision**: Track cumulative LLM token usage (prompt + completion) across the
+full session lifecycle. Each node that calls the LLM returns `total_input_tokens`
+and `total_output_tokens` deltas. A `_sum_int` reducer on `AgentState` accumulates
+these across all nodes. Totals are surfaced in every `SessionResponse`.
+
+**Reason**: Long Discover + multi-iteration loops can consume large token budgets.
+Operators need visibility into per-session cost. Surfacing totals in the API response
+enables cost dashboards, budget alerts, and capacity planning without any external
+instrumentation.
+
+**Implementation**:
+- `EngineResponse.input_tokens` / `.output_tokens` populated by both `ClaudeEngine`
+  and `OpenAIEngine` from their respective usage objects.
+- `AgentState.total_input_tokens` / `.total_output_tokens` with `Annotated[int, _sum_int]`
+  reducer — each node contributes its delta; LangGraph accumulates automatically.
+- `_react()` returns a 4-tuple `(text, messages, in_tok, out_tok)`; plan and converge
+  nodes read from `response.input_tokens` / `.output_tokens` directly.
+- `SessionResponse` exposes both totals at the API level.
+
+**Rejected alternatives**:
+- External observability only (LangSmith): requires a separate service and doesn't
+  surface token counts directly in the API response.
+- Counting tokens client-side: inaccurate (depends on tokenizer) and not available
+  before the API call returns.
+
+---
+
+## DD-030 — Session Browser API
+
+**Date**: 2026-02-22
+**Decision**: Add `GET /sessions` (list all sessions) and `DELETE /sessions/{thread_id}`
+(permanently remove a session) to the FastAPI service.
+
+**Reason**: Operators need to enumerate active/completed sessions and clean up stale
+ones without direct database access. The listing endpoint also enables building a
+simple management UI on top of the API.
+
+**Implementation**:
+- `GET /sessions`: queries `SELECT DISTINCT thread_id FROM checkpoints` via the
+  `AsyncSqliteSaver.conn` (aiosqlite connection), then calls `graph.aget_state()` per
+  thread to build a lightweight `SessionSummary` (status, iteration, chatflow_id,
+  token totals). Status is inferred: `pending_interrupt` if any task has interrupts,
+  `completed` if `state.done` or no `snapshot.next`, otherwise `in_progress`.
+- `DELETE /sessions/{thread_id}`: verifies thread existence, then calls
+  `checkpointer.adelete_thread(thread_id)` which removes rows from both the
+  `checkpoints` and `writes` tables.
+
+**Rejected alternatives**:
+- `alist(None)` instead of raw SQL: iterates every checkpoint row (not just distinct
+  thread_ids), requiring deduplication in Python — less efficient.
+- Separate admin service: unnecessary complexity for an internal developer tool.
+
+---
+
+## DD-031 — Pattern Library (Self-Improvement)
+
+**Date**: 2026-02-22
+**Decision**: After every DONE verdict the agent automatically saves the requirement text
+and chatflow flowData to a `patterns` SQLite table. A new `search_patterns(keywords)`
+Discover tool lets the LLM query the library before doing full API discovery. A matching
+pattern can be reused directly, skipping most of the list_nodes/get_node/validate cycle.
+
+**Implementation**:
+- `flowise_dev_agent/agent/pattern_store.py` — `PatternStore` async class with `setup()`,
+  `save_pattern()`, `search_patterns()`, `increment_success()`, and `list_patterns()`.
+  Uses `aiosqlite` (transitive dep from langgraph-checkpoint-sqlite).
+- `PatternDomain` in `tools.py` — wraps `PatternStore` as a `DomainTools` plugin;
+  exposes `search_patterns` and `use_pattern` in the Discover phase.
+- `_make_converge_node()` accepts optional `client` and `pattern_store`; when the
+  verdict is DONE it fetches the final `flowData` via `client.get_chatflow()` and
+  calls `pattern_store.save_pattern()`. Failure is logged but non-fatal.
+- `build_graph()` accepts `pattern_store=` and auto-appends `PatternDomain` to
+  `domains` when provided. The same `pattern_store` object is threaded to converge.
+- `GET /patterns` endpoint exposes the library for inspection and search.
+- `PATTERN_DB_PATH` env var (default: same SQLite file as sessions).
+- Rule 14 added to `flowise_builder.md`: always call `search_patterns` first in Discover.
+
+**Keyword search**: splits query on whitespace, runs `LIKE %word%` per word with a
+CASE WHEN match-score counter. Results ranked by match_score then success_count.
+
+**Rejected alternatives**:
+- Full-text search (FTS5): adds complexity without meaningful benefit for short
+  requirement descriptions. LIKE search is sufficient at this scale.
+- Store patterns as a tool-result in the discover context: too verbose; the LLM
+  would see full flowData for every pattern in every Discover call.
+
+---
+
+## DD-032 — Multiple Flowise Instances
+
+**Date**: 2026-02-22
+**Decision**: Support routing different sessions to different Flowise deployments
+(dev/staging/prod, or separate customer tenants) via a `FlowiseClientPool`.
+The session request carries an optional `flowise_instance_id` which is stored in
+`AgentState` and used to resolve the correct client for rollback.
+
+**Implementation**:
+- `flowise_dev_agent/instance_pool.py` — `FlowiseClientPool` class. Reads
+  `FLOWISE_INSTANCES` env var (JSON array of `{id, endpoint, api_key}` objects).
+  Falls back to a single default instance from `FLOWISE_*` env vars when unset.
+- `StartSessionRequest.flowise_instance_id` (optional) — passed to `_initial_state()`.
+- `AgentState.flowise_instance_id` — persisted in checkpoint so rollback uses the
+  correct client even after server restart.
+- `_get_client(request, instance_id)` helper in `api.py` — resolves client from pool.
+- `GET /instances` endpoint — returns available instance IDs for introspection.
+- Rollback endpoint reads `instance_id` from state and resolves the client via pool.
+
+**Limitations**:
+- The graph is compiled with the default instance's domain tools. Routing per-session
+  to a different instance's graph (with different node schemas) is not yet supported.
+- Future work: compile separate graphs per instance, or reload domains dynamically.
+
+**Rejected alternatives**:
+- Per-session graph compilation: very high latency; not practical for interactive sessions.
+- Single shared client with instance routing: would require passing instance_id through
+  every tool call, coupling the tool layer to the routing layer.
+
+---
+
+## DD-033 — Requirement Clarification Node
+
+**Date**: 2026-02-22
+**Decision**: Insert a new `clarify` HITL node between `START` and `discover` in the
+graph topology. The node calls the LLM with a requirements-analyst prompt, scores
+ambiguity 0–10, and issues a HITL interrupt with 2–3 targeted questions when the
+score is ≥ 5. If the score is < 5, or if `SKIP_CLARIFICATION=true`, the node passes
+through immediately with `clarification: None`.
+
+**New graph topology**:
+```
+START → clarify → discover → check_credentials → plan → ...
+```
+
+**Reason**: The most expensive failure mode in the agent loop is an ITERATE cycle
+caused by a misunderstood requirement — the agent builds the wrong thing, tests it,
+fails, and has to rebuild. Front-loading 2–3 targeted questions about LLM provider,
+memory, RAG, and new-vs-modify decisions eliminates the most common sources of
+ambiguity before any expensive API calls are made.
+
+**Implementation**:
+- `AgentState.clarification: str | None` — stores the developer's answers; `None`
+  when clarification was not needed or was skipped.
+- `_CLARIFY_SYSTEM` prompt in `graph.py` — instructs the LLM on the 0–10 scoring
+  rubric and question format.
+- `_make_clarify_node(engine)` — async node factory; reads `SKIP_CLARIFICATION` env
+  var and issues `interrupt({"type": "clarification", ...})` when score ≥ 5.
+- `discover` node updated to prepend clarification answers to `user_content` when
+  `state["clarification"]` is set.
+- `SKIP_CLARIFICATION=false` added to `.env.example`.
+- `"clarification": None` added to `_initial_state()` in `api.py`.
+- `InterruptPayload.type` description updated to include `"clarification"`.
+
+**Bypass**: Set `SKIP_CLARIFICATION=true` to disable for automated pipelines and tests.
+
+**Rejected alternatives**:
+- Always ask questions: adds latency to every session, even for clear requirements.
+- Static keyword matching to detect ambiguity: too brittle; LLM scoring generalises better.
+- Ask questions in the plan node: too late — by then the discover phase has already
+  run without the developer's input.
+
+---
+
+## DD-034 — Session Export / Audit Trail
+
+**Date**: 2026-02-22
+**Decision**: Add `GET /sessions/{thread_id}/summary` which returns a human-readable
+markdown document summarising the session. The response includes requirement, chatflow
+ID, status, iteration count, token totals, clarifications, approved plan, discovery
+summary, and test results — all read from existing `AgentState` fields.
+
+**Reason**: Teams need to hand off sessions between developers, produce compliance
+artefacts, and debug failures without direct database access. A structured markdown
+summary captures the full lifecycle of a session in a shareable format that works
+in GitHub comments, Slack, Confluence, and plain terminals.
+
+**Implementation**:
+- New endpoint in `api.py`: `GET /sessions/{thread_id}/summary` → `{"thread_id": ..., "summary": "..."}`.
+- Uses the synchronous `graph.get_state(config)` (same as `_build_response`); no new
+  state fields are read or written.
+- Sections are only included when the corresponding state field is non-empty, so
+  early-stage sessions produce a short summary and completed sessions produce a full one.
+- Clarification section added so auditors can see the questions and answers that
+  shaped the requirement.
+
+**Rejected alternatives**:
+- Return structured JSON instead of markdown: markdown is immediately readable without
+  tooling; structured JSON can be derived later if needed.
+- Store the summary in state: pure formatting over existing data; no persistence needed.
+
+---
+
+## DD-035 — Discover Response Caching
+
+**Date**: 2026-02-22
+**Decision**: Wrap `list_nodes` and `list_marketplace_templates` in a monotonic-clock
+TTL cache keyed by `f"{tool_name}:{id(client)}"`. The default TTL is 5 minutes,
+configurable via `DISCOVER_CACHE_TTL_SECS`. Setting the TTL to 0 disables caching.
+
+**Reason**: `list_nodes` returns ~162k tokens of node schema data. `list_marketplace_templates`
+(trimmed) returns ~3k tokens but requires a network round-trip every call. Both responses
+are stable across sessions — the Flowise node registry doesn't change between requests.
+A 5-minute TTL eliminates 20–30% of per-session token cost and reduces Flowise API load
+with zero change to agent behaviour.
+
+**Implementation**:
+- `_tool_cache: dict[str, tuple[Any, float]]` module-level dict in `tools.py`.
+- `_cached(key, ttl, fn)` — returns an async wrapper that checks the cache before
+  calling `fn`, stores the result on a miss, and respects `ttl=0` as a disable flag.
+- `_make_flowise_executor()` reads `DISCOVER_CACHE_TTL_SECS` via `os.getenv` and
+  wraps the two tools at executor construction time.
+- Cache key uses `id(client)` to scope per-instance (supports multi-instance pools).
+- `DISCOVER_CACHE_TTL_SECS=300` added to `.env.example`.
+
+**Trade-offs**:
+- In-process cache: lost on server restart (acceptable — TTL is short).
+- `id(client)` reuse: safe because the client is held for the process lifetime.
+- Node schemas never change mid-session; 5-minute staleness window is acceptable.
+
+**Rejected alternatives**:
+- Redis/external cache: adds infrastructure for a minor optimisation.
+- Caching `get_node` results: node schemas are fetched selectively per type and vary
+  by name; the per-call cost is low and safe to skip.
+- Cache invalidation on deploy: Flowise doesn't emit events; polling is equivalent to TTL.
+
+---
+
+## DD-036 — Rate Limiting
+
+**Date**: 2026-02-22
+**Decision**: Add `slowapi` rate limiting to `POST /sessions` and `POST /sessions/stream`.
+The per-IP limit defaults to 10 new sessions per minute and is configurable via
+`RATE_LIMIT_SESSIONS_PER_MIN`. Exceeding the limit returns HTTP 429.
+
+**Reason**: Each session start triggers a full Discover phase (LLM calls, Flowise API
+calls, up to 162k tokens of node data). A single misconfigured or malicious caller
+can exhaust the LLM quota and block all other sessions. A per-IP rate limit at the
+session-start endpoints is the minimum viable protection with negligible implementation cost.
+
+**Implementation**:
+- `slowapi>=0.1` and `limits>=3.0` added to `pyproject.toml` dependencies.
+- `Limiter(key_func=get_remote_address)` created at module level in `api.py`.
+- `app.state.limiter = limiter` and `app.add_exception_handler(RateLimitExceeded, ...)`
+  wired immediately after `app = FastAPI(...)`.
+- `@limiter.limit(f"{RATE_LIMIT_SESSIONS_PER_MIN}/minute")` applied to `create_session`
+  and `stream_create_session`. Resume endpoints are not rate-limited — resuming a session
+  is cheap compared to starting one.
+- `RATE_LIMIT_SESSIONS_PER_MIN=10` added to `.env.example`.
+
+**Rejected alternatives**:
+- Rate limiting all endpoints: resume, get, and list endpoints are cheap; no need to
+  restrict legitimate polling or status checks.
+- API-gateway-level limiting (nginx, Caddy): correct for production but adds
+  infrastructure; slowapi provides the same protection with zero operational overhead
+  for single-instance deployments.
+- Token-bucket per API key: more precise but requires tracking state per key; IP-based
+  limiting is sufficient for the single-tenant use case.

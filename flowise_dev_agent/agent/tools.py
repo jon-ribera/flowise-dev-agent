@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time as _time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -279,6 +280,19 @@ _FLOWISE_PATCH_TOOLS: list[ToolDef] = [
         ["chatflow_id"],
     ),
     _td(
+        "snapshot_chatflow",
+        (
+            "Save the current chatflow state as a snapshot before making changes. "
+            "REQUIRED before every update_chatflow — this enables rollback if the patch breaks the flow. "
+            "Use the session thread_id as session_id."
+        ),
+        {
+            "chatflow_id": {"type": "string"},
+            "session_id": {"type": "string", "description": "The session thread_id (used to scope snapshots)"},
+        },
+        ["chatflow_id", "session_id"],
+    ),
+    _td(
         "list_credentials",
         "List credential IDs needed for binding to nodes (data.credential and data.inputs.credential).",
         {}, [],
@@ -322,6 +336,16 @@ _FLOWISE_TEST_TOOLS: list[ToolDef] = [
     _td(
         "get_chatflow",
         "Verify the chatflow exists and is saved before testing.",
+        {"chatflow_id": {"type": "string"}},
+        ["chatflow_id"],
+    ),
+    _td(
+        "upsert_vector",
+        (
+            "Load documents into the vector store for RAG chatflows. "
+            "REQUIRED before testing any RAG flow — the vector store is empty until upserted. "
+            "Call this after creating or modifying a RAG chatflow and before running create_prediction."
+        ),
         {"chatflow_id": {"type": "string"}},
         ["chatflow_id"],
     ),
@@ -588,22 +612,125 @@ def _validate_flow_data(flow_data_str: str) -> dict:
     return {"valid": True, "node_count": len(nodes), "edge_count": len(edges)}
 
 
+# ---------------------------------------------------------------------------
+# Chatflow snapshot / rollback (in-memory store per session)
+# ---------------------------------------------------------------------------
+
+# Maps session_id → list of snapshots (most recent last)
+_snapshots: dict[str, list[dict]] = {}
+
+
+async def _snapshot_chatflow(
+    client: FlowiseClient, chatflow_id: str, session_id: str
+) -> dict:
+    """Save the current chatflow flowData as a snapshot before patching.
+
+    Call this before every update_chatflow so rollback is available if the
+    patch breaks the flow.
+    """
+    import time
+
+    chatflow = await client.get_chatflow(chatflow_id)
+    if "error" in chatflow:
+        return chatflow
+
+    snap = {
+        "chatflow_id": chatflow_id,
+        "name": chatflow.get("name"),
+        "flow_data": chatflow.get("flowData", ""),
+        "timestamp": time.time(),
+    }
+    _snapshots.setdefault(session_id, []).append(snap)
+    logger.debug(
+        "Snapshot saved for chatflow %s (session %s, count=%d)",
+        chatflow_id,
+        session_id,
+        len(_snapshots[session_id]),
+    )
+    return {"snapshotted": True, "snapshot_count": len(_snapshots[session_id])}
+
+
+async def _rollback_chatflow(
+    client: FlowiseClient, chatflow_id: str, session_id: str
+) -> dict:
+    """Restore the last snapshot for a chatflow within this session."""
+    snaps = _snapshots.get(session_id, [])
+    if not snaps:
+        return {"error": "No snapshots found for this session"}
+
+    snap = snaps[-1]
+    logger.info(
+        "Rolling back chatflow %s to snapshot at %.0f (session %s)",
+        chatflow_id,
+        snap["timestamp"],
+        session_id,
+    )
+    return await client.update_chatflow(
+        chatflow_id=chatflow_id,
+        flow_data=snap["flow_data"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Discover response cache (DD-035)
+# Keyed by (instance_id, tool_name) via f"{tool_name}:{id(client)}".
+# TTL configured via DISCOVER_CACHE_TTL_SECS (default: 300 seconds).
+# ---------------------------------------------------------------------------
+
+_tool_cache: dict[str, tuple[Any, float]] = {}  # key → (result, expires_at)
+
+
+def _cached(key: str, ttl: float, fn: Callable) -> Callable:
+    """Wrap an async callable with a monotonic-clock TTL cache.
+
+    Returns a cached value if it was stored within the last `ttl` seconds.
+    Setting ttl=0 disables caching (fn is always called).
+    """
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if ttl > 0:
+            now = _time.monotonic()
+            if key in _tool_cache:
+                value, expires_at = _tool_cache[key]
+                if now < expires_at:
+                    logger.debug("Cache hit: %s", key)
+                    return value
+        result = await fn(*args, **kwargs)
+        if ttl > 0:
+            _tool_cache[key] = (result, _time.monotonic() + ttl)
+        return result
+
+    return wrapper
+
+
 def _make_flowise_executor(client: FlowiseClient) -> dict[str, Callable[..., Any]]:
     """Return tool_name → async callable mapping for the FlowiseClient."""
+    import os as _os
+    _cache_ttl = float(_os.getenv("DISCOVER_CACHE_TTL_SECS", "300"))
+    _client_key = id(client)
+
     return {
         # Discovery tools
         "list_chatflows": client.list_chatflows,
         "get_chatflow": client.get_chatflow,
-        "list_nodes": lambda: _list_nodes_slim(client),
+        "list_nodes": _cached(
+            f"list_nodes:{_client_key}", _cache_ttl,
+            lambda: _list_nodes_slim(client),
+        ),
         "get_node": lambda name: _get_node_processed(client, name),
         "list_credentials": client.list_credentials,
-        "list_marketplace_templates": lambda: _list_marketplace_templates_slim(client),
+        "list_marketplace_templates": _cached(
+            f"list_marketplace_templates:{_client_key}", _cache_ttl,
+            lambda: _list_marketplace_templates_slim(client),
+        ),
         # Patch tools
         "validate_flow_data": lambda flow_data_str: _validate_flow_data(flow_data_str),
+        "snapshot_chatflow": lambda chatflow_id, session_id: _snapshot_chatflow(client, chatflow_id, session_id),
+        "rollback_chatflow": lambda chatflow_id, session_id: _rollback_chatflow(client, chatflow_id, session_id),
         "create_chatflow": client.create_chatflow,
         "update_chatflow": client.update_chatflow,
         # Test tools
         "create_prediction": client.create_prediction,
+        "upsert_vector": client.upsert_vector,
     }
 
 
@@ -646,3 +773,75 @@ def result_to_str(result: Any) -> str:
         return json.dumps(result, default=str)
     except Exception:
         return str(result)
+
+
+async def rollback_session_chatflow(
+    client: FlowiseClient, chatflow_id: str, session_id: str
+) -> dict:
+    """Public wrapper for the rollback API endpoint in api.py."""
+    return await _rollback_chatflow(client, chatflow_id, session_id)
+
+
+# ---------------------------------------------------------------------------
+# Pattern domain — wraps PatternStore as a DomainTools plugin
+# ---------------------------------------------------------------------------
+
+
+_PATTERN_SEARCH_TOOL = _td(
+    "search_patterns",
+    (
+        "Search the pattern library for prior successful chatflows matching your requirement. "
+        "Returns up to 3 patterns with their name, requirement, flowData, and success_count. "
+        "Call this FIRST in Discover before using list_chatflows or list_nodes — "
+        "if a matching pattern exists, you can reuse its flowData directly and skip most discovery. "
+        "Increment success_count with use_pattern(id) when you reuse a pattern."
+    ),
+    {"keywords": {"type": "string", "description": "Space-separated keywords from the requirement"}},
+    ["keywords"],
+)
+
+_PATTERN_USE_TOOL = _td(
+    "use_pattern",
+    (
+        "Record that a pattern from the library is being reused. "
+        "Increments its success_count so highly-reliable patterns surface first in future searches. "
+        "Call this after search_patterns when you decide to base your plan on an existing pattern."
+    ),
+    {"pattern_id": {"type": "integer", "description": "The id returned by search_patterns"}},
+    ["pattern_id"],
+)
+
+
+class PatternDomain(DomainTools):
+    """Tool domain wrapping the pattern library (PatternStore).
+
+    Provides `search_patterns` and `use_pattern` tools in the Discover phase
+    so the LLM can check the library before doing a full Flowise API scan.
+
+    Usage:
+        store = await PatternStore.open(db_path)
+        pattern_domain = PatternDomain(store)
+        graph = build_graph(engine, domains=[flowise_domain, pattern_domain])
+
+    See DESIGN_DECISIONS.md — DD-031.
+    """
+
+    def __init__(self, pattern_store: "PatternStore") -> None:  # noqa: F821
+        super().__init__(
+            name="patterns",
+            discover=[_PATTERN_SEARCH_TOOL, _PATTERN_USE_TOOL],
+            patch=[],
+            test=[],
+            executor={
+                "search_patterns": lambda keywords: pattern_store.search_patterns(keywords),
+                "use_pattern": lambda pattern_id: pattern_store.increment_success(int(pattern_id)),
+            },
+            discover_context=(
+                "PATTERN LIBRARY:\n"
+                "Call search_patterns(keywords) at the START of every Discover phase.\n"
+                "If a relevant pattern is found, use its flowData as the base for the plan\n"
+                "and call use_pattern(id) to record the reuse. Skip list_nodes and\n"
+                "list_marketplace_templates if the pattern already matches the requirement closely.\n"
+                "Patterns are ranked by relevance then success_count — higher count = more reliable."
+            ),
+        )

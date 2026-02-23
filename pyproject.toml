@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=72"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowise-dev-agent"
@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "LangGraph co-pilot for building Flowise chatflows — discover, plan, patch, test, converge"
 requires-python = ">=3.11"
 dependencies = [
-    "cursorwise>=1.0.0",          # FlowiseClient + Settings (Flowise API layer)
+    "cursorwise @ git+https://github.com/jon-ribera/cursorwise.git",  # FlowiseClient + Settings
     "langgraph>=0.2",
     "langchain-core>=0.3",
     "fastapi>=0.115",
@@ -16,14 +16,19 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "python-dotenv>=1.0",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "slowapi>=0.1",
+    "limits>=3.0",
 ]
 
 [project.optional-dependencies]
 claude = ["anthropic>=0.40"]
 openai = ["openai>=1.50"]
+langsmith = ["langsmith>=0.1"]
 
 [project.scripts]
-flowise-agent = "flowise_dev_agent.api:serve"
+flowise-agent     = "flowise_dev_agent.api:serve"
+flowise-agent-cli = "flowise_dev_agent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -225,6 +225,72 @@ Use INCOMPLETE when tests were not run or produced no results.
 """
 
 
+_CLARIFY_SYSTEM = """
+You are a requirements analyst. Read the developer's requirement and decide if it is
+specific enough to build a correct Flowise chatflow without further information.
+
+Score ambiguity 0–10 (0 = fully specified, 10 = completely unclear).
+If score >= 5, output exactly 2–3 YES/NO or short-answer questions that would resolve
+the ambiguity. Focus on: LLM provider, memory requirements, new vs modify, RAG needed.
+If score < 5, output: CLEAR
+
+Format:
+SCORE: N
+QUESTIONS:
+1. ...
+2. ...
+"""
+
+
+def _make_clarify_node(engine: ReasoningEngine):
+    async def clarify(state: AgentState) -> dict:
+        """Pre-discover: ask clarifying questions if requirement is ambiguous (DD-033).
+
+        Scores requirement ambiguity 0-10. If score >= 5, issues a HITL interrupt
+        with 2-3 targeted questions. Bypassed when SKIP_CLARIFICATION=true.
+        """
+        import os
+        if os.getenv("SKIP_CLARIFICATION", "").lower() in ("true", "1", "yes"):
+            return {"clarification": None}
+
+        response = await engine.complete(
+            messages=[Message(role="user", content=state["requirement"])],
+            system=_CLARIFY_SYSTEM,
+            tools=None,
+        )
+        text = (response.content or "").strip()
+
+        if text.upper().startswith("SCORE"):
+            score_line = text.splitlines()[0]
+            try:
+                score = int(score_line.split(":")[1].strip())
+            except (IndexError, ValueError):
+                score = 0
+        else:
+            score = 0
+
+        if score >= 5:
+            developer_response: str = interrupt({
+                "type": "clarification",
+                "prompt": text,
+                "requirement": state["requirement"],
+                "iteration": 0,
+            })
+            return {
+                "clarification": developer_response,
+                "total_input_tokens": response.input_tokens,
+                "total_output_tokens": response.output_tokens,
+            }
+
+        return {
+            "clarification": None,
+            "total_input_tokens": response.input_tokens,
+            "total_output_tokens": response.output_tokens,
+        }
+
+    return clarify
+
+
 def _build_system_prompt(base: str, domains: list[DomainTools], phase: str) -> str:
     """Combine the base system prompt with all domain-specific context additions."""
     extra = merge_context(domains, phase)
@@ -245,7 +311,7 @@ async def _react(
     tools: list[ToolDef],
     executor: dict[str, Any],
     max_rounds: int = 8,
-) -> tuple[str, list[Message]]:
+) -> tuple[str, list[Message], int, int]:
     """Run the LLM in a ReAct loop until it produces a text response.
 
     Each round:
@@ -262,10 +328,13 @@ async def _react(
         max_rounds: Safety cap to prevent runaway loops.
 
     Returns:
-        (final_text, new_messages_produced_in_this_loop)
+        (final_text, new_messages_produced_in_this_loop, input_tokens, output_tokens)
         new_messages includes assistant turns and tool result turns.
+        input_tokens/output_tokens are the cumulative totals across all rounds.
     """
     new_msgs: list[Message] = []
+    total_in = 0
+    total_out = 0
 
     for round_num in range(max_rounds):
         response = await engine.complete(
@@ -273,13 +342,15 @@ async def _react(
             system=system,
             tools=tools or None,
         )
+        total_in += response.input_tokens
+        total_out += response.output_tokens
 
         if not response.has_tool_calls:
             # LLM gave a text answer — loop complete
             final_text = response.content or ""
             new_msgs.append(Message(role="assistant", content=final_text))
-            logger.debug("ReAct complete after %d round(s)", round_num + 1)
-            return final_text, new_msgs
+            logger.debug("ReAct complete after %d round(s): in=%d out=%d", round_num + 1, total_in, total_out)
+            return final_text, new_msgs, total_in, total_out
 
         # LLM requested tool calls
         logger.debug("ReAct round %d: %d tool call(s)", round_num + 1, len(response.tool_calls))
@@ -305,7 +376,7 @@ async def _react(
     )
     new_msgs.append(Message(role="assistant", content=timeout_msg))
     logger.warning("ReAct loop hit max_rounds (%d)", max_rounds)
-    return timeout_msg, new_msgs
+    return timeout_msg, new_msgs, total_in, total_out
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +417,8 @@ def _make_discover_node(engine: ReasoningEngine, domains: list[DomainTools]):
         logger.info("[DISCOVER] iteration=%d", iteration)
 
         user_content = f"My requirement:\n{state['requirement']}"
+        if state.get("clarification"):
+            user_content += f"\n\nClarifications provided:\n{state['clarification']}"
         if state.get("developer_feedback"):
             user_content += f"\n\nDeveloper feedback from previous iteration:\n{state['developer_feedback']}"
 
@@ -353,7 +426,7 @@ def _make_discover_node(engine: ReasoningEngine, domains: list[DomainTools]):
         # Discover runs with only the current user message — tool call responses
         # from list_nodes / list_marketplace_templates can be 500k+ tokens and must
         # not accumulate in state["messages"] for downstream phases to inherit.
-        summary, new_msgs = await _react(engine, [user_msg], system, tool_defs, executor)
+        summary, new_msgs, in_tok, out_tok = await _react(engine, [user_msg], system, tool_defs, executor)
 
         # Build a per-domain context summary (stored for extensibility / debugging)
         domain_context = dict(state.get("domain_context") or {})
@@ -379,6 +452,8 @@ def _make_discover_node(engine: ReasoningEngine, domains: list[DomainTools]):
             "discovery_summary": summary,
             "domain_context": domain_context,
             "credentials_missing": credentials_missing,
+            "total_input_tokens": in_tok,
+            "total_output_tokens": out_tok,
         }
 
     return discover
@@ -486,6 +561,8 @@ def _make_plan_node(engine: ReasoningEngine, domains: list[DomainTools]):
             "messages": [user_msg, assistant_msg],
             "plan": plan_text,
             "developer_feedback": None,  # consumed; clear it
+            "total_input_tokens": response.input_tokens,
+            "total_output_tokens": response.output_tokens,
         }
 
     return plan
@@ -560,7 +637,7 @@ def _make_patch_node(engine: ReasoningEngine, domains: list[DomainTools]):
             ),
             Message(role="assistant", content=f"Approved plan:\n{state.get('plan') or ''}"),
         ]
-        _, new_msgs = await _react(
+        _, new_msgs, in_tok, out_tok = await _react(
             engine,
             ctx + [user_msg],
             system,
@@ -574,6 +651,8 @@ def _make_patch_node(engine: ReasoningEngine, domains: list[DomainTools]):
         return {
             "messages": [user_msg] + new_msgs,
             "chatflow_id": chatflow_id,
+            "total_input_tokens": in_tok,
+            "total_output_tokens": out_tok,
         }
 
     return patch
@@ -610,7 +689,7 @@ def _make_test_node(engine: ReasoningEngine, domains: list[DomainTools]):
 
         # Test only needs the chatflow_id (already in user_msg). No prior tool
         # call history required — _react will make its own create_prediction calls.
-        text, new_msgs = await _react(
+        text, new_msgs, in_tok, out_tok = await _react(
             engine,
             [user_msg],
             system,
@@ -621,6 +700,8 @@ def _make_test_node(engine: ReasoningEngine, domains: list[DomainTools]):
         return {
             "messages": [user_msg] + new_msgs,
             "test_results": text,
+            "total_input_tokens": in_tok,
+            "total_output_tokens": out_tok,
         }
 
     return test
@@ -649,7 +730,11 @@ def _parse_converge_verdict(text: str) -> dict:
     return v
 
 
-def _make_converge_node(engine: ReasoningEngine):
+def _make_converge_node(
+    engine: ReasoningEngine,
+    client: "FlowiseClient | None" = None,
+    pattern_store=None,
+):
     async def converge(state: AgentState) -> dict:
         """Phase 5: Evaluate Definition of Done. Returns done=True or loops.
 
@@ -657,6 +742,9 @@ def _make_converge_node(engine: ReasoningEngine):
           {"verdict": "DONE"|"ITERATE", "category": ..., "reason": ..., "fixes": [...]}
         The plan node reads converge_verdict to inject specific repair instructions
         into the next planning context (evaluator-optimizer feedback loop).
+
+        When the verdict is DONE and a pattern_store is provided, the agent
+        auto-saves the successful chatflow pattern for future reuse (DD-031).
         """
         iteration = state.get("iteration", 0)
         logger.info("[CONVERGE] iteration=%d", iteration)
@@ -689,11 +777,34 @@ def _make_converge_node(engine: ReasoningEngine):
         assistant_msg = Message(role="assistant", content=raw_verdict)
         logger.info("[CONVERGE] verdict=%r done=%s", verdict_dict, is_done)
 
+        # Auto-save pattern when DONE (DD-031)
+        if is_done and pattern_store and client:
+            chatflow_id = state.get("chatflow_id")
+            requirement = state.get("requirement", "")
+            if chatflow_id and requirement:
+                try:
+                    chatflow = await client.get_chatflow(chatflow_id)
+                    flow_data = chatflow.get("flowData", "") if isinstance(chatflow, dict) else ""
+                    name = (
+                        chatflow.get("name") if isinstance(chatflow, dict) else None
+                    ) or requirement[:60]
+                    await pattern_store.save_pattern(
+                        name=name,
+                        requirement_text=requirement,
+                        flow_data=flow_data,
+                        chatflow_id=chatflow_id,
+                    )
+                    logger.info("[CONVERGE] Pattern saved for chatflow %s", chatflow_id)
+                except Exception as exc:
+                    logger.warning("[CONVERGE] Pattern save failed (non-fatal): %s", exc)
+
         return {
             "messages": [user_msg, assistant_msg],
             "done": is_done,
             "iteration": iteration + 1,
             "converge_verdict": verdict_dict if not is_done else None,
+            "total_input_tokens": response.input_tokens,
+            "total_output_tokens": response.output_tokens,
         }
 
     return converge
@@ -775,17 +886,24 @@ def build_graph(
     engine: ReasoningEngine,
     domains: list[DomainTools],
     checkpointer=None,
+    client: "FlowiseClient | None" = None,
+    pattern_store=None,
 ):
     """Construct and compile the Flowise Builder co-pilot LangGraph.
 
     Args:
-        engine:       Reasoning engine (LLM provider). Use create_engine(settings).
-        domains:      List of DomainTools plugins. v1: [FloviseDomain(client)].
-                      v2 (Workday): [FloviseDomain(client), WorkdayDomain(workday_client)].
-        checkpointer: LangGraph checkpointer for persistence + HITL support.
-                      Defaults to MemorySaver (in-memory, suitable for development).
-                      For production: use SqliteSaver or PostgresSaver.
-                      See DESIGN_DECISIONS.md — DD-010.
+        engine:        Reasoning engine (LLM provider). Use create_engine(settings).
+        domains:       List of DomainTools plugins. v1: [FloviseDomain(client)].
+                       v2 (Workday): [FloviseDomain(client), WorkdayDomain(workday_client)].
+        checkpointer:  LangGraph checkpointer for persistence + HITL support.
+                       Defaults to MemorySaver (in-memory, suitable for development).
+                       For production: use SqliteSaver or PostgresSaver.
+                       See DESIGN_DECISIONS.md — DD-010.
+        client:        Optional FlowiseClient passed to converge for pattern auto-save.
+                       Required when pattern_store is provided (DD-031).
+        pattern_store: Optional PatternStore for pattern library (DD-031).
+                       When provided, PatternDomain is auto-appended to domains,
+                       and converge auto-saves patterns after DONE verdicts.
 
     Returns:
         Compiled LangGraph graph ready for ainvoke() / invoke().
@@ -795,20 +913,28 @@ def build_graph(
         checkpointer = MemorySaver()
         logger.info("Using MemorySaver checkpointer (in-memory, dev mode)")
 
+    # Auto-inject PatternDomain when a pattern_store is provided (DD-031)
+    if pattern_store is not None:
+        from flowise_dev_agent.agent.tools import PatternDomain
+        domains = list(domains) + [PatternDomain(pattern_store)]
+        logger.info("PatternDomain injected into domains list")
+
     builder = StateGraph(AgentState)
 
     # Register all nodes
+    builder.add_node("clarify",             _make_clarify_node(engine))
     builder.add_node("discover",            _make_discover_node(engine, domains))
     builder.add_node("check_credentials",   _make_check_credentials_node())
     builder.add_node("plan",                _make_plan_node(engine, domains))
     builder.add_node("human_plan_approval", _make_human_plan_approval_node())
     builder.add_node("patch",               _make_patch_node(engine, domains))
     builder.add_node("test",                _make_test_node(engine, domains))
-    builder.add_node("converge",            _make_converge_node(engine))
+    builder.add_node("converge",            _make_converge_node(engine, client=client, pattern_store=pattern_store))
     builder.add_node("human_result_review", _make_human_result_review_node())
 
     # Fixed edges (always taken)
-    builder.add_edge(START, "discover")
+    builder.add_edge(START, "clarify")
+    builder.add_edge("clarify", "discover")
     builder.add_edge("discover", "check_credentials")  # credential gate before plan
     builder.add_edge("check_credentials", "plan")
     builder.add_edge("plan", "human_plan_approval")

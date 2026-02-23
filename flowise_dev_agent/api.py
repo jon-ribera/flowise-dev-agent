@@ -404,6 +404,9 @@ def _initial_state(
         "test_trials": test_trials,
         "flowise_instance_id": flowise_instance_id,
         "domain_context": {},
+        "artifacts": {},
+        "facts": {},
+        "debug": {},
         "total_input_tokens": 0,
         "total_output_tokens": 0,
     }

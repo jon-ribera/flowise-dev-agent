@@ -11,11 +11,17 @@ so the LLM sees all available tools from all domains simultaneously.
 
 Current domains:
   FloviseDomain — wraps FlowiseClient (Cursorwise MCP, 50 tools)
+  PatternDomain — wraps PatternStore (pattern library search)
 
 Planned domains:
   WorkdayDomain — will wrap Workday Agent Gateway MCP client (v2)
+  See agent/domains/workday.py for the stub and activation checklist.
 
-See DESIGN_DECISIONS.md — DD-008.
+Tool results are normalized through the ToolResult envelope. Only the compact
+.summary field is injected into LLM context; raw .data is stored in state['debug'].
+See DD-048 (ToolResult as single transformation point).
+
+See DESIGN_DECISIONS.md — DD-008, DD-048.
 """
 
 from __future__ import annotations
@@ -775,46 +781,250 @@ def _stream_write(payload: dict) -> None:
         pass
 
 
+
+# ---------------------------------------------------------------------------
+# ToolResult envelope (DD-048)
+# Normalizes every tool execution result into a typed container.
+# Only .summary is injected into LLM context; .data is stored to state['debug'].
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolResult:
+    """Normalized envelope for every tool execution result.
+
+    ok:        True if the tool completed without error.
+    summary:   Compact, prompt-safe string injected into LLM context.
+               Written for an LLM reader: concise, no raw JSON blobs.
+               This is the ONLY field that goes into message history.
+    facts:     Structured key→value deltas extracted from the result.
+               Stored in state['facts'][domain], keyed by domain name.
+               Examples:
+                 {"chatflow_id": "abc123", "node_count": 5}
+                 {"missing_credentials": ["openAIApi"]}
+    data:      Raw output from the underlying tool callable.
+               NOT injected into the LLM by default. Stored in state['debug'].
+    error:     Present when ok=False. Dict with keys:
+                 type:    Exception class name or error category.
+                 message: Human-readable summary.
+                 detail:  Original exception message or API error body.
+    artifacts: Optional domain-specific references produced by the tool.
+               Stored in state['artifacts'][domain].
+               Examples:
+                 {"chatflow_ids": ["abc123"], "snapshot_labels": ["v1.0"]}
+
+    See DD-048 and roadmap3_architecture_optimization.md.
+    """
+
+    ok: bool
+    summary: str
+    facts: dict
+    data: Any
+    error: dict | None
+    artifacts: dict | None
+
+
+def _wrap_result(tool_name: str, raw: Any) -> "ToolResult":
+    """Wrap a raw tool callable result into a ToolResult envelope.
+
+    This is the single transformation point between the raw-result world and the
+    typed ToolResult world. The 21 existing tool functions are NOT changed — wrapping
+    happens here at the execute_tool() boundary.
+
+    Summary generation rules (priority order):
+      1. dict with "error" key          → ok=False, summary from error message
+      2. dict with "valid" key          → validate_flow_data result
+      3. dict with "id" + "name" keys   → chatflow create/get/update result
+      4. dict with "snapshotted" key    → snapshot result
+      5. list                           → count summary
+      6. other dict                     → first 200 chars of JSON
+      7. scalar / string                → first 300 chars
+    """
+    # Rule 1: explicit error dict
+    if isinstance(raw, dict) and "error" in raw:
+        msg = str(raw["error"])
+        return ToolResult(
+            ok=False,
+            summary=f"{tool_name} failed: {msg}",
+            facts={},
+            data=raw,
+            error={"type": "ToolError", "message": msg, "detail": None},
+            artifacts=None,
+        )
+
+    # Rule 2: validate_flow_data result
+    if isinstance(raw, dict) and "valid" in raw:
+        if raw["valid"]:
+            return ToolResult(
+                ok=True,
+                summary=(
+                    f"Flow data valid: {raw.get('node_count', 0)} nodes, "
+                    f"{raw.get('edge_count', 0)} edges."
+                ),
+                facts={
+                    "node_count": raw.get("node_count"),
+                    "edge_count": raw.get("edge_count"),
+                },
+                data=raw,
+                error=None,
+                artifacts=None,
+            )
+        errors = raw.get("errors", [])
+        first_error = errors[0] if errors else "unknown"
+        return ToolResult(
+            ok=False,
+            summary=f"Flow data invalid: {len(errors)} error(s). First: {first_error}",
+            facts={"validation_errors": errors},
+            data=raw,
+            error={
+                "type": "ValidationError",
+                "message": f"{len(errors)} validation error(s)",
+                "detail": str(errors[:3]),
+            },
+            artifacts=None,
+        )
+
+    # Rule 3: chatflow create/get/update — extract ID as artifact
+    if isinstance(raw, dict) and "id" in raw:
+        cid = str(raw["id"])
+        name = raw.get("name", cid)
+        return ToolResult(
+            ok=True,
+            summary=f"Chatflow '{name}' (id={cid}).",
+            facts={"chatflow_id": cid, "chatflow_name": name},
+            data=raw,
+            error=None,
+            artifacts={"chatflow_ids": [cid]},
+        )
+
+    # Rule 4: snapshot result
+    if isinstance(raw, dict) and "snapshotted" in raw:
+        label = raw.get("version_label", "unknown")
+        count = raw.get("snapshot_count", 1)
+        return ToolResult(
+            ok=True,
+            summary=f"Snapshot saved as {label} (total: {count}).",
+            facts={"snapshot_label": label},
+            data=raw,
+            error=None,
+            artifacts={"snapshot_labels": [label]},
+        )
+
+    # Rule 5: list result
+    if isinstance(raw, list):
+        return ToolResult(
+            ok=True,
+            summary=f"{tool_name} returned {len(raw)} item(s).",
+            facts={"count": len(raw)},
+            data=raw,
+            error=None,
+            artifacts=None,
+        )
+
+    # Rule 6: other dict
+    if isinstance(raw, dict):
+        try:
+            preview = json.dumps(raw, default=str)[:200]
+        except Exception:
+            preview = str(raw)[:200]
+        return ToolResult(
+            ok=True,
+            summary=f"{tool_name}: {preview}",
+            facts={},
+            data=raw,
+            error=None,
+            artifacts=None,
+        )
+
+    # Rule 7: scalar / string
+    return ToolResult(
+        ok=True,
+        summary=str(raw)[:300],
+        facts={},
+        data=raw,
+        error=None,
+        artifacts=None,
+    )
+
+
 async def execute_tool(
     tool_name: str,
     arguments: dict[str, Any],
     executor: dict[str, Callable[..., Any]],
-) -> Any:
-    """Execute a named tool with the given arguments.
+) -> "ToolResult":
+    """Execute a named tool with the given arguments. Returns a ToolResult envelope.
 
     Emits tool_call / tool_result custom events via get_stream_writer() so
     the SSE stream receives live tool badges for each Flowise API call.
 
-    Returns the raw result from the tool callable, or an error dict if the
-    tool is unknown or raises an exception.
+    The summary field of the returned ToolResult is safe for LLM injection.
+    The data field is raw output suitable only for debug storage.
+
+    See DD-048 (ToolResult as single transformation point).
     """
     _stream_write({"type": "tool_call", "name": tool_name})
 
     fn = executor.get(tool_name)
     if fn is None:
         logger.warning("Unknown tool requested: %r", tool_name)
-        result: Any = {"error": f"Unknown tool: {tool_name!r}. Check available tools for this phase."}
-        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
+        result = ToolResult(
+            ok=False,
+            summary=f"Unknown tool: {tool_name!r}. Check available tools for this phase.",
+            facts={},
+            data=None,
+            error={
+                "type": "UnknownTool",
+                "message": f"Tool {tool_name!r} not found in executor",
+                "detail": None,
+            },
+            artifacts=None,
+        )
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": result.summary[:200]})
         return result
     try:
-        result = await fn(**arguments)
-        logger.debug("Tool %s(%s) → OK", tool_name, list(arguments.keys()))
-        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
+        raw = await fn(**arguments)
+        result = _wrap_result(tool_name, raw)
+        logger.debug("Tool %s(%s) → ok=%s", tool_name, list(arguments.keys()), result.ok)
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": result.summary[:200]})
         return result
     except TypeError as e:
         logger.warning("Tool %s called with wrong arguments %s: %s", tool_name, arguments, e)
-        result = {"error": f"Wrong arguments for {tool_name}: {e}"}
-        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
+        result = ToolResult(
+            ok=False,
+            summary=f"Wrong arguments for {tool_name}: {e}",
+            facts={},
+            data=None,
+            error={"type": "TypeError", "message": str(e), "detail": None},
+            artifacts=None,
+        )
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": result.summary[:200]})
         return result
     except Exception as e:
         logger.warning("Tool %s failed: %s", tool_name, e)
-        result = {"error": str(e)}
-        _stream_write({"type": "tool_result", "name": tool_name, "preview": str(result)[:200]})
+        result = ToolResult(
+            ok=False,
+            summary=f"{tool_name} error: {e}",
+            facts={},
+            data=None,
+            error={"type": type(e).__name__, "message": str(e), "detail": None},
+            artifacts=None,
+        )
+        _stream_write({"type": "tool_result", "name": tool_name, "preview": result.summary[:200]})
         return result
 
 
 def result_to_str(result: Any) -> str:
-    """Serialize a tool result to a string for the message history."""
+    """Serialize a tool result to a string for the message history.
+
+    When given a ToolResult, returns result.summary (compact, prompt-safe).
+    This is the enforcement point for the compact context policy (DD-048):
+    raw JSON blobs from tool calls are NEVER injected into LLM context.
+
+    Legacy path: accepts raw values (str, dict, list) for any code that has
+    not yet been updated to use ToolResult.
+    """
+    if isinstance(result, ToolResult):
+        return result.summary
     if isinstance(result, str):
         return result
     try:

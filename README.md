@@ -57,10 +57,14 @@ POST /sessions/stream  {"requirement": "Build a customer support chatbot with GP
 cp .env.example .env
 # Edit .env: set FLOWISE_API_KEY, FLOWISE_API_ENDPOINT, ANTHROPIC_API_KEY
 
-pip install -e ".[claude]"
+pip install -e ".[claude,dev]"   # dev includes pytest
 flowise-agent
 # Open http://localhost:8000/ui
 ```
+
+> **Windows note:** if `flowise-agent` is not found after install, run
+> `python -m flowise_dev_agent.api` instead, or add the Python Scripts
+> directory to your PATH (pip will print the path during install).
 
 The web UI streams token output in real-time, renders the structured plan in markdown,
 and provides one-click Approve / Accept buttons at each HITL checkpoint.

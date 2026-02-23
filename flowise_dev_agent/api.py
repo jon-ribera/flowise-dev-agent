@@ -20,8 +20,6 @@ Human-in-the-loop flow:
 See DESIGN_DECISIONS.md — DD-011, DD-012.
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import os

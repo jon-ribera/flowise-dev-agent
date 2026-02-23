@@ -1,0 +1,155 @@
+"""Agent state definition for the Flowise Builder co-pilot.
+
+The AgentState TypedDict is the shared memory that flows through every node
+in the LangGraph graph. Each node receives the full state and returns a
+partial dict — only the keys it wants to update.
+
+Fields annotated with a reducer function use append semantics (messages).
+All other fields use overwrite semantics (last-writer-wins).
+
+See DESIGN_DECISIONS.md — DD-007.
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, TypedDict
+
+from flowise_dev_agent.reasoning import Message
+
+
+# ---------------------------------------------------------------------------
+# Reducer for the message list
+# ---------------------------------------------------------------------------
+
+
+def _append_messages(existing: list[Message], incoming: list[Message] | None) -> list[Message]:
+    """Append new messages to the existing message history.
+
+    LangGraph calls this reducer when a node returns {"messages": [...]}.
+    The reducer receives (current_state_value, node_return_value) and must
+    return the new state value.
+    """
+    return existing + (incoming or [])
+
+
+# ---------------------------------------------------------------------------
+# State schema
+# ---------------------------------------------------------------------------
+
+
+class AgentState(TypedDict):
+    """Full state of a co-development session.
+
+    Lifecycle:
+        1. Initialized at session start with requirement + empty fields.
+        2. Each node reads the full state and returns a partial update dict.
+        3. LangGraph merges updates: reducer fields (messages) are appended,
+           all other fields are overwritten.
+        4. Human interrupt nodes surface state to the developer and resume
+           with their input.
+    """
+
+    # -----------------------------------------------------------------------
+    # Session identity
+    # -----------------------------------------------------------------------
+
+    # The developer's original requirement, set at start and never changed.
+    requirement: str
+
+    # -----------------------------------------------------------------------
+    # Conversation + tool history (append-only)
+    # -----------------------------------------------------------------------
+
+    # Full message history: user turns, assistant turns, tool calls, tool results.
+    # Uses the _append_messages reducer — nodes return new messages to add,
+    # not the full list.
+    messages: Annotated[list[Message], _append_messages]
+
+    # -----------------------------------------------------------------------
+    # Working context
+    # -----------------------------------------------------------------------
+
+    # The Flowise chatflow being built or modified.
+    # Set during discover/patch; carried across iterations.
+    chatflow_id: str | None
+
+    # Summary of what was discovered (set by discover node, used by plan node).
+    discovery_summary: str | None
+
+    # -----------------------------------------------------------------------
+    # Plan
+    # -----------------------------------------------------------------------
+
+    # The structured plan text produced by the plan node.
+    # Cleared when developer requests changes (set to None).
+    plan: str | None
+
+    # -----------------------------------------------------------------------
+    # Test results
+    # -----------------------------------------------------------------------
+
+    # Output from the test node: happy-path and edge-case results.
+    # Overwritten each iteration.
+    test_results: str | None
+
+    # -----------------------------------------------------------------------
+    # Iteration tracking
+    # -----------------------------------------------------------------------
+
+    # Number of complete iterations (discover → patch → test → converge) run so far.
+    iteration: int
+
+    # -----------------------------------------------------------------------
+    # Completion signals
+    # -----------------------------------------------------------------------
+
+    # True when the Definition of Done is met and the developer has accepted.
+    done: bool
+
+    # -----------------------------------------------------------------------
+    # Human-in-the-loop
+    # -----------------------------------------------------------------------
+
+    # Feedback from a human interrupt node.
+    # Set by the interrupt node when developer provides feedback.
+    # Cleared (set to None) after the downstream node consumes it.
+    developer_feedback: str | None
+
+    # -----------------------------------------------------------------------
+    # Credential status (set once during discover, persists across iterations)
+    # -----------------------------------------------------------------------
+
+    # Credential types required by the planned nodes but not found in Flowise.
+    # Populated by the discover node from the structured CREDENTIALS_STATUS block
+    # in the discovery summary. Triggers the credential_check HITL interrupt.
+    # Examples: ["openAIApi", "anthropicApi"]
+    credentials_missing: list[str] | None
+
+    # -----------------------------------------------------------------------
+    # Converge evaluation (structured evaluator-optimizer feedback)
+    # -----------------------------------------------------------------------
+
+    # Structured verdict from the converge node. Set every ITERATE cycle.
+    # Keys: verdict ("DONE"|"ITERATE"), category (None|"CREDENTIAL"|"STRUCTURE"|
+    #        "LOGIC"|"INCOMPLETE"), reason (str), fixes (list[str]).
+    # Consumed by the plan node to produce targeted repair instructions.
+    # Cleared (set to None) when verdict is DONE.
+    converge_verdict: dict | None
+
+    # -----------------------------------------------------------------------
+    # Reliability testing (pass^k)
+    # -----------------------------------------------------------------------
+
+    # Number of times to run each test case. Default 1 (pass@1).
+    # Set to 2+ to require pass^k reliability across all trials.
+    # Each trial uses a unique sessionId.
+    test_trials: int
+
+    # -----------------------------------------------------------------------
+    # Multi-domain context (extensibility for Workday v2)
+    # -----------------------------------------------------------------------
+
+    # JSON-serializable context collected per domain during discover.
+    # Keys: domain name ("flowise", "workday"). Values: domain-specific summary.
+    # Each discover iteration merges into this dict.
+    domain_context: dict[str, str]

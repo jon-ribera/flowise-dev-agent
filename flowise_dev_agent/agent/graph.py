@@ -738,9 +738,30 @@ def _make_test_node(engine: ReasoningEngine, domains: list[DomainTools]):
         gathered in a single batch, giving maximum parallelism.
         """
         iteration = state.get("iteration", 0)
-        chatflow_id = state.get("chatflow_id") or "unknown"
+        chatflow_id = state.get("chatflow_id")
         trials = state.get("test_trials", 1)
         logger.info("[TEST] iteration=%d chatflow_id=%s trials=%d", iteration, chatflow_id, trials)
+
+        # Guard: cannot run predictions without a valid chatflow ID.
+        # Return a clear failure string so converge is forced to ITERATE.
+        if not chatflow_id:
+            logger.warning("[TEST] chatflow_id is not set — skipping predictions")
+            no_id_msg = (
+                "Chatflow: (not created)\n\n"
+                "TEST: HAPPY PATH\n"
+                "  Trial 1: SKIPPED — chatflow_id is None; the patch phase did not create or "
+                "capture the chatflow ID. create_chatflow must be called and its returned id "
+                "stored before predictions can run.\n\n"
+                "TEST: EDGE CASE\n"
+                "  Trial 1: SKIPPED — same reason as above.\n\n"
+                "RESULT: HAPPY PATH [FAIL] | EDGE CASE [FAIL]"
+            )
+            return {
+                "messages": [],
+                "test_results": no_id_msg,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+            }
 
         async def _run_trial(label: str, question: str, trial_num: int) -> str:
             session_id = f"test-{chatflow_id}-{label}-t{trial_num}"
@@ -880,6 +901,36 @@ def _make_converge_node(
         raw_verdict = (response.content or "ITERATE\nCategory: INCOMPLETE\nReason: no response from LLM").strip()
         verdict_dict = _parse_converge_verdict(raw_verdict)
         is_done = verdict_dict["verdict"] == "DONE"
+
+        # Safety net 1: no chatflow → cannot be DONE
+        if is_done and not state.get("chatflow_id"):
+            logger.warning("[CONVERGE] LLM said DONE but chatflow_id is missing — forcing ITERATE")
+            is_done = False
+            verdict_dict = {
+                "verdict": "ITERATE",
+                "category": "INCOMPLETE",
+                "reason": "chatflow_id is not set — patch phase did not create/capture the chatflow",
+                "fixes": [
+                    "Call create_chatflow with the full node graph from the plan",
+                    "Extract the id field from the API response and use it in all predict calls",
+                ],
+            }
+
+        # Safety net 2: explicit [FAIL] markers in test results → cannot be DONE
+        if is_done and state.get("test_results"):
+            tr_upper = state["test_results"].upper()
+            if "[FAIL]" in tr_upper or "SKIPPED" in tr_upper:
+                logger.warning("[CONVERGE] LLM said DONE but test_results contain [FAIL] — forcing ITERATE")
+                is_done = False
+                verdict_dict = {
+                    "verdict": "ITERATE",
+                    "category": "LOGIC",
+                    "reason": "Test results contain explicit [FAIL] — DoD not met",
+                    "fixes": [
+                        "Verify the chatflow ID is correct and the chatflow is deployed",
+                        "Re-run predictions using the captured chatflow ID",
+                    ],
+                }
 
         assistant_msg = Message(role="assistant", content=raw_verdict)
         logger.info("[CONVERGE] verdict=%r done=%s", verdict_dict, is_done)

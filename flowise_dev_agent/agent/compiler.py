@@ -333,7 +333,30 @@ def _build_node_data(
 
     input_anchors = _substitute(copy.deepcopy(schema.get("inputAnchors") or []))
     input_params = _substitute(copy.deepcopy(schema.get("inputParams") or []))
-    output_anchors = _substitute(copy.deepcopy(schema.get("outputAnchors") or []))
+    raw_output_anchors = _substitute(copy.deepcopy(schema.get("outputAnchors") or []))
+
+    # Flowise uses two distinct outputAnchor formats:
+    #   Single-output node: one anchor with a direct "id" field.
+    #   Multi-output node:  one anchor with type="options", an "options" list of
+    #                       sub-anchors, and a "default" name.
+    #                       The node's "outputs" dict must be {"output": selectedName}.
+    # The snapshot stores multi-output nodes as a flat list of named anchors.
+    # Convert here so compiled flowData matches what Flowise expects.
+    if len(raw_output_anchors) > 1:
+        default_name = raw_output_anchors[0].get("name", "output")
+        output_anchors = [
+            {
+                "name": "output",
+                "label": "Output",
+                "type": "options",
+                "options": raw_output_anchors,
+                "default": default_name,
+            }
+        ]
+        initial_outputs: dict[str, Any] = {"output": default_name}
+    else:
+        output_anchors = raw_output_anchors
+        initial_outputs = {}
 
     # Build the inputs dict (configurable values)
     inputs: dict[str, Any] = {}
@@ -381,7 +404,7 @@ def _build_node_data(
         "inputAnchors": input_anchors,
         "inputParams": input_params,
         "outputAnchors": output_anchors,
-        "outputs": {},
+        "outputs": initial_outputs,
         "inputs": inputs,
         "selected": False,
     }
@@ -580,6 +603,17 @@ def compile_patch_ops(
                 tgt_node.data.setdefault("inputs", {})[tgt_input_key] = (
                     "{{" + op.source_node_id + ".data.instance}}"
                 )
+
+            # For multi-output nodes, Flowise needs "outputs": {"output": selectedName}
+            # to know which output slot is active.  Parse the anchor name from the
+            # source handle: format is "{nodeId}-output-{anchorName}-{types}".
+            src_output_anchors = (src_schema or {}).get("outputAnchors") or []
+            if len(src_output_anchors) > 1:
+                # Strip "{nodeId}-output-" prefix to get "{anchorName}-{types}"
+                prefix = f"{op.source_node_id}-output-"
+                if src_handle.startswith(prefix):
+                    anchor_name = src_handle[len(prefix):].split("-")[0]
+                    src_node.data.setdefault("outputs", {})["output"] = anchor_name
 
             diff_lines.append(
                 f"EDGES ADDED: {op.source_node_id}\u2192{op.target_node_id}"

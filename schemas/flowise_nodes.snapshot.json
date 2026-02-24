@@ -215,9 +215,15 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-conditionAgentAgentflow-ConditionAgent",
-        "name": "conditionAgentAgentflow",
-        "label": "Condition Agent",
+        "id": "{nodeId}-output-0-ConditionAgent",
+        "name": "0",
+        "label": "0",
+        "type": "ConditionAgent"
+      },
+      {
+        "id": "{nodeId}-output-1-ConditionAgent",
+        "name": "1",
+        "label": "1",
         "type": "ConditionAgent"
       }
     ],
@@ -248,9 +254,15 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-conditionAgentflow-Condition",
-        "name": "conditionAgentflow",
-        "label": "Condition",
+        "id": "{nodeId}-output-0-Condition",
+        "name": "0",
+        "label": "0",
+        "type": "Condition"
+      },
+      {
+        "id": "{nodeId}-output-1-Condition",
+        "name": "1",
+        "label": "1",
         "type": "Condition"
       }
     ],
@@ -562,9 +574,15 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-humanInputAgentflow-HumanInput",
-        "name": "humanInputAgentflow",
-        "label": "Human Input",
+        "id": "{nodeId}-output-proceed-HumanInput",
+        "name": "proceed",
+        "label": "Proceed",
+        "type": "HumanInput"
+      },
+      {
+        "id": "{nodeId}-output-reject-HumanInput",
+        "name": "reject",
+        "label": "Reject",
         "type": "HumanInput"
       }
     ],
@@ -2384,6 +2402,12 @@
         "name": "graphCypherQAChain",
         "label": "Graph Cypher QA Chain",
         "type": "GraphCypherQAChain | BaseChain | Runnable"
+      },
+      {
+        "id": "{nodeId}-output-outputPrediction-string|json",
+        "name": "outputPrediction",
+        "label": "Output Prediction",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -2451,6 +2475,12 @@
         "name": "llmChain",
         "label": "LLM Chain",
         "type": "LLMChain | BaseChain | Runnable"
+      },
+      {
+        "id": "{nodeId}-output-outputPrediction-string|json",
+        "name": "outputPrediction",
+        "label": "Output Prediction",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7008,10 +7038,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-S3-Document",
-        "name": "S3",
-        "label": "S3",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7118,10 +7154,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-airtable-Document",
-        "name": "airtable",
-        "label": "Airtable",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7210,10 +7252,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-apiLoader-Document",
-        "name": "apiLoader",
-        "label": "API Loader",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7303,10 +7351,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-apifyWebsiteContentCrawler-Document",
-        "name": "apifyWebsiteContentCrawler",
-        "label": "Apify Website Content Crawler",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7363,10 +7417,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-braveSearchApiLoader-Document",
-        "name": "braveSearchApiLoader",
-        "label": "BraveSearch API Document Loader",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7449,10 +7509,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-cheerioWebScraper-Document",
-        "name": "cheerioWebScraper",
-        "label": "Cheerio Web Scraper",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7523,10 +7589,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-confluence-Document",
-        "name": "confluence",
-        "label": "Confluence",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7592,10 +7664,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-csvFile-Document",
-        "name": "csvFile",
-        "label": "Csv File",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7632,10 +7710,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-customDocumentLoader-Document",
-        "name": "customDocumentLoader",
-        "label": "Custom Document Loader",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7664,10 +7748,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-documentStore-Document",
-        "name": "documentStore",
-        "label": "Document Store",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7721,10 +7811,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-docxFile-Document",
-        "name": "docxFile",
-        "label": "Docx File",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7787,10 +7883,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-epubFile-Document",
-        "name": "epubFile",
-        "label": "Epub File",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7860,10 +7962,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-figma-Document",
-        "name": "figma",
-        "label": "Figma",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -7945,10 +8053,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-fileLoader-Document",
-        "name": "fileLoader",
-        "label": "File Loader",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8104,10 +8218,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-fireCrawl-Document",
-        "name": "fireCrawl",
-        "label": "FireCrawl",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8189,10 +8309,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-folderFiles-Document",
-        "name": "folderFiles",
-        "label": "Folder with Files",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8254,10 +8380,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-gitbook-Document",
-        "name": "gitbook",
-        "label": "GitBook",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8368,10 +8500,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-github-Document",
-        "name": "github",
-        "label": "Github",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8472,10 +8610,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-googleDrive-Document",
-        "name": "googleDrive",
-        "label": "Google Drive",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8566,10 +8710,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-googleSheets-Document",
-        "name": "googleSheets",
-        "label": "Google Sheets",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8651,10 +8801,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-jira-Document",
-        "name": "jira",
-        "label": "Jira",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8727,10 +8883,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-jsonFile-Document",
-        "name": "jsonFile",
-        "label": "Json File",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8792,10 +8954,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-jsonlinesFile-Document",
-        "name": "jsonlinesFile",
-        "label": "Json Lines File",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8849,10 +9017,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-microsoftExcel-Document",
-        "name": "microsoftExcel",
-        "label": "Microsoft Excel",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8906,10 +9080,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-microsoftPowerpoint-Document",
-        "name": "microsoftPowerpoint",
-        "label": "Microsoft PowerPoint",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -8963,10 +9143,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-microsoftWord-Document",
-        "name": "microsoftWord",
-        "label": "Microsoft Word",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9020,10 +9206,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-notionDB-Document",
-        "name": "notionDB",
-        "label": "Notion Database",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9080,10 +9272,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-notionFolder-Document",
-        "name": "notionFolder",
-        "label": "Notion Folder",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9137,10 +9335,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-notionPage-Document",
-        "name": "notionPage",
-        "label": "Notion Page",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9224,10 +9428,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-oxylabs-Document",
-        "name": "oxylabs",
-        "label": "Oxylabs",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9301,10 +9511,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-pdfFile-Document",
-        "name": "pdfFile",
-        "label": "Pdf File",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9358,10 +9574,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-plainText-Document",
-        "name": "plainText",
-        "label": "Plain Text",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9457,10 +9679,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-playwrightWebScraper-Document",
-        "name": "playwrightWebScraper",
-        "label": "Playwright Web Scraper",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9556,10 +9784,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-puppeteerWebScraper-Document",
-        "name": "puppeteerWebScraper",
-        "label": "Puppeteer Web Scraper",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9647,10 +9881,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-s3Directory-Document",
-        "name": "s3Directory",
-        "label": "S3 Directory",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9715,10 +9955,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-searchApi-Document",
-        "name": "searchApi",
-        "label": "SearchApi For Web Search",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9775,10 +10021,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-serpApi-Document",
-        "name": "serpApi",
-        "label": "SerpApi For Web Search",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9861,10 +10113,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-spiderDocumentLoaders-Document",
-        "name": "spiderDocumentLoaders",
-        "label": "Spider Document Loaders",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -9921,10 +10179,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-textFile-Document",
-        "name": "textFile",
-        "label": "Text File",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -10104,10 +10368,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-unstructuredFileLoader-Document",
-        "name": "unstructuredFileLoader",
-        "label": "Unstructured File Loader",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -10156,10 +10426,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-vectorStoreToDocument-Document",
-        "name": "vectorStoreToDocument",
-        "label": "VectorStore To Document",
-        "type": "Document"
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -14803,10 +15079,22 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-AzureRerankRetriever-Azure Rerank Retriever|BaseRetriever",
-        "name": "AzureRerankRetriever",
+        "id": "{nodeId}-output-retriever-Azure Rerank Retriever|BaseRetriever",
+        "name": "retriever",
         "label": "Azure Rerank Retriever",
         "type": "Azure Rerank Retriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -14882,10 +15170,22 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-HydeRetriever-HydeRetriever|BaseRetriever",
-        "name": "HydeRetriever",
+        "id": "{nodeId}-output-retriever-HydeRetriever|BaseRetriever",
+        "name": "retriever",
         "label": "HyDE Retriever",
         "type": "HydeRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -14942,10 +15242,22 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-JinaRerankRetriever-JinaRerankRetriever|BaseRetriever",
-        "name": "JinaRerankRetriever",
+        "id": "{nodeId}-output-retriever-JinaRerankRetriever|BaseRetriever",
+        "name": "retriever",
         "label": "Jina AI Rerank Retriever",
         "type": "JinaRerankRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -15021,10 +15333,22 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-RRFRetriever-RRFRetriever|BaseRetriever",
-        "name": "RRFRetriever",
+        "id": "{nodeId}-output-retriever-RRFRetriever|BaseRetriever",
+        "name": "retriever",
         "label": "Reciprocal Rank Fusion Retriever",
         "type": "RRFRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -15166,10 +15490,22 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-cohereRerankRetriever-Cohere Rerank Retriever|BaseRetriever",
-        "name": "cohereRerankRetriever",
+        "id": "{nodeId}-output-retriever-Cohere Rerank Retriever|BaseRetriever",
+        "name": "retriever",
         "label": "Cohere Rerank Retriever",
         "type": "Cohere Rerank Retriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -15227,10 +15563,22 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-customRetriever-CustomRetriever|BaseRetriever",
-        "name": "customRetriever",
+        "id": "{nodeId}-output-retriever-CustomRetriever|BaseRetriever",
+        "name": "retriever",
         "label": "Custom Retriever",
         "type": "CustomRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -15295,10 +15643,22 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-embeddingsFilterRetriever-EmbeddingsFilterRetriever|BaseRetriever",
-        "name": "embeddingsFilterRetriever",
+        "id": "{nodeId}-output-retriever-EmbeddingsFilterRetriever|BaseRetriever",
+        "name": "retriever",
         "label": "Embeddings Filter Retriever",
         "type": "EmbeddingsFilterRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -15370,10 +15730,22 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-extractMetadataRetriever-ExtractMetadataRetriever|BaseRetriever",
-        "name": "extractMetadataRetriever",
+        "id": "{nodeId}-output-retriever-ExtractMetadataRetriever|BaseRetriever",
+        "name": "retriever",
         "label": "Extract Metadata Retriever",
         "type": "ExtractMetadataRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -15420,10 +15792,22 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-llmFilterRetriever-LLMFilterRetriever|BaseRetriever",
-        "name": "llmFilterRetriever",
+        "id": "{nodeId}-output-retriever-LLMFilterRetriever|BaseRetriever",
+        "name": "retriever",
         "label": "LLM Filter Retriever",
         "type": "LLMFilterRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -15587,10 +15971,22 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-similarityThresholdRetriever-SimilarityThresholdRetriever|BaseRetriever",
-        "name": "similarityThresholdRetriever",
-        "label": "Similarity Score Threshold Retriever",
+        "id": "{nodeId}-output-retriever-SimilarityThresholdRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Similarity Threshold Retriever",
         "type": "SimilarityThresholdRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -15695,10 +16091,22 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-voyageAIRerankRetriever-VoyageAIRerankRetriever|BaseRetriever",
-        "name": "voyageAIRerankRetriever",
+        "id": "{nodeId}-output-retriever-VoyageAIRerankRetriever|BaseRetriever",
+        "name": "retriever",
         "label": "Voyage AI Rerank Retriever",
         "type": "VoyageAIRerankRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-document-Document|json",
+        "name": "document",
+        "label": "Document",
+        "type": "Document | json"
+      },
+      {
+        "id": "{nodeId}-output-text-string|json",
+        "name": "text",
+        "label": "Text",
+        "type": "string | json"
       }
     ],
     "outputs": {},
@@ -15899,9 +16307,15 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-seqCondition-Condition",
-        "name": "seqCondition",
-        "label": "Condition",
+        "id": "{nodeId}-output-next-Condition",
+        "name": "next",
+        "label": "Next",
+        "type": "Condition"
+      },
+      {
+        "id": "{nodeId}-output-end-Condition",
+        "name": "end",
+        "label": "End",
         "type": "Condition"
       }
     ],
@@ -15997,10 +16411,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-seqConditionAgent-ConditionAgent",
-        "name": "seqConditionAgent",
-        "label": "Condition Agent",
-        "type": "ConditionAgent"
+        "id": "{nodeId}-output-next-Condition",
+        "name": "next",
+        "label": "Next",
+        "type": "Condition"
+      },
+      {
+        "id": "{nodeId}-output-end-Condition",
+        "name": "end",
+        "label": "End",
+        "type": "Condition"
       }
     ],
     "outputs": {},
@@ -21567,10 +21987,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-customFunction-CustomFunction|Utilities",
-        "name": "customFunction",
-        "label": "Custom JS Function",
-        "type": "CustomFunction | Utilities"
+        "id": "{nodeId}-output-output-string|number|boolean|json|array",
+        "name": "output",
+        "label": "Output",
+        "type": "string | number | boolean | json | array"
+      },
+      {
+        "id": "{nodeId}-output-EndingNode-CustomFunction",
+        "name": "EndingNode",
+        "label": "Ending Node",
+        "type": "CustomFunction"
       }
     ],
     "outputs": {},
@@ -21600,10 +22026,10 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-getVariable-GetVariable|Utilities",
-        "name": "getVariable",
-        "label": "Get Variable",
-        "type": "GetVariable | Utilities"
+        "id": "{nodeId}-output-output-string|number|boolean|json|array",
+        "name": "output",
+        "label": "Output",
+        "type": "string | number | boolean | json | array"
       }
     ],
     "outputs": {},
@@ -21658,10 +22084,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-ifElseFunction-IfElseFunction|Utilities",
-        "name": "ifElseFunction",
-        "label": "IfElse Function",
-        "type": "IfElseFunction | Utilities"
+        "id": "{nodeId}-output-returnTrue-string|number|boolean|json|array",
+        "name": "returnTrue",
+        "label": "True",
+        "type": "string | number | boolean | json | array"
+      },
+      {
+        "id": "{nodeId}-output-returnFalse-string|number|boolean|json|array",
+        "name": "returnFalse",
+        "label": "False",
+        "type": "string | number | boolean | json | array"
       }
     ],
     "outputs": {},
@@ -21708,10 +22140,10 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-setVariable-SetVariable|Utilities",
-        "name": "setVariable",
-        "label": "Set Variable",
-        "type": "SetVariable | Utilities"
+        "id": "{nodeId}-output-output-string|number|boolean|json|array",
+        "name": "output",
+        "label": "Output",
+        "type": "string | number | boolean | json | array"
       }
     ],
     "outputs": {},
@@ -21846,10 +22278,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-Astra-Astra|VectorStoreRetriever|BaseRetriever",
-        "name": "Astra",
-        "label": "Astra",
+        "id": "{nodeId}-output-retriever-Astra|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Astra Retriever",
         "type": "Astra | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Astra|VectorStore",
+        "name": "vectorStore",
+        "label": "Astra Vector Store",
+        "type": "Astra | VectorStore"
       }
     ],
     "outputs": {},
@@ -21932,10 +22370,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-chroma-Chroma|VectorStoreRetriever|BaseRetriever",
-        "name": "chroma",
-        "label": "Chroma",
+        "id": "{nodeId}-output-retriever-Chroma|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Chroma Retriever",
         "type": "Chroma | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Chroma|VectorStore",
+        "name": "vectorStore",
+        "label": "Chroma Vector Store",
+        "type": "Chroma | VectorStore"
       }
     ],
     "outputs": {},
@@ -22044,10 +22488,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-couchbase-Couchbase|VectorStoreRetriever|BaseRetriever",
-        "name": "couchbase",
-        "label": "Couchbase",
+        "id": "{nodeId}-output-retriever-Couchbase|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Couchbase Retriever",
         "type": "Couchbase | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Couchbase|VectorStore",
+        "name": "vectorStore",
+        "label": "Couchbase Vector Store",
+        "type": "Couchbase | VectorStore"
       }
     ],
     "outputs": {},
@@ -22081,10 +22531,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-documentStoreVS-DocumentStoreVS",
-        "name": "documentStoreVS",
-        "label": "Document Store (Vector)",
-        "type": "DocumentStoreVS"
+        "id": "{nodeId}-output-retriever-BaseRetriever",
+        "name": "retriever",
+        "label": "Retriever",
+        "type": "BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-VectorStore",
+        "name": "vectorStore",
+        "label": "Vector Store",
+        "type": "VectorStore"
       }
     ],
     "outputs": {},
@@ -22155,10 +22611,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-elasticsearch-Elasticsearch|VectorStoreRetriever|BaseRetriever",
-        "name": "elasticsearch",
-        "label": "Elasticsearch",
+        "id": "{nodeId}-output-retriever-Elasticsearch|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Elasticsearch Retriever",
         "type": "Elasticsearch | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Elasticsearch|VectorStore",
+        "name": "vectorStore",
+        "label": "Elasticsearch Vector Store",
+        "type": "Elasticsearch | VectorStore"
       }
     ],
     "outputs": {},
@@ -22218,10 +22680,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-faiss-Faiss|VectorStoreRetriever|BaseRetriever",
-        "name": "faiss",
-        "label": "Faiss",
+        "id": "{nodeId}-output-retriever-Faiss|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Faiss Retriever",
         "type": "Faiss | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Faiss|SaveableVectorStore|VectorStore",
+        "name": "vectorStore",
+        "label": "Faiss Vector Store",
+        "type": "Faiss | SaveableVectorStore | VectorStore"
       }
     ],
     "outputs": {},
@@ -22294,10 +22762,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-kendra-Kendra|VectorStoreRetriever|BaseRetriever",
-        "name": "kendra",
-        "label": "AWS Kendra",
+        "id": "{nodeId}-output-retriever-Kendra|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Kendra Retriever",
         "type": "Kendra | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Kendra|BaseRetriever",
+        "name": "vectorStore",
+        "label": "Kendra Vector Store",
+        "type": "Kendra | BaseRetriever"
       }
     ],
     "outputs": {},
@@ -22388,9 +22862,9 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-meilisearch-BaseRetriever",
-        "name": "meilisearch",
-        "label": "Meilisearch",
+        "id": "{nodeId}-output-retriever-BaseRetriever",
+        "name": "retriever",
+        "label": "Meilisearch Retriever",
         "type": "BaseRetriever"
       }
     ],
@@ -22440,10 +22914,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-memoryVectorStore-Memory|VectorStoreRetriever|BaseRetriever",
-        "name": "memoryVectorStore",
-        "label": "In-Memory Vector Store",
+        "id": "{nodeId}-output-retriever-Memory|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Memory Retriever",
         "type": "Memory | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Memory|VectorStore",
+        "name": "vectorStore",
+        "label": "Memory Vector Store",
+        "type": "Memory | VectorStore"
       }
     ],
     "outputs": {},
@@ -22580,10 +23060,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-milvus-Milvus|VectorStoreRetriever|BaseRetriever",
-        "name": "milvus",
-        "label": "Milvus",
+        "id": "{nodeId}-output-retriever-Milvus|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Milvus Retriever",
         "type": "Milvus | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Milvus|VectorStore",
+        "name": "vectorStore",
+        "label": "Milvus Vector Store",
+        "type": "Milvus | VectorStore"
       }
     ],
     "outputs": {},
@@ -22709,10 +23195,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-mongoDBAtlas-MongoDB Atlas|VectorStoreRetriever|BaseRetriever",
-        "name": "mongoDBAtlas",
-        "label": "MongoDB Atlas",
+        "id": "{nodeId}-output-retriever-MongoDB Atlas|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "MongoDB Retriever",
         "type": "MongoDB Atlas | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-MongoDB Atlas|VectorStore",
+        "name": "vectorStore",
+        "label": "MongoDB Vector Store",
+        "type": "MongoDB Atlas | VectorStore"
       }
     ],
     "outputs": {},
@@ -22789,10 +23281,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-openSearch-OpenSearch|VectorStoreRetriever|BaseRetriever",
-        "name": "openSearch",
-        "label": "OpenSearch",
+        "id": "{nodeId}-output-retriever-OpenSearch|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "OpenSearch Retriever",
         "type": "OpenSearch | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-OpenSearch|VectorStore",
+        "name": "vectorStore",
+        "label": "OpenSearch Vector Store",
+        "type": "OpenSearch | VectorStore"
       }
     ],
     "outputs": {},
@@ -22916,10 +23414,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-pinecone-Pinecone|VectorStoreRetriever|BaseRetriever",
-        "name": "pinecone",
-        "label": "Pinecone",
+        "id": "{nodeId}-output-retriever-Pinecone|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Pinecone Retriever",
         "type": "Pinecone | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Pinecone|VectorStore",
+        "name": "vectorStore",
+        "label": "Pinecone Vector Store",
+        "type": "Pinecone | VectorStore"
       }
     ],
     "outputs": {},
@@ -23002,10 +23506,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-pineconeLlamaIndex-Pinecone|VectorIndexRetriever",
-        "name": "pineconeLlamaIndex",
-        "label": "Pinecone",
+        "id": "{nodeId}-output-retriever-Pinecone|VectorIndexRetriever",
+        "name": "retriever",
+        "label": "Pinecone Retriever",
         "type": "Pinecone | VectorIndexRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Pinecone|VectorStoreIndex",
+        "name": "vectorStore",
+        "label": "Pinecone Vector Store Index",
+        "type": "Pinecone | VectorStoreIndex"
       }
     ],
     "outputs": {},
@@ -23152,10 +23662,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-postgres-Postgres|VectorStoreRetriever|BaseRetriever",
-        "name": "postgres",
-        "label": "Postgres",
+        "id": "{nodeId}-output-retriever-Postgres|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Postgres Retriever",
         "type": "Postgres | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Postgres|VectorStore",
+        "name": "vectorStore",
+        "label": "Postgres Vector Store",
+        "type": "Postgres | VectorStore"
       }
     ],
     "outputs": {},
@@ -23298,10 +23814,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-qdrant-Qdrant|VectorStoreRetriever|BaseRetriever",
-        "name": "qdrant",
-        "label": "Qdrant",
+        "id": "{nodeId}-output-retriever-Qdrant|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Qdrant Retriever",
         "type": "Qdrant | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Qdrant|VectorStore",
+        "name": "vectorStore",
+        "label": "Qdrant Vector Store",
+        "type": "Qdrant | VectorStore"
       }
     ],
     "outputs": {},
@@ -23396,10 +23918,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-redis-Redis|VectorStoreRetriever|BaseRetriever",
-        "name": "redis",
-        "label": "Redis",
+        "id": "{nodeId}-output-retriever-Redis|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Redis Retriever",
         "type": "Redis | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Redis|VectorStore",
+        "name": "vectorStore",
+        "label": "Redis Vector Store",
+        "type": "Redis | VectorStore"
       }
     ],
     "outputs": {},
@@ -23467,10 +23995,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-simpleStoreLlamaIndex-SimpleVectorStore|VectorIndexRetriever",
-        "name": "simpleStoreLlamaIndex",
-        "label": "SimpleStore",
+        "id": "{nodeId}-output-retriever-SimpleVectorStore|VectorIndexRetriever",
+        "name": "retriever",
+        "label": "SimpleStore Retriever",
         "type": "SimpleVectorStore | VectorIndexRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-SimpleVectorStore|VectorStoreIndex",
+        "name": "vectorStore",
+        "label": "SimpleStore Vector Store Index",
+        "type": "SimpleVectorStore | VectorStoreIndex"
       }
     ],
     "outputs": {},
@@ -23565,10 +24099,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-singlestore-SingleStore|VectorStoreRetriever|BaseRetriever",
-        "name": "singlestore",
-        "label": "SingleStore",
+        "id": "{nodeId}-output-retriever-SingleStore|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "SingleStore Retriever",
         "type": "SingleStore | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-SingleStore|VectorStore",
+        "name": "vectorStore",
+        "label": "SingleStore Vector Store",
+        "type": "SingleStore | VectorStore"
       }
     ],
     "outputs": {},
@@ -23692,10 +24232,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-supabase-Supabase|VectorStoreRetriever|BaseRetriever",
-        "name": "supabase",
-        "label": "Supabase",
+        "id": "{nodeId}-output-retriever-Supabase|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Supabase Retriever",
         "type": "Supabase | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Supabase|VectorStore",
+        "name": "vectorStore",
+        "label": "Supabase Vector Store",
+        "type": "Supabase | VectorStore"
       }
     ],
     "outputs": {},
@@ -23770,10 +24316,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-upstash-Upstash|VectorStoreRetriever|BaseRetriever",
-        "name": "upstash",
-        "label": "Upstash Vector",
+        "id": "{nodeId}-output-retriever-Upstash|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Upstash Retriever",
         "type": "Upstash | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Upstash|VectorStore",
+        "name": "vectorStore",
+        "label": "Upstash Vector Store",
+        "type": "Upstash | VectorStore"
       }
     ],
     "outputs": {},
@@ -23875,10 +24427,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-vectara-Vectara|VectorStoreRetriever|BaseRetriever",
-        "name": "vectara",
-        "label": "Vectara",
+        "id": "{nodeId}-output-retriever-Vectara|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Vectara Retriever",
         "type": "Vectara | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Vectara|VectorStore",
+        "name": "vectorStore",
+        "label": "Vectara Vector Store",
+        "type": "Vectara | VectorStore"
       }
     ],
     "outputs": {},
@@ -23952,10 +24510,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-vectaraUpload-Vectara|VectorStoreRetriever|BaseRetriever",
-        "name": "vectaraUpload",
-        "label": "Vectara Upload File",
+        "id": "{nodeId}-output-retriever-Vectara|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Vectara Retriever",
         "type": "Vectara | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Vectara|VectorStore",
+        "name": "vectorStore",
+        "label": "Vectara Vector Store",
+        "type": "Vectara | VectorStore"
       }
     ],
     "outputs": {},
@@ -24096,10 +24660,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-weaviate-Weaviate|VectorStoreRetriever|BaseRetriever",
-        "name": "weaviate",
-        "label": "Weaviate",
+        "id": "{nodeId}-output-retriever-Weaviate|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Weaviate Retriever",
         "type": "Weaviate | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Weaviate|VectorStore",
+        "name": "vectorStore",
+        "label": "Weaviate Vector Store",
+        "type": "Weaviate | VectorStore"
       }
     ],
     "outputs": {},
@@ -24209,10 +24779,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-zep-Zep|VectorStoreRetriever|BaseRetriever",
-        "name": "zep",
-        "label": "Zep Collection - Open Source",
+        "id": "{nodeId}-output-retriever-Zep|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Zep Retriever",
         "type": "Zep | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Zep|VectorStore",
+        "name": "vectorStore",
+        "label": "Zep Vector Store",
+        "type": "Zep | VectorStore"
       }
     ],
     "outputs": {},
@@ -24296,10 +24872,16 @@
     ],
     "outputAnchors": [
       {
-        "id": "{nodeId}-output-zepCloud-Zep|VectorStoreRetriever|BaseRetriever",
-        "name": "zepCloud",
-        "label": "Zep Collection - Cloud",
+        "id": "{nodeId}-output-retriever-Zep|VectorStoreRetriever|BaseRetriever",
+        "name": "retriever",
+        "label": "Zep Retriever",
         "type": "Zep | VectorStoreRetriever | BaseRetriever"
+      },
+      {
+        "id": "{nodeId}-output-vectorStore-Zep|VectorStore",
+        "name": "vectorStore",
+        "label": "Zep Vector Store",
+        "type": "Zep | VectorStore"
       }
     ],
     "outputs": {},

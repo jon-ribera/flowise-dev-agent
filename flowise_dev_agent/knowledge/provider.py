@@ -103,10 +103,30 @@ def _normalize_api_schema(raw: dict) -> dict:
         else:
             input_anchors.append(entry)
 
-    # Use raw outputAnchors when the API provides them (multi-output nodes),
-    # otherwise synthesize from baseClasses — same logic as _get_node_processed.
-    raw_oa = raw.get("outputAnchors") or []
-    if raw_oa:
+    # Build outputAnchors from the authoritative source — in priority order:
+    #   1. raw["outputs"] — present in Flowise API responses, contains real output names
+    #      (e.g. "retriever", "vectorStore") and their baseClasses per output slot.
+    #   2. raw["outputAnchors"] — legacy field; used when "outputs" is absent.
+    #   3. Synthesize from node-level baseClasses — fallback for single-output nodes
+    #      where the API provides neither field.
+    raw_outputs = raw.get("outputs") or []  # Flowise API: [{name, label, baseClasses}]
+    raw_oa = raw.get("outputAnchors") or []  # Legacy field
+
+    if raw_outputs:
+        output_anchors = []
+        for out in raw_outputs:
+            out_name = out.get("name") or node_name
+            out_bcs = out.get("baseClasses") or base_classes
+            out_type = "|".join(out_bcs)
+            output_anchors.append(
+                {
+                    "id": f"{{nodeId}}-output-{out_name}-{out_type}",
+                    "name": out_name,
+                    "label": out.get("label", out_name),
+                    "type": " | ".join(out_bcs),
+                }
+            )
+    elif raw_oa:
         output_anchors = []
         for oa in raw_oa:
             entry = dict(oa)

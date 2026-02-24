@@ -179,7 +179,7 @@ def test_rag_chain(schema_cache):
         BindCredential(node_id="openAIEmbeddings_0", credential_id="openai-cred", credential_type="openAIApi"),
         Connect(source_node_id="openAIEmbeddings_0", source_anchor="openAIEmbeddings", target_node_id="memoryVectorStore_0", target_anchor="embeddings"),
         Connect(source_node_id="chatOpenAI_0", source_anchor="chatOpenAI", target_node_id="qaChain_0", target_anchor="model"),
-        Connect(source_node_id="memoryVectorStore_0", source_anchor="memoryVectorStore", target_node_id="qaChain_0", target_anchor="vectorStoreRetriever"),
+        Connect(source_node_id="memoryVectorStore_0", source_anchor="retriever", target_node_id="qaChain_0", target_anchor="vectorStoreRetriever"),
         Connect(source_node_id="bufferMemory_0", source_anchor="bufferMemory", target_node_id="qaChain_0", target_anchor="memory"),
     ]
     result = compile_patch_ops(GraphIR(), ops, schema_cache)
@@ -258,10 +258,10 @@ def test_react_agent_with_tool(schema_cache):
 
 
 def test_multi_type_output_anchor(schema_cache):
-    """memoryVectorStore has type 'Memory | VectorStoreRetriever | BaseRetriever'.
+    """memoryVectorStore has two outputs: 'retriever' and 'vectorStore'.
 
-    The compiler must resolve 'vectorStoreRetriever' (LLM target anchor name) to
-    the single outputAnchor of memoryVectorStore via type-suffix matching.
+    The compiler must resolve source_anchor='retriever' (the correct Flowise output
+    name) to the first outputAnchor of memoryVectorStore.
     """
     ops = [
         AddNode(node_name="openAIEmbeddings", node_id="emb_0", label="Embeddings"),
@@ -271,7 +271,7 @@ def test_multi_type_output_anchor(schema_cache):
         BindCredential(node_id="emb_0", credential_id="cred", credential_type="openAIApi"),
         BindCredential(node_id="llm_0", credential_id="cred", credential_type="openAIApi"),
         Connect(source_node_id="emb_0", source_anchor="openAIEmbeddings", target_node_id="vs_0", target_anchor="embeddings"),
-        Connect(source_node_id="vs_0", source_anchor="memoryVectorStore", target_node_id="qa_0", target_anchor="vectorStoreRetriever"),
+        Connect(source_node_id="vs_0", source_anchor="retriever", target_node_id="qa_0", target_anchor="vectorStoreRetriever"),
         Connect(source_node_id="llm_0", source_anchor="chatOpenAI", target_node_id="qa_0", target_anchor="model"),
     ]
     result = compile_patch_ops(GraphIR(), ops, schema_cache)

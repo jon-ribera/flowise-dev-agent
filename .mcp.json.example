@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "cursorwise": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/jon-ribera/cursorwise.git", "cursorwise"],
+      "env": {
+        "FLOWISE_API_KEY": "your-flowise-api-key",
+        "FLOWISE_API_ENDPOINT": "http://localhost:3000",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

@@ -7,6 +7,7 @@
   </p>
   <p align="center">
     <a href="#-quick-start">Quick Start</a> •
+    <a href="#-claude-code-mcp-setup">MCP Setup</a> •
     <a href="#️-configuration">Configuration</a> •
     <a href="#-api-reference">API</a> •
     <a href="#-how-it-works">How It Works</a> •
@@ -59,6 +60,71 @@ curl http://localhost:8000/health
 flowise-agent          # start the API server
 flowise-agent-cli      # interactive terminal session (prompts for requirement)
 ```
+
+---
+
+## 🔌 Claude Code MCP Setup
+
+Connect [cursorwise](https://github.com/jon-ribera/cursorwise) to Claude Code so the AI can build and manage Flowise chatflows directly from the IDE.
+
+### Prerequisites
+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) installed (`uvx` available in PATH)
+- Flowise running and accessible (default: `http://localhost:3000`)
+- A Flowise API key — generate one at **Flowise → top-right menu → API Keys → Add New Key**
+
+### 1. Configure the MCP server
+
+Copy the example config and fill in your values:
+
+```bash
+cp .mcp.json.example .mcp.json
+```
+
+Edit `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "cursorwise": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/jon-ribera/cursorwise.git", "cursorwise"],
+      "env": {
+        "FLOWISE_API_KEY": "your-flowise-api-key",
+        "FLOWISE_API_ENDPOINT": "http://localhost:3000",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
+```
+
+> **Windows users:** If `uvx` is not found by the extension, replace `"command": "uvx"` with the full path to `uvx.exe`, e.g. `"C:/Users/<you>/AppData/Local/uv/uvx.exe"`. Find it with `where uvx` in a terminal.
+
+### 2. Enable auto-approval in `.claude/settings.local.json`
+
+```json
+{
+  "enableAllProjectMcpServers": true
+}
+```
+
+### 3. Reload the window
+
+`Ctrl+Shift+P` → **Developer: Reload Window**
+
+Verify the connection with `/mcp` in the chat — `cursorwise` should show as connected.
+
+### Configuration reference
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FLOWISE_API_KEY` | Yes | — | Bearer token for Flowise API |
+| `FLOWISE_API_ENDPOINT` | No | `http://localhost:3000` | Flowise instance URL |
+| `FLOWISE_TIMEOUT` | No | `120` | HTTP timeout in seconds |
+| `PYTHONUNBUFFERED` | No | `1` | Recommended — ensures MCP log output is not buffered |
+
+> `.mcp.json` contains secrets — it is gitignored. Never commit it. Share `.mcp.json.example` instead.
 
 ---
 

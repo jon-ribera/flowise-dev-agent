@@ -601,6 +601,10 @@ def _validate_flow_data(flow_data_str: str) -> dict:
         for anchor in data.get("outputAnchors", []):
             if "id" in anchor:
                 anchor_ids.add(anchor["id"])
+            # Multi-output nodes use type="options" — IDs are nested inside options[]
+            for opt in anchor.get("options", []):
+                if "id" in opt:
+                    anchor_ids.add(opt["id"])
 
     for edge in edges:
         src = edge.get("source")

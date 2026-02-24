@@ -262,6 +262,65 @@ def _synthesize_output_anchors(
     ]
 
 
+def _patch_output_anchors_from_api(schemas: list[dict]) -> tuple[list[dict], int]:
+    """Fetch live output definitions from Flowise and patch outputAnchors.
+
+    The markdown synthesis always produces a single outputAnchor named after the
+    node type (e.g. "memoryVectorStore"), but many Flowise nodes expose multiple
+    outputs with different names (e.g. "retriever", "vectorStore").  This function
+    calls GET /api/v1/nodes/{name} for every schema, reads the "outputs" field, and
+    replaces the synthesized outputAnchors with correctly-named entries.
+
+    Silently skips nodes where the API call fails or "outputs" is absent/empty.
+    Returns (patched_schemas, patch_count).
+    """
+    import os
+    import urllib.request
+
+    # Load .env so the function works when run via CLI without export'd vars
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
+    api_url = os.getenv("FLOWISE_API_URL", "http://localhost:3000")
+    api_key = os.getenv("FLOWISE_API_KEY", "")
+    base = api_url.rstrip("/")
+
+    patched = 0
+    result: list[dict] = []
+    for schema in schemas:
+        node_name = schema.get("node_type", "")
+        try:
+            url = f"{base}/api/v1/nodes/{node_name}"
+            req = urllib.request.Request(url)
+            if api_key:
+                req.add_header("Authorization", f"Bearer {api_key}")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+            live_outputs = raw.get("outputs") or []
+            if live_outputs:
+                new_anchors = []
+                for out in live_outputs:
+                    out_name = out.get("name") or node_name
+                    out_bcs = out.get("baseClasses") or schema.get("baseClasses", [])
+                    new_anchors.append(
+                        {
+                            "id": f"{{nodeId}}-output-{out_name}-{'|'.join(out_bcs)}",
+                            "name": out_name,
+                            "label": out.get("label", out_name),
+                            "type": " | ".join(out_bcs),
+                        }
+                    )
+                schema = {**schema, "outputAnchors": new_anchors}
+                patched += 1
+        except Exception:
+            pass  # API unavailable or node not found — keep synthesized anchors
+        result.append(schema)
+    return result, patched
+
+
 def _parse_node_block(
     block: str,
     category: str,
@@ -558,6 +617,15 @@ def refresh_nodes(dry_run: bool = False, validate: bool = False) -> int:
     if not schemas:
         logger.error("No schemas parsed — aborting to avoid overwriting with empty snapshot")
         return 1
+
+    # Enrich outputAnchors with real output names from the live Flowise API.
+    # The markdown synthesis always generates a single anchor named after the node
+    # type, which is wrong for multi-output nodes (e.g. memoryVectorStore outputs
+    # "retriever" and "vectorStore", not "memoryVectorStore").
+    # Silently skips when the API is unreachable.
+    schemas, n_patched = _patch_output_anchors_from_api(schemas)
+    if n_patched:
+        print(f"  [nodes] patched outputAnchors for {n_patched} node(s) from live API")
 
     content = json.dumps(schemas, indent=2, ensure_ascii=False)
     content_bytes = content.encode("utf-8")

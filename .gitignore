@@ -18,6 +18,10 @@ env/
 .env.*
 !.env.example
 
+# Claude Code local settings and MCP config (may contain hardcoded secrets)
+.claude/settings.local.json
+.mcp.json
+
 # Editor
 .vscode/
 .idea/

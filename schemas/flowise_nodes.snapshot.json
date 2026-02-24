@@ -2215,7 +2215,7 @@
         "label": "responsePrompt",
         "type": "string",
         "optional": true,
-        "description": "If there is nothing in the context relevant to the question at hand, just say \"Hmm, I'm not sure\" and stop after that. Refuse to answer any question not about the info. Never break character."
+        "description": "If there is nothing in the context relevant to the question at hand, just say \"Hmm, I'm not sure\" and stop after that. Refuse to answer any question not about the info. Never break character. --------"
       }
     ],
     "outputAnchors": [
@@ -14625,7 +14625,15 @@
         "label": "refinePrompt",
         "type": "string",
         "optional": true,
-        "description": "We have provided an existing answer: {existingAnswer} We have the opportunity to refine the existing answer (only if needed) with some more context below."
+        "description": "We have provided an existing answer: {existingAnswer} We have the opportunity to refine the existing answer (only if needed) with some more context below. ------------ {context} ------------ Given the"
+      },
+      {
+        "id": "{nodeId}-input-textQAPrompt-string",
+        "name": "textQAPrompt",
+        "label": "textQAPrompt",
+        "type": "string",
+        "optional": true,
+        "description": "--------------------- {context} --------------------- Given the context information and not prior knowledge, answer the query. Query: {query} Answer: | Text QA Prompt |"
       }
     ],
     "outputAnchors": [
@@ -14658,7 +14666,15 @@
         "label": "refinePrompt",
         "type": "string",
         "optional": true,
-        "description": "We have provided an existing answer: {existingAnswer} We have the opportunity to refine the existing answer (only if needed) with some more context below."
+        "description": "We have provided an existing answer: {existingAnswer} We have the opportunity to refine the existing answer (only if needed) with some more context below. ------------ {context} ------------ Given the"
+      },
+      {
+        "id": "{nodeId}-input-textQAPrompt-string",
+        "name": "textQAPrompt",
+        "label": "textQAPrompt",
+        "type": "string",
+        "optional": true,
+        "description": "--------------------- {context} --------------------- Given the context information and not prior knowledge, answer the query. Query: {query} Answer: | Text QA Prompt |"
       }
     ],
     "outputAnchors": [
@@ -14714,7 +14730,8 @@
         "name": "prompt",
         "label": "prompt",
         "type": "string",
-        "optional": true
+        "optional": true,
+        "description": "--------------------- {context} --------------------- Given the information from multiple sources and not prior knowledge, answer the query. Query: {query} Answer: | Prompt |"
       }
     ],
     "outputAnchors": [
@@ -15711,13 +15728,12 @@
         "description": "Tools"
       },
       {
-        "id": "{nodeId}-input-sequentialNode-Start",
+        "id": "{nodeId}-input-sequentialNode-Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "name": "sequentialNode",
         "label": "sequentialNode",
-        "type": "Start",
+        "type": "Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "optional": true,
-        "default": "Agent",
-        "description": "Condition"
+        "description": "Can be connected to one of the following nodes: Start, Agent, Condition, LLM Node, Tool Node, Custom"
       },
       {
         "id": "{nodeId}-input-model-BaseChatModel",
@@ -15855,13 +15871,12 @@
     "category": "Sequential Agents",
     "inputAnchors": [
       {
-        "id": "{nodeId}-input-sequentialNode-Start",
+        "id": "{nodeId}-input-sequentialNode-Start | Agent | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "name": "sequentialNode",
         "label": "sequentialNode",
-        "type": "Start",
+        "type": "Start | Agent | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "optional": true,
-        "default": "Agent",
-        "description": "LLMNode"
+        "description": "Can be connected to one of the following nodes: Start, Agent, LLM Node, Tool Node, Custom Function,"
       },
       {
         "id": "{nodeId}-input-condition-conditionFunction",
@@ -15905,13 +15920,12 @@
     "category": "Sequential Agents",
     "inputAnchors": [
       {
-        "id": "{nodeId}-input-sequentialNode-Start",
+        "id": "{nodeId}-input-sequentialNode-Start | Agent | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "name": "sequentialNode",
         "label": "sequentialNode",
-        "type": "Start",
+        "type": "Start | Agent | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "optional": true,
-        "default": "Agent",
-        "description": "LLMNode"
+        "description": "Can be connected to one of the following nodes: Start, Agent, LLM Node, Tool Node, Custom Function,"
       },
       {
         "id": "{nodeId}-input-model-BaseChatModel",
@@ -16004,13 +16018,12 @@
     "category": "Sequential Agents",
     "inputAnchors": [
       {
-        "id": "{nodeId}-input-sequentialNode-Start",
+        "id": "{nodeId}-input-sequentialNode-Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "name": "sequentialNode",
         "label": "sequentialNode",
-        "type": "Start",
+        "type": "Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "optional": true,
-        "default": "Agent",
-        "description": "Condition"
+        "description": "Can be connected to one of the following nodes: Start, Agent, Condition, LLM Node, Tool Node, Custom"
       }
     ],
     "inputParams": [
@@ -16071,13 +16084,12 @@
     "category": "Sequential Agents",
     "inputAnchors": [
       {
-        "id": "{nodeId}-input-sequentialNode-Agent",
+        "id": "{nodeId}-input-sequentialNode-Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "name": "sequentialNode",
         "label": "sequentialNode",
-        "type": "Agent",
+        "type": "Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "optional": true,
-        "default": "Condition",
-        "description": "LLMNode"
+        "description": "Can be connected to one of the following nodes: Agent, Condition, LLM Node, Tool Node, Custom Functi"
       }
     ],
     "inputParams": [],
@@ -16104,13 +16116,12 @@
     "category": "Sequential Agents",
     "inputAnchors": [
       {
-        "id": "{nodeId}-input-sequentialNode-Start",
+        "id": "{nodeId}-input-sequentialNode-Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "name": "sequentialNode",
         "label": "sequentialNode",
-        "type": "Start",
+        "type": "Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "optional": true,
-        "default": "Agent",
-        "description": "Condition"
+        "description": "Can be connected to one of the following nodes: Start, Agent, Condition, LLM Node, Tool Node, Custom"
       }
     ],
     "inputParams": [
@@ -16199,13 +16210,12 @@
     "category": "Sequential Agents",
     "inputAnchors": [
       {
-        "id": "{nodeId}-input-sequentialNode-Start",
+        "id": "{nodeId}-input-sequentialNode-Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "name": "sequentialNode",
         "label": "sequentialNode",
-        "type": "Start",
+        "type": "Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "optional": true,
-        "default": "Agent",
-        "description": "Condition"
+        "description": "Can be connected to one of the following nodes: Start, Agent, Condition, LLM, Tool Node, Custom Func"
       },
       {
         "id": "{nodeId}-input-model-BaseChatModel",
@@ -16307,13 +16317,12 @@
     "category": "Sequential Agents",
     "inputAnchors": [
       {
-        "id": "{nodeId}-input-sequentialNode-Agent",
+        "id": "{nodeId}-input-sequentialNode-Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "name": "sequentialNode",
         "label": "sequentialNode",
-        "type": "Agent",
+        "type": "Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow",
         "optional": true,
-        "default": "Condition",
-        "description": "LLMNode"
+        "description": "Can be connected to one of the following nodes: Agent, Condition, LLM Node, Tool Node, Custom Functi"
       }
     ],
     "inputParams": [
@@ -21669,17 +21678,17 @@
     "name": "setVariable",
     "label": "Set Variable",
     "category": "Utilities",
-    "inputAnchors": [],
-    "inputParams": [
+    "inputAnchors": [
       {
-        "id": "{nodeId}-input-input-string",
+        "id": "{nodeId}-input-input-string | number | boolean | json | array",
         "name": "input",
         "label": "input",
-        "type": "string",
+        "type": "string | number | boolean | json | array",
         "optional": true,
-        "default": "number",
-        "description": "boolean"
-      },
+        "description": "Input"
+      }
+    ],
+    "inputParams": [
       {
         "id": "{nodeId}-input-variableName-string",
         "name": "variableName",

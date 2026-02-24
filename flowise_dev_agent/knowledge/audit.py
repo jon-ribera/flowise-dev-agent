@@ -240,13 +240,20 @@ def _audit_node(snap: dict, live_norm: dict) -> dict:
         issues.extend(f"outputAnchor/{d}" for d in oa_diffs)
 
     # --- determine severity ---
+    # order_differs-only issues are MINOR (param ordering doesn't affect compilation).
+    # Missing/extra anchors or params are MAJOR (structural change breaks compiler).
+    _structural = [
+        i for i in issues
+        if "missing_from_snapshot" in i or "extra_in_snapshot" in i
+    ]
+    _order_only = [i for i in issues if "order_differs" in i]
+    _version_or_class = [i for i in issues if "version" in i or "baseClasses" in i or "outputAnchor" in i]
+
     if oa_empty:
         status = "CRITICAL"
-    elif any("missing_from_snapshot" in i or "inputAnchor" in i or "inputParam" in i for i in issues):
+    elif _structural or _version_or_class:
         status = "MAJOR"
-    elif any("version" in i or "baseClasses" in i or "outputAnchor" in i for i in issues):
-        status = "MAJOR"
-    elif issues:
+    elif _order_only or issues:
         status = "MINOR"
     else:
         status = "PASS"
@@ -363,16 +370,16 @@ async def run_audit(
 
     non_pass = {n: r for n, r in node_results.items() if r["status"] != "PASS"}
     if non_pass:
-        print(f"\n{'─'*60}")
+        print(f"\n{'-'*60}")
         print("NON-PASS NODES:")
         for name, r in sorted(non_pass.items()):
             sev = r["status"]
             issues = r.get("issues", [])
             print(f"\n  [{sev}] {name}")
             for issue in issues[:5]:
-                print(f"    • {issue}")
+                print(f"    * {issue}")
             if len(issues) > 5:
-                print(f"    … (+{len(issues) - 5} more)")
+                print(f"    ... (+{len(issues) - 5} more)")
     else:
         print("\n  All audited nodes PASS.")
 

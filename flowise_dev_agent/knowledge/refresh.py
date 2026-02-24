@@ -100,9 +100,14 @@ _RE_CREDENTIAL = re.compile(
 )
 _RE_CATEGORY_HEADING = re.compile(r"^##\s+(.+?)\s*(?:\(\d+\))?\s*$", re.MULTILINE)
 
-# Table row: | `name` | type | ... — first cell must be backtick-wrapped
+# Table row: | `name` | type | ... — first cell must be backtick-wrapped.
+# The type cell (group 2) may contain GFM escaped-pipe sequences "\|" to represent
+# literal pipe characters used in union type strings like "Start \| Agent \| ...".
+# The pattern (?:[^|\\]|\\.)+ matches: any non-pipe/non-backslash char, OR any
+# backslash followed by any char (including \|).
+# After matching, post-process group(2) with .replace("\\|", "|") to unescape.
 _RE_TABLE_ROW = re.compile(
-    r"^\|\s*`([^`]+)`\s*\|\s*([^\|]+?)\s*\|(?:\s*([^\|]*?)\s*\|)?(?:\s*([^\|]*?)\s*\|)?",
+    r"^\|\s*`([^`]+)`\s*\|\s*((?:[^|\\]|\\.)+?)\s*\|(?:\s*([^\|]*?)\s*\|)?(?:\s*([^\|]*?)\s*\|)?",
     re.MULTILINE,
 )
 _RE_TABLE_SEP = re.compile(r"^\|[-| :]+\|$")
@@ -179,7 +184,9 @@ def _parse_table_rows(block: str, section: str) -> tuple[list[dict], list[dict]]
             m = _RE_TABLE_ROW.match(line.strip())
             if m:
                 param_name = m.group(1).strip()
-                param_type = m.group(2).strip()
+                # Unescape GFM pipe escapes (\|) used in union-type strings,
+                # e.g. "Start \| Agent \| ..." → "Start | Agent | ..."
+                param_type = m.group(2).strip().replace("\\|", "|")
                 raw_default = (m.group(3) or "").strip()
                 raw_desc = (m.group(4) or "").strip()
 
@@ -356,9 +363,12 @@ def parse_node_reference(md_path: Path) -> tuple[list[dict], list[str]]:
         if line.startswith("### "):
             line_categories[idx] = current_category
 
-    # Split by horizontal rule  ---  (preceded/followed by blank lines)
-    # Use a pattern that matches lines consisting only of dashes
-    blocks = re.split(r"\n---+\n", text)
+    # Split by the exactly-3-dash horizontal rule used as a node separator.
+    # Using ---+ (3-or-more) would also match long dash-lines that appear inside
+    # multi-line table cell default values (e.g. "-----" used as a visual divider
+    # inside a prompt template), splitting blocks in the wrong place.  The
+    # markdown convention in this file uses exactly "---" as the separator.
+    blocks = re.split(r"\n---\n", text)
 
     # Track category as we scan through blocks in order
     current_category = "Unknown"

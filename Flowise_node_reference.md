@@ -5488,7 +5488,7 @@ Original question: {question} | Prompt for the language model to generate altern
 | `agentName` | string |  | Agent Name |
 | `systemMessagePrompt` | string | You are a research assistant who can search for up-to-date info using search engine. | System Prompt |
 | `tools` | Tool |  | Tools |
-| `sequentialNode` | Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, Condition, LLM Node, Tool Node, Custom |
+| `sequentialNode` | Start \| Agent \| Condition \| LLMNode \| ToolNode \| CustomFunction \| ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, Condition, LLM Node, Tool Node, Custom |
 | `model` | BaseChatModel |  | Overwrite model to be used for this agent |
 | `interrupt` | boolean |  | Pause execution and request user approval before running tools.
 If enabled, the agent will prompt th |
@@ -5523,7 +5523,7 @@ If enabled, the agent will prompt th |
 | Name | Type | Default | Description |
 |---|---|---|---|
 | `conditionName` | string |  | Condition Name |
-| `sequentialNode` | Start | Agent | LLMNode | ToolNode | CustomFunction | ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, LLM Node, Tool Node, Custom Function,  |
+| `sequentialNode` | Start \| Agent \| LLMNode \| ToolNode \| CustomFunction \| ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, LLM Node, Tool Node, Custom Function,  |
 | `condition` | conditionFunction |  | Condition |
 
 ---
@@ -5539,7 +5539,7 @@ If enabled, the agent will prompt th |
 | Name | Type | Default | Description |
 |---|---|---|---|
 | `conditionAgentName` | string |  | Name |
-| `sequentialNode` | Start | Agent | LLMNode | ToolNode | CustomFunction | ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, LLM Node, Tool Node, Custom Function,  |
+| `sequentialNode` | Start \| Agent \| LLMNode \| ToolNode \| CustomFunction \| ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, LLM Node, Tool Node, Custom Function,  |
 | `model` | BaseChatModel |  | Overwrite model to be used for this agent |
 | `condition` | conditionFunction |  | Condition |
 
@@ -5576,7 +5576,7 @@ Remember, only respond with one of the above words. | This prompt will be added 
 | Name | Type | Default | Description |
 |---|---|---|---|
 | `functionInputVariables` | json |  | Input variables can be used in the function with prefix $. For example: $var |
-| `sequentialNode` | Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, Condition, LLM Node, Tool Node, Custom |
+| `sequentialNode` | Start \| Agent \| Condition \| LLMNode \| ToolNode \| CustomFunction \| ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, Condition, LLM Node, Tool Node, Custom |
 | `functionName` | string |  | Function Name |
 | `javascriptFunction` | code |  | Javascript Function |
 | `returnValueAs` | options | aiMessage | Return Value As |
@@ -5593,7 +5593,7 @@ Remember, only respond with one of the above words. | This prompt will be added 
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `sequentialNode` | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow |  | Can be connected to one of the following nodes: Agent, Condition, LLM Node, Tool Node, Custom Functi |
+| `sequentialNode` | Agent \| Condition \| LLMNode \| ToolNode \| CustomFunction \| ExecuteFlow |  | Can be connected to one of the following nodes: Agent, Condition, LLM Node, Tool Node, Custom Functi |
 
 ---
 
@@ -5609,7 +5609,7 @@ Remember, only respond with one of the above words. | This prompt will be added 
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `sequentialNode` | Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, Condition, LLM Node, Tool Node, Custom |
+| `sequentialNode` | Start \| Agent \| Condition \| LLMNode \| ToolNode \| CustomFunction \| ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, Condition, LLM Node, Tool Node, Custom |
 | `seqExecuteFlowName` | string |  | Name |
 | `selectedFlow` | asyncOptions |  | Select Flow |
 | `seqExecuteFlowInput` | options |  | Select one of the following or enter custom input |
@@ -5639,7 +5639,7 @@ Remember, only respond with one of the above words. | This prompt will be added 
 | Name | Type | Default | Description |
 |---|---|---|---|
 | `llmNodeName` | string |  | Name |
-| `sequentialNode` | Start | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, Condition, LLM, Tool Node, Custom Func |
+| `sequentialNode` | Start \| Agent \| Condition \| LLMNode \| ToolNode \| CustomFunction \| ExecuteFlow |  | Can be connected to one of the following nodes: Start, Agent, Condition, LLM, Tool Node, Custom Func |
 | `model` | BaseChatModel |  | Overwrite model to be used for this node |
 
 <details>
@@ -5669,7 +5669,7 @@ Remember, only respond with one of the above words. | This prompt will be added 
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `sequentialNode` | Agent | Condition | LLMNode | ToolNode | CustomFunction | ExecuteFlow |  | Can be connected to one of the following nodes: Agent, Condition, LLM Node, Tool Node, Custom Functi |
+| `sequentialNode` | Agent \| Condition \| LLMNode \| ToolNode \| CustomFunction \| ExecuteFlow |  | Can be connected to one of the following nodes: Agent, Condition, LLM Node, Tool Node, Custom Functi |
 | `loopToName` | string |  | Name of the agent/llm to loop back to |
 
 ---
@@ -7147,7 +7147,7 @@ try {
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `input` | string | number | boolean | json | array |  | Input |
+| `input` | string \| number \| boolean \| json \| array |  | Input |
 | `variableName` | string |  | Variable Name |
 
 <details>

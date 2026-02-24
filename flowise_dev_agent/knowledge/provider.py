@@ -226,6 +226,22 @@ class NodeSchemaStore:
     # Public interface
     # ------------------------------------------------------------------
 
+    @property
+    def meta_fingerprint(self) -> str | None:
+        """Return the fingerprint stored in the snapshot meta file, or None.
+
+        Used by M7.3 to record which schema version was active when a pattern
+        was saved.  Returns None when the meta file is absent or malformed.
+        See DD-068.
+        """
+        if not self._meta_path.exists():
+            return None
+        try:
+            meta = json.loads(self._meta_path.read_text(encoding="utf-8"))
+            return meta.get("fingerprint") or meta.get("sha256") or None
+        except Exception:
+            return None
+
     def get(self, node_type: str) -> dict | None:
         """Return the processed schema for node_type from snapshot, or None.
 

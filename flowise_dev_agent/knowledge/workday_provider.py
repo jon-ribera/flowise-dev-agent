@@ -1,31 +1,28 @@
-"""Workday knowledge provider — Milestone 4 stubs.
+"""Workday knowledge provider — Milestone 4 scaffold; WorkdayMcpStore real (M7.5).
 
-Roadmap 6, Milestone 4: scaffolds the WorkdayKnowledgeProvider and its two
-sub-stores (WorkdayMcpStore, WorkdayApiStore).  All public lookup methods raise
-NotImplementedError — real implementations are deferred to Milestone 5+.
+Roadmap 6, Milestone 4: scaffolded WorkdayKnowledgeProvider and WorkdayApiStore.
+Roadmap 7, Milestone 7.5: WorkdayMcpStore now loads blueprints from the snapshot
+and exposes get() / find() / is_stale() / item_count without raising NotImplementedError.
 
 Design rationale (DD-065):
-- Mirrors the FlowiseKnowledgeProvider pattern (provider.py) so that future
-  implementors have a clear template to follow.
-- Snapshot files (workday_mcp.snapshot.json, workday_api.snapshot.json) exist
-  on disk with status="stub" so that the refresh CLI can already accept
-  --workday-mcp / --workday-api flags without failing.
-- No imports from flowise_dev_agent.knowledge.provider — intentionally
-  independent to avoid coupling Workday and Flowise knowledge layers.
-- DomainCapability integration (WorkdayCapability in agent/domains/workday.py)
-  will accept a WorkdayKnowledgeProvider in a future milestone.
+- Mirrors the FlowiseKnowledgeProvider pattern (provider.py) for consistency.
+- Snapshot file: schemas/workday_mcp.snapshot.json — blueprint list, NOT live MCP data.
+- No imports from flowise_dev_agent.knowledge.provider — intentionally independent.
+- WorkdayApiStore remains a stub (no real Workday REST/SOAP calls in scope).
 
 Public surface:
     WorkdayKnowledgeProvider — holds WorkdayMcpStore + WorkdayApiStore.
-    WorkdayMcpStore          — stub; future: Workday MCP endpoint metadata.
-    WorkdayApiStore          — stub; future: Workday REST/SOAP API metadata.
+    WorkdayMcpStore          — real (M7.5): blueprint lookup + keyword search.
+    WorkdayApiStore          — stub; Workday REST/SOAP deferred to future milestone.
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -38,26 +35,29 @@ _WORKDAY_API_SNAPSHOT = _SCHEMAS_DIR / "workday_api.snapshot.json"
 _WORKDAY_API_META = _SCHEMAS_DIR / "workday_api.meta.json"
 
 _NOT_IMPLEMENTED_MSG = (
-    "WorkdayKnowledgeProvider is a Milestone 4 stub. "
-    "Real implementation is deferred to Milestone 5+. "
-    "See roadmap6_architecture_optimization.md section on Workday integration."
+    "WorkdayApiStore is a stub. "
+    "Real Workday REST/SOAP API integration is deferred to a future milestone. "
+    "See roadmap7_multi_domain_runtime_hardening.md."
 )
 
 
 # ---------------------------------------------------------------------------
-# WorkdayMcpStore
+# WorkdayMcpStore — real implementation (Milestone 7.5)
 # ---------------------------------------------------------------------------
 
 
 class WorkdayMcpStore:
-    """Stub store for Workday MCP endpoint metadata.
+    """Blueprint store for Workday Custom MCP tool configurations.
 
-    Milestone 4: scaffold only — all lookup methods raise NotImplementedError.
+    Loads from schemas/workday_mcp.snapshot.json — a list of blueprint dicts
+    describing how to wire Workday via Flowise's ``customMCP`` selected_tool.
 
-    Future implementation:
-    - Will load from schemas/workday_mcp.snapshot.json.
-    - Will expose get(endpoint_name) → dict | None for MCP tool descriptions.
-    - Refresh CLI: python -m flowise_dev_agent.knowledge.refresh --workday-mcp
+    Each blueprint has a unique ``blueprint_id`` key.
+
+    Refresh:
+        python -m flowise_dev_agent.knowledge.refresh --workday-mcp
+
+    See roadmap7_multi_domain_runtime_hardening.md — Milestone 7.5.
     """
 
     def __init__(
@@ -67,69 +67,114 @@ class WorkdayMcpStore:
     ) -> None:
         self._snapshot_path = snapshot_path
         self._meta_path = meta_path
-        logger.debug(
-            "[WorkdayMcpStore] Initialised (stub) — snapshot: %s", snapshot_path
-        )
+        self._data: list[dict[str, Any]] | None = None
+        self._index: dict[str, dict[str, Any]] = {}
+        logger.debug("[WorkdayMcpStore] Initialised — snapshot: %s", snapshot_path)
 
-    def get(self, endpoint_name: str) -> dict:
-        """Return MCP endpoint metadata by name.
+    # ------------------------------------------------------------------
+    # Internal loading
+    # ------------------------------------------------------------------
 
-        Raises
-        ------
-        NotImplementedError
-            Always — WorkdayMcpStore is a Milestone 4 stub.
+    def _load(self) -> None:
+        """Lazily load blueprints from the snapshot file."""
+        if self._data is not None:
+            return
+        if not self._snapshot_path.exists():
+            logger.warning(
+                "[WorkdayMcpStore] Snapshot not found at %s — returning empty store",
+                self._snapshot_path,
+            )
+            self._data = []
+            self._index = {}
+            return
+        try:
+            raw = json.loads(self._snapshot_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.error("[WorkdayMcpStore] Failed to parse snapshot: %s", exc)
+            self._data = []
+            self._index = {}
+            return
+        if not isinstance(raw, list):
+            logger.error(
+                "[WorkdayMcpStore] Snapshot is not a JSON array — treating as empty"
+            )
+            self._data = []
+            self._index = {}
+            return
+        self._data = [entry for entry in raw if isinstance(entry, dict)]
+        self._index = {
+            entry["blueprint_id"]: entry
+            for entry in self._data
+            if entry.get("blueprint_id")
+        }
+        logger.debug("[WorkdayMcpStore] Loaded %d blueprint(s)", len(self._data))
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def get(self, blueprint_id: str) -> dict[str, Any] | None:
+        """Return a blueprint by its blueprint_id, or None if not found."""
+        self._load()
+        return self._index.get(blueprint_id)
+
+    def find(self, tags: list[str], limit: int = 3) -> list[dict[str, Any]]:
+        """Return blueprints whose description, mcp_actions, or tags overlap with *tags*.
+
+        Keyword search: any tag substring match against description, mcp_actions list,
+        or the blueprint's own tags list.  Returns up to *limit* results.
         """
-        raise NotImplementedError(
-            f"WorkdayMcpStore.get({endpoint_name!r}) is not implemented. "
-            + _NOT_IMPLEMENTED_MSG
-        )
+        self._load()
+        if not tags or not self._data:
+            return (self._data or [])[:limit]
 
-    def find(self, tags: list[str], limit: int = 3) -> list[dict]:
-        """Search MCP endpoints by tags.
+        keywords = [t.lower() for t in tags]
+        scored: list[tuple[int, dict]] = []
+        for bp in self._data:
+            score = 0
+            desc = (bp.get("description") or "").lower()
+            bp_tags = [t.lower() for t in (bp.get("tags") or [])]
+            actions = [a.lower() for a in (bp.get("mcp_actions") or [])]
+            category = (bp.get("category") or "").lower()
+            search_corpus = " ".join([desc, category] + bp_tags + actions)
+            for kw in keywords:
+                if kw in search_corpus:
+                    score += 1
+            if score > 0:
+                scored.append((score, bp))
 
-        Raises
-        ------
-        NotImplementedError
-            Always — WorkdayMcpStore is a Milestone 4 stub.
-        """
-        raise NotImplementedError(
-            f"WorkdayMcpStore.find(tags={tags!r}) is not implemented. "
-            + _NOT_IMPLEMENTED_MSG
-        )
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return [bp for _, bp in scored[:limit]]
 
     def is_stale(self, ttl_seconds: int | None = None) -> bool:
-        """Return staleness flag for the MCP snapshot.
+        """Return True if the snapshot is older than *ttl_seconds*.
 
-        Raises
-        ------
-        NotImplementedError
-            Always — WorkdayMcpStore is a Milestone 4 stub.
+        Reads ``generated_at`` from the meta file.  Returns False when the meta
+        file is absent (not stale by assumption — just refresh not yet run).
         """
-        raise NotImplementedError(
-            "WorkdayMcpStore.is_stale() is not implemented. " + _NOT_IMPLEMENTED_MSG
-        )
+        if not self._meta_path.exists():
+            return False
+        try:
+            meta = json.loads(self._meta_path.read_text(encoding="utf-8"))
+            generated_at_str = meta.get("generated_at")
+            if not generated_at_str:
+                return False
+            generated_at = datetime.datetime.fromisoformat(
+                generated_at_str.replace("Z", "+00:00")
+            )
+            now = datetime.datetime.now(datetime.timezone.utc)
+            age_seconds = (now - generated_at).total_seconds()
+            effective_ttl = ttl_seconds if ttl_seconds is not None else 86400
+            return age_seconds > effective_ttl
+        except Exception as exc:
+            logger.debug("[WorkdayMcpStore] is_stale() error: %s", exc)
+            return False
 
     @property
     def item_count(self) -> int:
-        """Return number of loaded MCP endpoints.
-
-        Raises
-        ------
-        NotImplementedError
-            Always — WorkdayMcpStore is a Milestone 4 stub.
-        """
-        raise NotImplementedError(
-            "WorkdayMcpStore.item_count is not implemented. " + _NOT_IMPLEMENTED_MSG
-        )
-
-    def _stub_meta(self) -> dict:
-        """Return the stub meta dict from disk (informational only)."""
-        if self._meta_path.exists():
-            try:
-                return json.loads(self._meta_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return {"status": "stub"}
+        """Return number of loaded blueprints."""
+        self._load()
+        return len(self._data or [])
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +299,8 @@ class WorkdayKnowledgeProvider:
             base / "workday_api.meta.json",
         )
         logger.info(
-            "[WorkdayKnowledgeProvider] Initialised (stub) — "
-            "all lookup methods raise NotImplementedError until Milestone 5+"
+            "[WorkdayKnowledgeProvider] Initialised — "
+            "WorkdayMcpStore: blueprint lookup ready; WorkdayApiStore: stub (future milestone)"
         )
 
     @property

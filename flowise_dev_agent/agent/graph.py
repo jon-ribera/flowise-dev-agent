@@ -41,7 +41,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from langgraph.graph import END, START, StateGraph
@@ -79,8 +81,18 @@ from cursorwise.client import FlowiseClient
 from cursorwise.config import Settings
 from flowise_dev_agent.reasoning import Message, ReasoningEngine, ReasoningSettings, ToolDef, create_engine
 from flowise_dev_agent.knowledge.provider import FlowiseKnowledgeProvider, TemplateStore
+from flowise_dev_agent.agent.metrics import MetricsCollector
+from flowise_dev_agent.agent.plan_schema import _parse_plan_contract
 
 logger = logging.getLogger("flowise_dev_agent.agent")
+
+# M7.4 (DD-069): Schema drift policy.  Set FLOWISE_SCHEMA_DRIFT_POLICY to:
+#   "warn"    (default) — log a warning and continue
+#   "fail"              — return an error message and abort the patch phase
+#   "refresh"           — log and continue (refresh scheduling is future work)
+_SCHEMA_DRIFT_POLICY: str = os.environ.get(
+    "FLOWISE_SCHEMA_DRIFT_POLICY", "warn"
+).lower()
 
 # ---------------------------------------------------------------------------
 # Base system prompts (derived from FLOWISE_BUILDER_ORCHESTRATOR_CHATFLOW_MCP.md)
@@ -154,6 +166,26 @@ Your plan MUST include ALL of these sections:
    2. <short label>: <one-sentence description>
    Omit this section entirely if there is only one clear path forward.
    Do NOT list sub-steps of the same approach as separate approaches.
+
+9. MACHINE-READABLE METADATA (REQUIRED — parser reads these verbatim)
+   Append EXACTLY these three sections at the end of your plan.
+   Follow the format precisely — spacing and header names must match exactly.
+
+   ## DOMAINS
+   <comma-separated domain names involved>
+   Use "flowise" for Flowise-only.  Use "flowise,workday" when Workday MCP
+   nodes are also required.  No extra text on this line.
+
+   ## CREDENTIALS
+   <comma-separated Flowise credentialName values required by this chatflow>
+   Example: openAIApi, anthropicApi
+   Write "(none)" if no credentials are needed.
+
+   ## DATA_CONTRACTS
+   <one line per field that crosses a domain boundary, format:>
+   <  fieldName: source-domain → target-domain>
+   <  fieldName: source-domain → target-domain [PII]   ← add [PII] if personally identifiable>
+   Write "(none)" if there are no cross-domain data flows.
 
 Keep the plan concise. The developer will approve it before any writes happen.
 """
@@ -651,12 +683,7 @@ def _make_discover_node(
             "domain_context": state.get("domain_context") or {},
         }
 
-        # Run discover for all capabilities in parallel
-        results = await asyncio.gather(
-            *[cap.discover(context) for cap in (capabilities or [])],
-            return_exceptions=True,
-        )
-
+        # Run discover for all capabilities in parallel (M7.4: timed via MetricsCollector)
         domain_context = dict(state.get("domain_context") or {})
         new_facts: dict[str, Any] = {}
         new_artifacts: dict[str, Any] = {}
@@ -666,31 +693,53 @@ def _make_discover_node(
         total_in_tok = 0
         total_out_tok = 0
 
-        for cap, result in zip(capabilities or [], results):
-            if isinstance(result, Exception):
-                logger.warning("[DISCOVER] %s.discover() raised: %s", cap.name, result)
-                domain_context[cap.name] = f"ERROR during {cap.name} discovery: {result}"
-                continue
+        async with MetricsCollector("discover") as m_disc:
+            results = await asyncio.gather(
+                *[cap.discover(context) for cap in (capabilities or [])],
+                return_exceptions=True,
+            )
 
-            domain_context[cap.name] = result.summary
+            for cap, result in zip(capabilities or [], results):
+                if isinstance(result, Exception):
+                    logger.warning("[DISCOVER] %s.discover() raised: %s", cap.name, result)
+                    domain_context[cap.name] = f"ERROR during {cap.name} discovery: {result}"
+                    continue
 
-            if cap.name == "flowise":
-                flowise_summary = result.summary
-                # Parse credentials from flowise summary (only on first iteration)
-                if iteration == 0:
-                    m = re.search(
-                        r"CREDENTIALS_STATUS:\s*MISSING\s*\nMISSING_TYPES:\s*(.+)",
-                        result.summary,
-                    )
-                    credentials_missing = [t.strip() for t in m.group(1).split(",")] if m else []
+                domain_context[cap.name] = result.summary
 
-            # Distribute structured outputs to their state fields
-            if result.facts:
-                new_facts[cap.name] = result.facts
-            if result.artifacts:
-                new_artifacts[cap.name] = result.artifacts
-            if result.debug:
-                new_debug[cap.name] = result.debug
+                if cap.name == "flowise":
+                    flowise_summary = result.summary
+                    # Parse credentials from flowise summary (only on first iteration)
+                    if iteration == 0:
+                        m = re.search(
+                            r"CREDENTIALS_STATUS:\s*MISSING\s*\nMISSING_TYPES:\s*(.+)",
+                            result.summary,
+                        )
+                        credentials_missing = [t.strip() for t in m.group(1).split(",")] if m else []
+
+                # Distribute structured outputs to their state fields
+                if result.facts:
+                    new_facts[cap.name] = result.facts
+                if result.artifacts:
+                    new_artifacts[cap.name] = result.artifacts
+                if result.debug:
+                    new_debug[cap.name] = result.debug
+
+            m_disc.tool_call_count = sum(
+                1 for r in results if not isinstance(r, Exception)
+            )
+            m_disc.input_tokens = total_in_tok
+            m_disc.output_tokens = total_out_tok
+
+        # M7.4: merge discover phase metrics into new_debug["flowise"]
+        _disc_existing = new_debug.get("flowise") or {}
+        _disc_prior_phases = (
+            (state.get("debug") or {}).get("flowise", {}).get("phase_metrics", [])
+        )
+        new_debug["flowise"] = {
+            **_disc_existing,
+            "phase_metrics": _disc_prior_phases + [m_disc.to_dict()],
+        }
 
         return {
             "messages": [],  # tool call msgs NOT in state.messages (raw → debug only)
@@ -782,6 +831,7 @@ def _make_plan_node(
     engine: ReasoningEngine,
     domains: list[DomainTools],
     template_store: TemplateStore | None = None,
+    pattern_store=None,
 ):
     system = _build_system_prompt(_PLAN_BASE, domains, "discover")  # plan uses discover context
 
@@ -812,17 +862,19 @@ def _make_plan_node(
 
         user_msg = Message(role="user", content=user_content)
 
+        # Extract meaningful keywords from the requirement.
+        # Used for both template matching and pattern library lookup (M7.3).
+        req_keywords = list(dict.fromkeys(
+            w for w in re.findall(r"[a-zA-Z]{4,}", state["requirement"])
+            if w.lower() not in _STOP
+        ))[:15]
+
         # Narrow template hint (Milestone 2 — knowledge layer).
-        # Extract meaningful keywords from the requirement, query the local
-        # TemplateStore, and inject a brief note when relevant matches exist.
+        # Query the local TemplateStore, inject a note when relevant matches exist.
         # NEVER injects more than 3 entries; description is capped at 120 chars.
         template_hint = ""
         if template_store is not None and template_store.template_count > 0:
-            keywords = list(dict.fromkeys(
-                w for w in re.findall(r"[a-zA-Z]{4,}", state["requirement"])
-                if w.lower() not in _STOP
-            ))[:15]
-            matches = template_store.find(keywords, limit=3)
+            matches = template_store.find(req_keywords, limit=3)
             if matches:
                 lines = [
                     "Possibly relevant marketplace templates "
@@ -837,6 +889,30 @@ def _make_plan_node(
                     "[PLAN] Template hint injected: %d match(es) for requirement",
                     len(matches),
                 )
+
+        # M7.3 (DD-068): Pattern base graph seeding.
+        # On the first iteration of a CREATE flow, search the pattern library
+        # for a matching prior pattern and seed artifacts["flowise"]["base_graph_ir"]
+        # so that patch v2 starts from a populated base rather than an empty GraphIR.
+        # Only active when pattern_store is provided.
+        _pattern_base_ir: dict | None = None
+        if pattern_store is not None and iteration == 0 and not state.get("chatflow_id"):
+            _kw_str = " ".join(req_keywords) or state.get("requirement", "")[:200]
+            try:
+                _pat_matches = await pattern_store.search_patterns_filtered(
+                    _kw_str, domain="flowise", limit=1
+                )
+                if _pat_matches:
+                    _pat = _pat_matches[0]
+                    _base_ir = await pattern_store.apply_as_base_graph(_pat["id"])
+                    if _base_ir.nodes:
+                        _pattern_base_ir = _base_ir.to_flow_data()
+                        logger.info(
+                            "[PLAN] Pattern seed: id=%d name=%r nodes=%d",
+                            _pat["id"], _pat.get("name", "?"), len(_base_ir.nodes),
+                        )
+            except Exception as _exc:
+                logger.warning("[PLAN] Pattern search failed (non-fatal): %s", _exc)
 
         # Build a compact context from structured state fields — never use the raw
         # state["messages"] which may contain huge tool call blobs from discover.
@@ -883,13 +959,33 @@ def _make_plan_node(
         plan_text = response.content or ""
         assistant_msg = Message(role="assistant", content=plan_text)
 
-        return {
+        # M7.2 (DD-067): parse structured plan contract from the LLM output and
+        # store it in facts["flowise"]["plan_contract"].  Merges with existing
+        # flowise facts so we never clobber other keys (e.g. schema_fingerprint).
+        contract = _parse_plan_contract(plan_text, state.get("chatflow_id"))
+        existing_flowise_facts: dict = (state.get("facts") or {}).get("flowise") or {}
+        logger.debug(
+            "[PLAN] PlanContract parsed: action=%s domains=%s criteria=%d",
+            contract.action,
+            contract.domain_targets,
+            len(contract.success_criteria),
+        )
+
+        ret: dict[str, Any] = {
             "messages": [user_msg, assistant_msg],
             "plan": plan_text,
             "developer_feedback": None,  # consumed; clear it
             "total_input_tokens": response.input_tokens,
             "total_output_tokens": response.output_tokens,
+            "facts": {"flowise": {**existing_flowise_facts, "plan_contract": asdict(contract)}},
         }
+        # M7.3: attach pattern-seeded base graph to artifacts if one was found
+        if _pattern_base_ir is not None:
+            existing_flowise_artifacts: dict = (state.get("artifacts") or {}).get("flowise") or {}
+            ret["artifacts"] = {
+                "flowise": {**existing_flowise_artifacts, "base_graph_ir": _pattern_base_ir}
+            }
+        return ret
 
     return plan
 
@@ -1106,9 +1202,11 @@ def _make_patch_node_v2(
         requirement = state.get("requirement", "")
         in_tok = 0
         out_tok = 0
+        _v2_phase_metrics: list[dict] = []   # M7.4: phase timing collected by phases B + D
 
         # ---- Phase A: Read base graph ----------------------------------------
         base_graph = GraphIR()
+        _using_pattern_seed = False
         discover_executor = (
             flowise_cap.tools.executor("discover") if flowise_cap else patch_executor
         )
@@ -1124,6 +1222,22 @@ def _make_patch_node_v2(
                         "[PATCH v2] Loaded base graph: %d nodes, %d edges",
                         len(base_graph.nodes), len(base_graph.edges),
                     )
+        else:
+            # M7.3 (DD-068): No existing chatflow — use pattern-seeded base if present.
+            # The plan node populates artifacts["flowise"]["base_graph_ir"] when a
+            # matching pattern is found in the library.
+            _base_ir_data: dict | None = (
+                (state.get("artifacts") or {}).get("flowise", {}).get("base_graph_ir")
+            )
+            if _base_ir_data:
+                _seeded = GraphIR.from_flow_data(_base_ir_data)
+                if _seeded.nodes:
+                    base_graph = _seeded
+                    _using_pattern_seed = True
+                    logger.info(
+                        "[PATCH v2] Using pattern-seeded base graph: %d nodes, %d edges",
+                        len(base_graph.nodes), len(base_graph.edges),
+                    )
 
         # ---- Phase B: LLM generates ops JSON ---------------------------------
         chatflow_summary: str
@@ -1133,6 +1247,13 @@ def _make_patch_node_v2(
                 for n in base_graph.nodes
             ]
             chatflow_summary = "Existing nodes:\n" + "\n".join(node_lines)
+            if _using_pattern_seed:
+                chatflow_summary += (
+                    "\nNote: these nodes come from a saved pattern that matched this "
+                    "requirement. Do NOT re-add them with AddNode. Instead, only emit "
+                    "ops for nodes that are MISSING from this list or params that need "
+                    "to be changed (SetParam / BindCredential)."
+                )
         else:
             chatflow_summary = "(creating new chatflow)"
 
@@ -1146,13 +1267,18 @@ def _make_patch_node_v2(
                 "Output the JSON array of Patch IR operations to implement this plan."
             ),
         )
-        response = await engine.complete(
-            messages=[user_msg],
-            system=system,
-            tools=None,   # Ops generation — no tool calls
-        )
+        # M7.4: time Phase B (LLM ops generation)
+        async with MetricsCollector("patch_b") as m_b:
+            response = await engine.complete(
+                messages=[user_msg],
+                system=system,
+                tools=None,   # Ops generation — no tool calls
+            )
+            m_b.input_tokens = response.input_tokens
+            m_b.output_tokens = response.output_tokens
         in_tok += response.input_tokens
         out_tok += response.output_tokens
+        _v2_phase_metrics.append(m_b.to_dict())
         raw_ops_text = (response.content or "[]").strip()
 
         new_msgs: list[Message] = [
@@ -1253,54 +1379,97 @@ def _make_patch_node_v2(
             op.node_name for op in ops
             if isinstance(op, AddNode) and op.node_name
         }
-        if new_node_names:
-            provider = flowise_cap.knowledge if flowise_cap else None
-            node_store = provider.node_schemas if provider else None
 
-            async def _api_fetcher(node_type: str) -> dict:
-                """Single targeted get_node API call — invoked ONLY on cache miss."""
-                _result = await execute_tool(
-                    "get_node", {"name": node_type}, discover_executor
-                )
-                if isinstance(_result, ToolResult) and _result.ok and isinstance(_result.data, dict):
-                    return _result.data
-                return {}
+        # M7.4: time Phase D (schema resolution) — runs even when new_node_names is empty
+        async with MetricsCollector("patch_d") as m_d:
+            if new_node_names:
+                provider = flowise_cap.knowledge if flowise_cap else None
+                node_store = provider.node_schemas if provider else None
 
-            for _name in new_node_names:
-                if node_store is not None:
-                    # Fast path: local snapshot hit → zero API calls
-                    # Slow path: cache miss → ONE targeted get_node call (repair)
-                    _schema = await node_store.get_or_repair(
-                        _name, _api_fetcher, repair_events_out=_phase_d_repair_events
+                async def _api_fetcher(node_type: str) -> dict:
+                    """Single targeted get_node API call — invoked ONLY on cache miss."""
+                    _result = await execute_tool(
+                        "get_node", {"name": node_type}, discover_executor
                     )
-                else:
-                    # capabilities=None legacy path — always calls API (unchanged behaviour)
-                    _legacy = await execute_tool(
-                        "get_node", {"name": _name}, discover_executor
-                    )
-                    _schema = (
-                        _legacy.data
-                        if isinstance(_legacy, ToolResult) and _legacy.ok and isinstance(_legacy.data, dict)
-                        else None
-                    )
+                    if isinstance(_result, ToolResult) and _result.ok and isinstance(_result.data, dict):
+                        return _result.data
+                    return {}
 
-                if _schema:
-                    schema_cache[_name] = _schema
-                else:
-                    logger.warning("[PATCH v2] Schema unavailable for '%s' — AddNode will fail", _name)
+                for _name in new_node_names:
+                    if node_store is not None:
+                        # Fast path: local snapshot hit → zero API calls
+                        # Slow path: cache miss → ONE targeted get_node call (repair)
+                        _schema = await node_store.get_or_repair(
+                            _name, _api_fetcher, repair_events_out=_phase_d_repair_events
+                        )
+                    else:
+                        # capabilities=None legacy path — always calls API (unchanged behaviour)
+                        _legacy = await execute_tool(
+                            "get_node", {"name": _name}, discover_executor
+                        )
+                        _schema = (
+                            _legacy.data
+                            if isinstance(_legacy, ToolResult) and _legacy.ok and isinstance(_legacy.data, dict)
+                            else None
+                        )
 
-            # Build debug update for repair events (written to state via return dict)
-            if _phase_d_repair_events:
-                logger.info("[PATCH v2] Knowledge repair events: %d", len(_phase_d_repair_events))
-                _existing_events = state.get("debug", {}).get("flowise", {}).get(
-                    "knowledge_repair_events", []
-                )
-                _phase_d_debug = {
-                    "flowise": {
-                        **state.get("debug", {}).get("flowise", {}),
-                        "knowledge_repair_events": _existing_events + _phase_d_repair_events,
+                    if _schema:
+                        schema_cache[_name] = _schema
+                    else:
+                        logger.warning("[PATCH v2] Schema unavailable for '%s' — AddNode will fail", _name)
+
+                # Build debug update for repair events (written to state via return dict)
+                if _phase_d_repair_events:
+                    logger.info("[PATCH v2] Knowledge repair events: %d", len(_phase_d_repair_events))
+                    _existing_events = state.get("debug", {}).get("flowise", {}).get(
+                        "knowledge_repair_events", []
+                    )
+                    _phase_d_debug = {
+                        "flowise": {
+                            **state.get("debug", {}).get("flowise", {}),
+                            "knowledge_repair_events": _existing_events + _phase_d_repair_events,
+                        }
                     }
-                }
+
+                m_d.cache_hits = len(new_node_names) - len(_phase_d_repair_events)
+                m_d.repair_events = len(_phase_d_repair_events)
+
+        _v2_phase_metrics.append(m_d.to_dict())
+
+        # M7.4 (DD-069): Drift detection — compare schema fingerprint against prior iteration.
+        # The current fingerprint is always written to facts["flowise"]["schema_fingerprint"]
+        # so subsequent iterations can detect snapshot refreshes between iterations.
+        _current_schema_fp: str | None = None
+        _phase_d_provider = flowise_cap.knowledge if flowise_cap else None
+        _phase_d_node_store = _phase_d_provider.node_schemas if _phase_d_provider else None
+        if _phase_d_node_store is not None:
+            _current_schema_fp = _phase_d_node_store.meta_fingerprint
+            _prior_fp: str | None = (
+                (state.get("facts") or {}).get("flowise", {}).get("schema_fingerprint")
+            )
+            if _current_schema_fp and _prior_fp and _current_schema_fp != _prior_fp:
+                logger.warning(
+                    "[PATCH v2] Schema drift detected: prior=%s… current=%s… policy=%s",
+                    _prior_fp[:8], _current_schema_fp[:8], _SCHEMA_DRIFT_POLICY,
+                )
+                if _SCHEMA_DRIFT_POLICY == "fail":
+                    new_msgs.append(Message(
+                        role="tool_result",
+                        content=(
+                            f"Schema drift detected — snapshot fingerprint changed "
+                            f"({_prior_fp[:8]}… → {_current_schema_fp[:8]}…). "
+                            "Run --nodes refresh before continuing."
+                        ),
+                    ))
+                    return {
+                        "messages": new_msgs,
+                        "total_input_tokens": in_tok,
+                        "total_output_tokens": out_tok,
+                    }
+                elif _SCHEMA_DRIFT_POLICY == "refresh":
+                    logger.info(
+                        "[PATCH v2] Drift policy=refresh — recording drift, continuing"
+                    )
 
         # ---- Phase E: Deterministic compile ----------------------------------
         compile_result = compile_patch_ops(base_graph, ops, schema_cache)
@@ -1427,9 +1596,9 @@ def _make_patch_node_v2(
         # Roadmap 6 M3: write resolved_credentials to facts["flowise"].
         # Merges with any credentials resolved in earlier patch iterations
         # without overwriting other flowise fact keys (e.g. available_node_types).
+        _existing_flowise_facts = (state.get("facts") or {}).get("flowise") or {}
         _phase_c_facts: dict = {}
         if _resolved_credentials:
-            _existing_flowise_facts = (state.get("facts") or {}).get("flowise") or {}
             _existing_resolved = _existing_flowise_facts.get("resolved_credentials") or {}
             _phase_c_facts = {
                 "flowise": {
@@ -1440,6 +1609,12 @@ def _make_patch_node_v2(
                     },
                 }
             }
+
+        # M7.4 (DD-069): persist current schema fingerprint to facts so next iteration
+        # can detect drift.  Merged on top of any resolved_credentials fact already set.
+        if _current_schema_fp:
+            _fc_base = _phase_c_facts.get("flowise") or {**_existing_flowise_facts}
+            _phase_c_facts["flowise"] = {**_fc_base, "schema_fingerprint": _current_schema_fp}
 
         # Combine credential repair events with node-schema repair events in debug
         if _phase_cred_repair_events:
@@ -1465,6 +1640,17 @@ def _make_patch_node_v2(
             else:
                 _phase_d_debug = _cred_debug
 
+        # M7.4: append patch phase metrics to debug["flowise"]["phase_metrics"]
+        if _v2_phase_metrics:
+            _pm_flowise = _phase_d_debug.get("flowise") or (
+                (state.get("debug") or {}).get("flowise") or {}
+            )
+            _pm_prior = _pm_flowise.get("phase_metrics", [])
+            _phase_d_debug["flowise"] = {
+                **_pm_flowise,
+                "phase_metrics": list(_pm_prior) + _v2_phase_metrics,
+            }
+
         return {
             "messages": new_msgs,
             "chatflow_id": final_chatflow_id,
@@ -1474,9 +1660,11 @@ def _make_patch_node_v2(
             "total_output_tokens": out_tok,
             # Roadmap 6 M1: node schema repair events
             # Roadmap 6 M3: credential repair events (merged into same debug key)
+            # M7.4:         phase_metrics appended to debug["flowise"]
             # _phase_d_debug is {} when no repairs occurred — reducer ignores empty dict
             "debug": _phase_d_debug,
             # Roadmap 6 M3: resolved_credentials written to facts (empty dict = no-op)
+            # M7.4:         schema_fingerprint written to facts["flowise"]
             "facts": _phase_c_facts,
         }
 
@@ -1580,21 +1768,36 @@ def _make_test_node(engine: ReasoningEngine, domains: list[DomainTools]):
                 "Final line must be: RESULT: HAPPY PATH [PASS/FAIL] | EDGE CASE [PASS/FAIL]"
             ),
         )
-        response = await engine.complete(
-            messages=[eval_msg],
-            system=system,
-            tools=None,
-        )
+        # M7.4: time the test evaluation LLM call
+        async with MetricsCollector("test") as m_test:
+            response = await engine.complete(
+                messages=[eval_msg],
+                system=system,
+                tools=None,
+            )
+            m_test.input_tokens = response.input_tokens
+            m_test.output_tokens = response.output_tokens
         eval_text = response.content or ""
 
         user_msg   = Message(role="user",      content=raw_results)
         asst_msg   = Message(role="assistant", content=eval_text)
+
+        # M7.4: write test phase metrics to debug["flowise"]["phase_metrics"]
+        _test_existing_fd = (state.get("debug") or {}).get("flowise") or {}
+        _test_prior_phases = _test_existing_fd.get("phase_metrics", [])
+        _test_debug = {
+            "flowise": {
+                **_test_existing_fd,
+                "phase_metrics": _test_prior_phases + [m_test.to_dict()],
+            }
+        }
 
         return {
             "messages": [user_msg, asst_msg],
             "test_results": eval_text,
             "total_input_tokens":  response.input_tokens,
             "total_output_tokens": response.output_tokens,
+            "debug": _test_debug,
         }
 
     return test
@@ -1840,6 +2043,7 @@ def _make_converge_node(
     engine: ReasoningEngine,
     client: "FlowiseClient | None" = None,
     pattern_store=None,
+    capabilities: "list[DomainCapability] | None" = None,
 ):
     async def converge(state: AgentState) -> dict:
         """Phase 5: Evaluate Definition of Done. Returns done=True or loops.
@@ -1870,11 +2074,38 @@ def _make_converge_node(
         ctx: list[Message] = []
         if state.get("plan"):
             ctx.append(Message(role="user", content=f"Approved plan:\n{state['plan']}"))
-        response = await engine.complete(
-            messages=ctx + [user_msg],
-            system=_CONVERGE_BASE,
-            tools=None,
-        )
+
+        # M7.2 (DD-067): if a PlanContract was parsed, inject its success_criteria
+        # so the verdict is grounded in the exact testable conditions the developer
+        # approved rather than the LLM re-deriving them.
+        plan_contract: dict | None = (state.get("facts") or {}).get("flowise", {}).get("plan_contract")
+        if plan_contract:
+            criteria: list[str] = plan_contract.get("success_criteria") or []
+            if criteria:
+                criteria_text = "\n".join(f"- {c}" for c in criteria)
+                ctx.append(Message(
+                    role="user",
+                    content=(
+                        "REQUIRED SUCCESS CRITERIA (from plan contract — approved by developer):\n"
+                        f"{criteria_text}\n\n"
+                        "Your verdict MUST explicitly reference each criterion above: "
+                        "state whether it passed or failed based on the test results."
+                    ),
+                ))
+                logger.debug(
+                    "[CONVERGE] Injecting %d plan_contract success_criteria into prompt",
+                    len(criteria),
+                )
+
+        # M7.4: time the converge LLM evaluation
+        async with MetricsCollector("converge") as m_conv:
+            response = await engine.complete(
+                messages=ctx + [user_msg],
+                system=_CONVERGE_BASE,
+                tools=None,
+            )
+            m_conv.input_tokens = response.input_tokens
+            m_conv.output_tokens = response.output_tokens
 
         raw_verdict = (response.content or "ITERATE\nCategory: INCOMPLETE\nReason: no response from LLM").strip()
         verdict_dict = _parse_converge_verdict(raw_verdict)
@@ -1913,7 +2144,17 @@ def _make_converge_node(
         assistant_msg = Message(role="assistant", content=raw_verdict)
         logger.info("[CONVERGE] verdict=%r done=%s", verdict_dict, is_done)
 
-        # Auto-save pattern when DONE (DD-031)
+        # M7.4: write converge phase metrics to debug["flowise"]["phase_metrics"]
+        _conv_existing_fd = (state.get("debug") or {}).get("flowise") or {}
+        _conv_prior_phases = _conv_existing_fd.get("phase_metrics", [])
+        _conv_debug = {
+            "flowise": {
+                **_conv_existing_fd,
+                "phase_metrics": _conv_prior_phases + [m_conv.to_dict()],
+            }
+        }
+
+        # Auto-save pattern when DONE (DD-031, enriched in M7.3 DD-068)
         if is_done and pattern_store and client:
             chatflow_id = state.get("chatflow_id")
             requirement = state.get("requirement", "")
@@ -1924,11 +2165,61 @@ def _make_converge_node(
                     name = (
                         chatflow.get("name") if isinstance(chatflow, dict) else None
                     ) or requirement[:60]
+
+                    # M7.3 (DD-068): derive structured metadata for pattern save
+                    _node_types_json = ""
+                    _category = ""
+                    _schema_fp = ""
+
+                    # node_types: extract from saved flow_data
+                    if flow_data:
+                        try:
+                            _fd_parsed = (
+                                json.loads(flow_data)
+                                if isinstance(flow_data, str)
+                                else flow_data
+                            )
+                            _names = [
+                                n.get("data", {}).get("name") or ""
+                                for n in (_fd_parsed.get("nodes") or [])
+                            ]
+                            _node_types_json = json.dumps([n for n in _names if n])
+                        except Exception:
+                            pass
+
+                    # category: parse "6. PATTERN" section from approved plan
+                    _plan_text = state.get("plan") or ""
+                    _pm = re.search(
+                        r"6\.\s+PATTERN\s*\n(.*?)(?=\n\d+\.|\n##|\Z)",
+                        _plan_text,
+                        re.DOTALL | re.IGNORECASE,
+                    )
+                    if _pm:
+                        for _line in _pm.group(1).splitlines():
+                            _line = _line.strip().lstrip("-* ")
+                            if _line and not _line.lower().startswith("which"):
+                                _category = _line.split(":")[0].strip()
+                                break
+
+                    # schema_fingerprint: from FlowiseCapability.knowledge.node_schemas
+                    if capabilities:
+                        _flowise_cap = next(
+                            (c for c in capabilities if c.name == "flowise"), None
+                        )
+                        if _flowise_cap and hasattr(_flowise_cap, "knowledge"):
+                            _ns = getattr(_flowise_cap.knowledge, "node_schemas", None)
+                            if _ns and hasattr(_ns, "meta_fingerprint"):
+                                _schema_fp = _ns.meta_fingerprint or ""
+
                     await pattern_store.save_pattern(
                         name=name,
                         requirement_text=requirement,
                         flow_data=flow_data,
                         chatflow_id=chatflow_id,
+                        domain="flowise",
+                        node_types=_node_types_json,
+                        category=_category,
+                        schema_fingerprint=_schema_fp,
                     )
                     logger.info("[CONVERGE] Pattern saved for chatflow %s", chatflow_id)
                 except Exception as exc:
@@ -1941,6 +2232,7 @@ def _make_converge_node(
             "converge_verdict": verdict_dict if not is_done else None,
             "total_input_tokens": response.input_tokens,
             "total_output_tokens": response.output_tokens,
+            "debug": _conv_debug,
         }
 
     return converge
@@ -2034,6 +2326,29 @@ def _route_after_result_review(state: AgentState) -> str:
 # ---------------------------------------------------------------------------
 
 
+def make_default_capabilities(
+    engine: ReasoningEngine,
+    domains: list[DomainTools],
+) -> list[DomainCapability]:
+    """Build the default capability list for capability-first mode (M7.1, DD-066).
+
+    Constructs a FlowiseCapability with the pre-built discover system prompt so
+    callers (api.py lifespan) don't need to import private helpers.
+
+    Returns:
+        list containing one FlowiseCapability instance wrapping the first
+        FloviseDomain found in domains (or domains[0] as fallback).
+    """
+    from flowise_dev_agent.agent.tools import FloviseDomain as _FloviseDomain
+
+    flowise_domain = next(
+        (d for d in domains if isinstance(d, _FloviseDomain)),
+        domains[0],
+    )
+    system = _build_system_prompt(_DISCOVER_BASE, domains, "discover")
+    return [FlowiseCapability(flowise_domain, engine, system)]
+
+
 def build_graph(
     engine: ReasoningEngine,
     domains: list[DomainTools],
@@ -2104,11 +2419,11 @@ def build_graph(
     builder.add_node("clarify",             _make_clarify_node(engine))
     builder.add_node("discover",            _make_discover_node(engine, domains, capabilities))
     builder.add_node("check_credentials",   _make_check_credentials_node())
-    builder.add_node("plan",                _make_plan_node(engine, domains, _template_store))
+    builder.add_node("plan",                _make_plan_node(engine, domains, _template_store, pattern_store=pattern_store))
     builder.add_node("human_plan_approval", _make_human_plan_approval_node())
     builder.add_node("patch",               patch_node)
     builder.add_node("test",                _make_test_node(engine, domains))
-    builder.add_node("converge",            _make_converge_node(engine, client=client, pattern_store=pattern_store))
+    builder.add_node("converge",            _make_converge_node(engine, client=client, pattern_store=pattern_store, capabilities=capabilities))
     builder.add_node("human_result_review", _make_human_result_review_node())
 
     # Fixed edges (always taken)

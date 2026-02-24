@@ -125,16 +125,27 @@ class TestSuite:
     In Milestone 1, generate_tests() returns the existing test logic configuration.
     It does not generate new test cases algorithmically.
 
-    happy_question:  Input for the happy-path test case.
-    edge_question:   Input for the edge-case test case (often "").
-    domain_name:     Which domain these tests target.
-    metadata:        Optional domain-specific test configuration.
+    happy_question:   Input for the happy-path test case.
+    edge_question:    Input for the edge-case test case (often "").
+    domain_name:      Which domain these tests target.
+    metadata:         Optional domain-specific test configuration.
+    domain_scopes:    Names of DomainCapabilities whose tests should run for this
+                      suite (e.g. ["flowise", "workday"] for cross-domain plans).
+                      Empty list means only the owning domain is in scope.
+                      Added in Roadmap 7 Milestone 7.2 (DD-067).
+    integration_tests: Freeform cross-domain test scenario strings.  Each entry
+                      describes a scenario that exercises data flow between two or
+                      more DomainCapabilities (e.g. "Hire employee via Workday MCP
+                      node inside a Flowise chatflow").
+                      Added in Roadmap 7 Milestone 7.2 (DD-067).
     """
 
     happy_question: str
     edge_question: str
     domain_name: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    domain_scopes: list[str] = field(default_factory=list)
+    integration_tests: list[str] = field(default_factory=list)
 
 
 @dataclass

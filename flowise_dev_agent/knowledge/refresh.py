@@ -826,22 +826,115 @@ def refresh_credentials(dry_run: bool = False, validate_only: bool = False) -> i
 
 
 def refresh_workday_mcp(dry_run: bool = False) -> int:
-    """No-op stub for future Workday MCP snapshot refresh.
+    """Write (or re-write) the Workday MCP blueprint snapshot.
 
-    Milestone 4: prints an informative message and exits 0.
-    Real implementation is deferred to Milestone 5+ (WorkdayMcpStore).
+    Milestone 7.5: reads ``WORKDAY_MCP_CATALOG_PATH`` env var.
+    - If set, loads blueprints from that JSON file and normalises them.
+    - If not set, writes the built-in default blueprint to the snapshot.
 
-    Returns exit code 0 (success — stub counts as a clean no-op).
+    The snapshot format is a JSON array of blueprint dicts matching:
+      blueprint_id, description, selected_tool, mcp_server_url_placeholder,
+      auth_var, mcp_actions, credential_type, chatflow_only, category, tags
+
+    Returns exit code (0 = success, 1 = error).
     """
-    print(
-        "\n[workday-mcp]  STUB — not yet implemented (Milestone 4).\n"
-        "  WorkdayMcpStore is scaffolded in "
-        "flowise_dev_agent/knowledge/workday_provider.py.\n"
-        "  Real Workday MCP endpoint data population is deferred to Milestone 5+.\n"
-        "  Snapshot file: schemas/workday_mcp.snapshot.json  (status: stub)"
-    )
+    import os
+
+    catalog_path_str = os.environ.get("WORKDAY_MCP_CATALOG_PATH", "").strip()
+
+    _default_blueprints = [
+        {
+            "blueprint_id": "workday_default",
+            "description": (
+                "Default Workday MCP actions for worker lookup and self-service "
+                "(getMyInfo, searchForWorker, getWorkers)"
+            ),
+            "selected_tool": "customMCP",
+            "mcp_server_url_placeholder": "https://<tenant>.workday.com/mcp",
+            "auth_var": "$vars.beartoken",
+            "mcp_actions": ["getMyInfo", "searchForWorker", "getWorkers"],
+            "credential_type": "workdayOAuth",
+            "chatflow_only": True,
+            "category": "HR",
+            "tags": ["workday", "mcp", "worker", "hr", "custom-mcp"],
+        }
+    ]
+
+    if catalog_path_str:
+        catalog_path = Path(catalog_path_str)
+        if not catalog_path.exists():
+            logger.error(
+                "[workday-mcp] WORKDAY_MCP_CATALOG_PATH=%s not found", catalog_path
+            )
+            return 1
+        try:
+            raw = json.loads(catalog_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, list):
+                raise ValueError("Expected a JSON array of blueprint dicts")
+            blueprints = raw
+            source = f"catalog_file:{catalog_path}"
+        except Exception as exc:
+            logger.error("[workday-mcp] Failed to load catalog: %s", exc)
+            return 1
+    else:
+        blueprints = _default_blueprints
+        source = "built_in_defaults"
+
+    content = json.dumps(blueprints, indent=2, ensure_ascii=False)
+    content_bytes = content.encode("utf-8")
+
+    # Diff against existing snapshot (blueprint_id set)
+    _wday_snapshot = _SCHEMAS_DIR / "workday_mcp.snapshot.json"
+    _wday_meta = _SCHEMAS_DIR / "workday_mcp.meta.json"
+
+    existing: list[dict] = []
+    if _wday_snapshot.exists():
+        try:
+            existing = json.loads(_wday_snapshot.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    existing_ids = {b.get("blueprint_id") for b in existing if b.get("blueprint_id")}
+    fresh_ids = {b.get("blueprint_id") for b in blueprints if b.get("blueprint_id")}
+    added = fresh_ids - existing_ids
+    removed = existing_ids - fresh_ids
+
+    print(f"\n[workday-mcp]  {len(blueprints)} blueprint(s)  source={source}", end="")
+    if existing:
+        print(f" | was {len(existing)}", end="")
+    print()
+    if added:
+        print(f"  + added   ({len(added)}): {', '.join(sorted(added))}")
+    if removed:
+        print(f"  - removed ({len(removed)}): {', '.join(sorted(removed))}")
+    if not added and not removed and existing:
+        print("  (no change)")
+
     if dry_run:
-        logger.info("--dry-run: nothing to write (stub)")
+        logger.info("--dry-run: nothing written")
+        return 0
+
+    _SCHEMAS_DIR.mkdir(parents=True, exist_ok=True)
+    _wday_snapshot.write_bytes(content_bytes)
+
+    digest = hashlib.sha256(content_bytes).hexdigest()
+    meta = {
+        "snapshot_file": str(_wday_snapshot.relative_to(_REPO_ROOT)),
+        "generated_at": (
+            datetime.datetime.now(datetime.timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        ),
+        "source": source,
+        "blueprint_count": len(blueprints),
+        "fingerprint": digest,
+        "status": "ok",
+    }
+    _wday_meta.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    logger.info("Written: %s", _wday_snapshot)
+    logger.info("Written: %s", _wday_meta)
+    logger.info("Fingerprint: %s", digest[:16] + "…")
     return 0
 
 
@@ -922,8 +1015,10 @@ Examples:
         "--workday-mcp",
         action="store_true",
         help=(
-            "Stub (Milestone 4): prints an informative message and exits 0. "
-            "Real Workday MCP snapshot refresh is deferred to Milestone 5+."
+            "Write (or re-write) the Workday MCP blueprint snapshot "
+            "(schemas/workday_mcp.snapshot.json). "
+            "Uses built-in defaults unless WORKDAY_MCP_CATALOG_PATH env var points "
+            "to a custom JSON file. (Milestone 7.5)"
         ),
     )
     parser.add_argument(

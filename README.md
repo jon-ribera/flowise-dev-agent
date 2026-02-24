@@ -1,13 +1,132 @@
-# Flowise Development Agent
-
-LangGraph co-pilot for building Flowise chatflows.
-Autonomous **Clarify → Discover → Plan → Patch → Test → Converge** loop with human-in-the-loop review at key checkpoints.
+<p align="center">
+  <h1 align="center">⚡ Flowise Dev Agent</h1>
+  <p align="center">
+    <strong>LangGraph co-pilot for building Flowise chatflows</strong><br>
+    Autonomous <strong>Clarify → Discover → Plan → Patch → Test → Converge</strong> loop
+    with human-in-the-loop review at every checkpoint
+  </p>
+  <p align="center">
+    <a href="#-quick-start">Quick Start</a> •
+    <a href="#️-configuration">Configuration</a> •
+    <a href="#-api-reference">API</a> •
+    <a href="#-how-it-works">How It Works</a> •
+    <a href="#-architecture">Architecture</a> •
+    <a href="#-documentation">Docs</a>
+  </p>
+</p>
 
 ---
 
-## What It Does
+## ✨ Features
 
-The Flowise Dev Agent takes a natural-language requirement and autonomously builds a working Flowise chatflow:
+| | Feature | Description |
+|---|---|---|
+| 🔄 | **Autonomous build loop** | Clarify → Discover → Plan → Patch → Test → Converge with HITL at 4 checkpoints |
+| 🧩 | **Patch IR compiler** | LLM emits structured ops (`AddNode / SetParam / Connect / BindCredential`); deterministic compiler resolves handle IDs — no hallucinated JSON |
+| 🛡️ | **WriteGuard** | SHA-256 gate prevents any Flowise write unless the payload hash matches the validation-time hash |
+| 📚 | **Pattern library** | SQLite-backed self-improvement — re-uses past successful chatflow blueprints as compile-time seeds |
+| 🔌 | **Domain plugins** | `DomainCapability` ABC; Flowise + Workday Custom MCP capabilities ship out of the box |
+| 🌐 | **Streaming web UI** | Real-time SSE token stream, one-click HITL approve/reject buttons, session sidebar — no build step |
+
+---
+
+## 🚀 Quick Start
+
+### 1. Local Web UI (recommended)
+
+```bash
+cp .env.example .env
+# Edit .env: set FLOWISE_API_KEY, FLOWISE_API_ENDPOINT, ANTHROPIC_API_KEY
+
+pip install -e ".[claude,dev]"
+flowise-agent
+# Open http://localhost:8000/ui
+```
+
+> 💡 **Windows:** if `flowise-agent` is not found after install, run `python -m flowise_dev_agent.api` or add the Python Scripts directory to your PATH.
+
+### 2. Docker
+
+```bash
+cp .env.example .env
+docker compose up
+curl http://localhost:8000/health
+```
+
+### 3. CLI (headless / CI)
+
+```bash
+flowise-agent          # start the API server
+flowise-agent-cli      # interactive terminal session (prompts for requirement)
+```
+
+---
+
+## ⚙️ Configuration
+
+Set via environment variables or a `.env` file. See [.env.example](.env.example) for the full template.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| 🌐 `FLOWISE_API_ENDPOINT` | ✅ Yes | `http://localhost:3000` | Flowise server URL |
+| 🔑 `FLOWISE_API_KEY` | ✅ Yes | — | Flowise API key |
+| 🤖 `REASONING_ENGINE` | No | `claude` | LLM provider: `claude` or `openai` |
+| 🧠 `REASONING_MODEL` | No | Provider default | Model name override |
+| 🌡️ `REASONING_TEMPERATURE` | No | `0.2` | Sampling temperature (0.0–1.0) |
+| 🔑 `ANTHROPIC_API_KEY` | If claude | — | Anthropic API key |
+| 🔑 `OPENAI_API_KEY` | If openai | — | OpenAI API key |
+| 🔒 `AGENT_API_KEY` | No | — | Bearer token for API auth (unset = open access) |
+| 🚪 `AGENT_API_PORT` | No | `8000` | API server port |
+| ⏱️ `FLOWISE_TIMEOUT` | No | `120` | HTTP timeout in seconds |
+| 🚦 `RATE_LIMIT_SESSIONS_PER_MIN` | No | `10` | Max new sessions per IP per minute |
+| 💬 `SKIP_CLARIFICATION` | No | `false` | Skip pre-discover clarification step |
+| 📦 `DISCOVER_CACHE_TTL_SECS` | No | `300` | TTL for cached discover responses (seconds) |
+| 🏃 `FLOWISE_COMPAT_LEGACY` | No | `false` | Set `true` to run the pre-refactor ReAct patch path |
+| 📐 `FLOWISE_SCHEMA_DRIFT_POLICY` | No | `warn` | `warn` \| `fail` \| `refresh` on schema fingerprint mismatch |
+
+---
+
+## 🔧 API Reference
+
+| | Endpoint | Purpose |
+|---|---|---|
+| 💓 | `GET /health` | API + Flowise connectivity check |
+| 🖥️ | `GET /ui` | Local developer web UI |
+| ▶️ | `POST /sessions/stream` | Start a session and stream SSE events (preferred) |
+| ↩️ | `POST /sessions/{id}/stream` | Resume a paused session and stream the continuation |
+| 📋 | `GET /sessions` | List all sessions with status, iteration count, token totals |
+| 🔍 | `GET /sessions/{id}` | Check session status + any pending interrupt payload |
+| ▶️ | `POST /sessions` | Start a session (non-streaming) |
+| ↩️ | `POST /sessions/{id}/resume` | Resume a paused session (non-streaming) |
+| 📄 | `GET /sessions/{id}/summary` | Markdown audit trail for the full session |
+| 🗑️ | `DELETE /sessions/{id}` | Delete a session and its checkpoint history |
+| 📸 | `GET /sessions/{id}/versions` | List all chatflow snapshots taken during the session |
+| ⏪ | `POST /sessions/{id}/rollback` | Roll back the chatflow to a prior snapshot |
+| 🔎 | `GET /patterns` | Search reusable chatflow blueprints |
+| 🌐 | `GET /instances` | List all configured Flowise instances |
+
+### Quick examples
+
+```bash
+# Start a session (streaming)
+curl -X POST http://localhost:8000/sessions/stream \
+  -H "Content-Type: application/json" \
+  -d '{"requirement": "Build a customer support chatbot with GPT-4o and memory"}'
+
+# Approve the plan interrupt
+curl -X POST http://localhost:8000/sessions/<thread_id>/resume \
+  -H "Content-Type: application/json" \
+  -d '{"response": "approved"}'
+
+# Request a change before patching
+curl -X POST http://localhost:8000/sessions/<thread_id>/resume \
+  -H "Content-Type: application/json" \
+  -d '{"response": "Use claude-sonnet-4-6 instead of GPT-4o"}'
+```
+
+---
+
+## 🔁 How It Works
 
 ```
 POST /sessions/stream  {"requirement": "Build a customer support chatbot with GPT-4o and memory"}
@@ -21,8 +140,8 @@ POST /sessions/stream  {"requirement": "Build a customer support chatbot with GP
   └──────┬──────┘
          │
   ┌──────▼──────┐
-  │CHECK CREDS  │  INTERRUPT if required credentials are missing
-  └──────┬──────┘   → Developer creates them in Flowise, resumes
+  │CHECK CREDS  │  INTERRUPT if required credentials are missing from Flowise
+  └──────┬──────┘
          │
   ┌──────▼──────┐
   │    PLAN     │  Structured plan: Goal / Inputs / Outputs / Pattern / Success Criteria
@@ -39,7 +158,7 @@ POST /sessions/stream  {"requirement": "Build a customer support chatbot with GP
   └──────┬──────┘
          │
   ┌──────▼──────┐
-  │   CONVERGE  │  Structured verdict: DONE or ITERATE with Category/Reason/Fix
+  │   CONVERGE  │  Structured verdict: DONE or ITERATE with Category / Reason / Fix
   └──────┬──────┘
          │ DONE
   ⏸ INTERRUPT: result_review  ← Developer accepts or requests another iteration
@@ -47,438 +166,175 @@ POST /sessions/stream  {"requirement": "Build a customer support chatbot with GP
         END
 ```
 
----
+### Patch IR + Deterministic Compiler
 
-## Quick Start
+The `patch` node runs a 5-step pipeline:
 
-### Local Web UI (recommended for development)
-
-```bash
-cp .env.example .env
-# Edit .env: set FLOWISE_API_KEY, FLOWISE_API_ENDPOINT, ANTHROPIC_API_KEY
-
-pip install -e ".[claude,dev]"   # dev includes pytest
-flowise-agent
-# Open http://localhost:8000/ui
-```
-
-> **Windows note:** if `flowise-agent` is not found after install, run
-> `python -m flowise_dev_agent.api` instead, or add the Python Scripts
-> directory to your PATH (pip will print the path during install).
-
-The web UI streams token output in real-time, renders the structured plan in markdown,
-and provides one-click Approve / Accept buttons at each HITL checkpoint.
-
-### Docker
-
-```bash
-cp .env.example .env
-docker compose up
-curl http://localhost:8000/health
-```
-
-### CLI (headless)
-
-```bash
-flowise-agent          # start API server
-flowise-agent-cli      # interactive terminal session (prompts for requirement)
-```
-
----
-
-## Configuration
-
-All configuration is via environment variables (or a `.env` file).
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `FLOWISE_API_ENDPOINT` | Yes | `http://localhost:3000` | Flowise server URL |
-| `FLOWISE_API_KEY` | Yes | — | Flowise API key |
-| `FLOWISE_TIMEOUT` | No | `120` | HTTP timeout in seconds |
-| `REASONING_ENGINE` | No | `claude` | LLM provider: `claude` or `openai` |
-| `REASONING_MODEL` | No | Provider default | Model name override |
-| `REASONING_TEMPERATURE` | No | `0.2` | Sampling temperature (0.0–1.0) |
-| `ANTHROPIC_API_KEY` | If claude | — | Anthropic API key |
-| `OPENAI_API_KEY` | If openai | — | OpenAI API key |
-| `AGENT_API_KEY` | No | — | Bearer token for API auth (unset = no auth) |
-| `AGENT_API_PORT` | No | `8000` | API server port |
-| `SKIP_CLARIFICATION` | No | `false` | Skip pre-discover clarification step |
-| `DISCOVER_CACHE_TTL_SECS` | No | `300` | TTL for cached discover responses |
-| `RATE_LIMIT_SESSIONS_PER_MIN` | No | `10` | Max new sessions per IP per minute |
-| `CURSORWISE_LOG_LEVEL` | No | `INFO` | Log verbosity |
-
----
-
-## API Reference
-
-### `GET /health`
-Verify the API and Flowise connection are both up.
-
-```bash
-curl http://localhost:8000/health
-# {"api": "ok", "flowise": "ok"}
-```
-
-### `GET /ui`
-Serve the local developer web UI (HTML, no build step required).
-
-```
-http://localhost:8000/ui
-```
-
-### `POST /sessions/stream`
-Start a new session and stream events via SSE. Preferred over `POST /sessions` for interactive use.
-
-```bash
-curl -X POST http://localhost:8000/sessions/stream \
-  -H "Content-Type: application/json" \
-  -d '{"requirement": "Build a customer support chatbot with GPT-4o and memory"}'
-```
-
-SSE event stream (`data: {...}\n\n`):
-```
-data: {"type": "token", "content": "Discovering node types..."}
-data: {"type": "tool_call", "tool": "get_node", "args": {"name": "chatOpenAI"}}
-data: {"type": "tool_result", "tool": "get_node", "result": "..."}
-data: {"type": "plan_approval", "plan": "# STRUCTURED PLAN\n...", "prompt": "..."}
-data: {"type": "done", "thread_id": "uuid-...", "status": "pending_interrupt"}
-```
-
-### `POST /sessions/{thread_id}/stream`
-Resume a paused session and stream the continuation.
-
-```bash
-curl -X POST http://localhost:8000/sessions/uuid-.../stream \
-  -H "Content-Type: application/json" \
-  -d '{"response": "approved"}'
-```
-
-### `POST /sessions`
-Start a new session (non-streaming). Returns after Discover + Plan when an interrupt is pending.
-
-```bash
-curl -X POST http://localhost:8000/sessions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "requirement": "Build a customer support chatbot with GPT-4o and memory",
-    "test_trials": 1,
-    "webhook_url": "https://your-server.com/webhook"
-  }'
-```
-
-Response:
-```json
-{
-  "thread_id": "uuid-...",
-  "status": "pending_interrupt",
-  "iteration": 0,
-  "interrupt": {
-    "type": "plan_approval",
-    "plan": "1. GOAL\n...",
-    "prompt": "Review the plan above. Reply 'approved' to proceed..."
-  }
-}
-```
-
-### `POST /sessions/{thread_id}/resume`
-Resume a paused session with the developer's response (non-streaming).
-
-```bash
-# Approve the plan
-curl -X POST http://localhost:8000/sessions/uuid-.../resume \
-  -H "Content-Type: application/json" \
-  -d '{"response": "approved"}'
-
-# Request changes
-curl -X POST http://localhost:8000/sessions/uuid-.../resume \
-  -H "Content-Type: application/json" \
-  -d '{"response": "Use claude-sonnet-4-6 instead of GPT-4o"}'
-```
-
-### `GET /sessions`
-List all sessions with current status, iteration count, and token totals.
-
-```bash
-curl http://localhost:8000/sessions
-```
-
-### `GET /sessions/{thread_id}`
-Check session status (including any pending interrupt payload).
-
-```bash
-curl http://localhost:8000/sessions/uuid-...
-```
-
-### `GET /sessions/{thread_id}/summary`
-Return a human-readable markdown audit trail of the session.
-
-```bash
-curl http://localhost:8000/sessions/uuid-.../summary
-# {"thread_id": "...", "summary": "# Session uuid-...\n\n**Requirement**: ..."}
-```
-
-### `DELETE /sessions/{thread_id}`
-Delete a session and its checkpoint history.
-
-```bash
-curl -X DELETE http://localhost:8000/sessions/uuid-...
-```
-
-### `GET /sessions/{thread_id}/versions`
-List all chatflow snapshots taken during the session.
-
-```bash
-curl http://localhost:8000/sessions/uuid-.../versions
-```
-
-### `POST /sessions/{thread_id}/rollback`
-Roll back the chatflow to a specific snapshot (or latest if version omitted).
-
-```bash
-curl -X POST http://localhost:8000/sessions/uuid-.../rollback \
-  -H "Content-Type: application/json" \
-  -d '{"version": "v1.0"}'
-```
-
-### `GET /patterns`
-Search the pattern library for reusable chatflow blueprints.
-
-```bash
-curl "http://localhost:8000/patterns?q=customer+support"
-```
-
-### `GET /instances`
-List all configured Flowise instances (from `FLOWISE_API_ENDPOINT_*` env vars).
-
-```bash
-curl http://localhost:8000/instances
-```
-
----
-
-## How It Works
-
-### 9-Node LangGraph Graph
-
-| Node | Phase | Description |
-|---|---|---|
-| `clarify` | Pre-discover | HITL interrupt when requirement is ambiguous — asks 2–3 targeted questions |
-| `discover` | Read-only | Searches pattern library, calls list_chatflows, get_node, list_credentials |
-| `check_credentials` | Validation | HITL interrupt if required credentials are missing from Flowise |
-| `plan` | Planning | Creates structured plan (Goal/Inputs/Outputs/Constraints/Success Criteria) |
-| `human_plan_approval` | HITL | Developer reviews and approves plan before any writes |
-| `patch` | Write | Snapshot → compile Patch IR ops → WriteGuard → create/update chatflow (DD-051, DD-052) |
-| `test` | Validation | Runs happy-path and edge-case predictions with unique sessionIds |
-| `converge` | Evaluation | Structured verdict: DONE or ITERATE with Category/Reason/Fix |
-| `human_result_review` | HITL | Developer accepts result or requests another iteration |
-
-### Patch IR + Deterministic Compiler (DD-051, DD-052)
-
-The `patch` node pipeline when `build_graph(capabilities=[FlowiseCapability(...)])`:
-
-1. **Snapshot** — save existing chatflow before any changes
+1. **Snapshot** — save the existing chatflow before any changes
 2. **LLM emits ops only** — `AddNode / SetParam / Connect / BindCredential` in JSON; no handle IDs, no edge IDs
 3. **IR validation** — `validate_patch_ops()` catches dangling refs and duplicate node IDs before compilation
 4. **Deterministic compiler** — `compile_patch_ops()` reads the existing chatflow as a `GraphIR`, resolves anchor handle IDs from node schemas, and produces `flowData + payload_hash + diff_summary`
-5. **Structural gate** — `_validate_flow_data()` must pass (same poka-yoke check as the legacy path)
-6. **WriteGuard** — `create_chatflow` / `update_chatflow` are blocked unless the payload hash matches the hash recorded at validation time; prevents any mutation between validation and write
-
-When `capabilities=None` (default), the original LLM-JSON patch path runs unchanged.
+5. **WriteGuard** — `create_chatflow / update_chatflow` are blocked unless the payload hash matches the hash recorded at validation time
 
 ### Evaluator-Optimizer Feedback Loop
 
 The `converge` node classifies failures and injects targeted fix instructions into
-the next planning context:
+the next iteration's planning context:
 
 ```
 ITERATE
 Category: CREDENTIAL
-Reason: OpenAI API key not bound at data.credential
-Fix: Set data.credential = "<credential_id>" in addition to data.inputs.credential
+Reason:   OpenAI API key not bound at data.credential
+Fix:      Set data.credential = "<credential_id>" in addition to data.inputs.credential
 ```
 
-The error recovery playbook maps each category to a specific repair strategy,
-reducing the next iteration from "reason from scratch" to "apply known fix X".
-
-### pass^k Reliability Testing
-
-Set `test_trials: 2` (or higher) to require all `k` trials to pass:
-- `test_trials: 1` — pass@1 (default — tests capability)
-- `test_trials: 2` — pass^2 (requires consistent results across 2 runs)
-- `test_trials: 3+` — pass^k (higher confidence for production readiness)
+Each failure category maps to a specific repair strategy — the next iteration applies
+a known fix rather than reasoning from scratch.
 
 ### Pattern Library (Self-Improvement)
 
-After each successful session, the agent saves the chatflow blueprint to a local
-SQLite pattern library. On subsequent sessions with similar requirements, `discover`
-finds the matching pattern and reuses its flowData directly — skipping most of the
-discovery and planning phases.
-
-### HITL Webhooks
-
-Pass `webhook_url` when starting a session to receive interrupt payloads via HTTP POST.
-The agent fires the webhook before each HITL pause, enabling CI pipelines, Slack bots,
-or custom UIs to respond without polling.
+After each successful session, the agent saves the chatflow blueprint to a local SQLite
+pattern library. On subsequent sessions with similar requirements, `discover` finds the
+matching pattern and seeds the compiler with it — reducing AddNode op count and token
+usage. Set `test_trials: 2+` for pass^k reliability testing across multiple runs.
 
 ---
 
-## Web UI
-
-The local web UI at `GET /ui` provides:
-- **Real-time token stream** — watch the LLM think as it discovers nodes and builds the plan
-- **Tool call badges** — each `get_node`, `create_chatflow`, etc. call appears as a badge in the stream
-- **Markdown plan rendering** — structured plan is rendered with full formatting at `plan_approval`
-- **One-click HITL responses** — Approve, Accept, and feedback buttons at each checkpoint
-- **Session sidebar** — browse all sessions with live status indicators
-- **Audit trail** — click any completed session to read the full summary
-
-No build step, no Node.js, no dependencies. Single HTML file served by FastAPI.
-
----
-
-## Architecture
+## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│          flowise-dev-agent                  │  This repo
-│                                             │
-│  FastAPI (15+ endpoints + SSE streaming)    │
-│       │                                     │
-│  LangGraph StateGraph (9 nodes)             │
-│  ├── clarify node (DD-033)                  │
-│  ├── discover node                          │
-│  ├── check_credentials node (DD-017)        │
-│  ├── plan node                              │
-│  ├── human_plan_approval (HITL)             │
-│  ├── patch node                             │
-│  ├── test node (parallel, DD-040)           │
-│  ├── converge node (DD-019)                 │
-│  └── human_result_review (HITL)             │
-│       │                                     │
-│  DomainCapability layer (DD-046)            │
-│  ├── FlowiseCapability  ← ToolRegistry      │
-│  │   discover + compile_ops + validate      │
-│  │   (namespaced, DD-049)                   │
-│  └── WorkdayCapability (stub, DD-047)       │
-│                                             │
-│  Patch IR + compiler (DD-051)               │
-│  ├── patch_ir.py  — AddNode/SetParam/       │
-│  │                  Connect/BindCredential  │
-│  └── compiler.py  — GraphIR + compile_      │
-│                     patch_ops() → hash      │
-│                                             │
-│  WriteGuard (DD-052)                        │
-│  └── SHA-256 gate before every write        │
-│                                             │
-│  ToolResult envelope (DD-048)               │
-│  └── execute_tool() → compact summary only  │
-│                                             │
-│  ReasoningEngine (Claude / OpenAI)          │
-│       │                                     │
-│  SQLite (AsyncSqliteSaver, DD-024)          │
-│  ├── sessions.db  — checkpoint store        │
-│  └── patterns.db  — pattern library (DD-031)│
-│                                             │
-│  flowise_dev_agent/skills/                  │
-│  └── flowise_builder.md                     │
-└────────────────┬────────────────────────────┘
-                 │  pip dependency
-┌────────────────▼────────────────────────────┐
-│              cursorwise                     │  Separate repo
-│                                             │
-│  FlowiseClient (52 async methods)           │
-│  FlowiseClientPool (multi-instance, DD-032) │
-│  Settings (Flowise connection)              │
-│  MCP Server (50 tools for Cursor)           │
-└─────────────────────────────────────────────┘
-                 │  HTTP REST API
-┌────────────────▼────────────────────────────┐
-│          Flowise Server                     │
-│  localhost:3000 (or remote)                 │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  flowise-dev-agent  (this repo)                      │
+│                                                      │
+│  FastAPI  (14 endpoints + SSE streaming)             │
+│       │                                              │
+│  LangGraph StateGraph  (9 nodes)                     │
+│  ├── clarify · discover · check_credentials          │
+│  ├── plan · human_plan_approval                      │
+│  ├── patch · test · converge · human_result_review   │
+│       │                                              │
+│  DomainCapability layer                              │
+│  ├── FlowiseCapability  — discover + compile_ops     │
+│  └── WorkdayCapability  — Custom MCP blueprint wiring│
+│                                                      │
+│  Patch IR + compiler                                 │
+│  ├── patch_ir.py   — AddNode / SetParam /            │
+│  │                   Connect / BindCredential        │
+│  └── compiler.py   — GraphIR + compile_patch_ops()  │
+│                                                      │
+│  Platform Knowledge Layer                            │
+│  ├── NodeSchemaStore   — flowise_nodes.snapshot.json │
+│  ├── CredentialStore   — flowise_credentials.snapshot│
+│  └── WorkdayMcpStore   — workday_mcp.snapshot.json   │
+│                                                      │
+│  SQLite                                              │
+│  ├── sessions.db   — LangGraph checkpoint store      │
+│  └── patterns.db   — chatflow pattern library        │
+└────────────────────────┬─────────────────────────────┘
+                         │  pip dependency
+┌────────────────────────▼─────────────────────────────┐
+│  cursorwise  (separate repo)                         │
+│  FlowiseClient — 52 async methods                    │
+│  MCP Server   — 50 tools for Cursor IDE              │
+└────────────────────────┬─────────────────────────────┘
+                         │  HTTP REST API
+┌────────────────────────▼─────────────────────────────┐
+│  Flowise Server  (localhost:3000 or remote)          │
+└──────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Skills — Extending Agent Knowledge
+## 🧩 Skills — Extending Agent Knowledge
 
-The agent's domain knowledge lives in editable markdown files:
+Agent domain knowledge lives in editable markdown files — no Python changes or server
+restart required:
 
 ```
 flowise_dev_agent/skills/
-├── flowise_builder.md   ← Active (14 rules for Flowise chatflow construction)
-├── workday_extend.md    ← Placeholder for Workday v2
+├── flowise_builder.md   ← Active — 14 rules for Flowise chatflow construction
 └── README.md            ← Skill authoring guide
 ```
 
-Each skill file has three sections injected into system prompts:
-- `## Discover Context` — what to look for, what APIs to call
-- `## Patch Context` — non-negotiable rules for writing flowData
-- `## Test Context` — how to validate the result
+Each skill file injects three sections into system prompts:
+
+| Section | Purpose |
+|---|---|
+| `## Discover Context` | What to look for, which APIs to call |
+| `## Patch Context` | Non-negotiable rules for writing `flowData` |
+| `## Test Context` | How to validate the result |
 
 To update agent behavior for a new Flowise pattern, edit `flowise_builder.md` directly.
-No Python changes or server restart required.
 
 ---
 
-## Design Decisions
+## 📚 Documentation
 
-See [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) for the full architectural rationale,
-covering 52 decisions from LangGraph topology to the deterministic patch compiler.
-
-Key decisions:
-
-| DD | Title |
+| Document | Description |
 |---|---|
-| DD-009 | Compact context strategy — no raw tool call blobs in state |
-| DD-013 | `_get_node_processed` — pre-splits inputAnchors/inputParams to prevent HTTP 500 |
-| DD-017 | Credential HITL checkpoint — front-load credential discovery |
-| DD-018 | FlowData pre-flight validator — poka-yoke design against invalid writes |
+| 📐 [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) | 70 architectural decisions — the authoritative rationale log (DD-001 – DD-070) |
+| ✅ [roadmap_shipped.md](roadmap_shipped.md) | All shipped milestones with DD cross-references and original roadmap traceability |
+| 🗂️ [roadmap_pending.md](roadmap_pending.md) | Open backlog items — each traceable to its source roadmap and next DD number |
+| 📊 [PERFORMANCE.md](PERFORMANCE.md) | Token cost analysis, root cause of quadratic context growth, and optimization strategies |
+| 📄 [.env.example](.env.example) | Full environment variable template with inline documentation |
+| 🗄️ [roadmap_archive/](roadmap_archive/) | Historical roadmap files (source-code docstrings reference these filenames) |
+
+**Key design decisions at a glance:**
+
+| DD | Decision |
+|---|---|
 | DD-019 | Structured converge verdicts — evaluator-optimizer feedback loop |
-| DD-021 | pass^k reliability testing — capability vs reliability distinction |
-| DD-024 | SQLite session persistence via AsyncSqliteSaver |
-| DD-025 | SSE streaming endpoints |
-| DD-026 | Chatflow snapshot / rollback |
-| DD-028 | API key authentication (optional bearer token) |
-| DD-029 | Token budget tracking |
-| DD-031 | Pattern library (self-improvement loop) |
-| DD-032 | Multiple Flowise instances |
-| DD-033 | Requirement clarification node — front-load human input |
-| DD-034 | Session export / audit trail |
-| DD-035 | Discover response caching |
-| DD-036 | Rate limiting |
-| DD-037 | Webhook callbacks for HITL interrupts |
-| DD-038 | Error recovery playbook |
-| DD-039 | Chatflow version tags (full rollback history) |
-| DD-040 | Parallel test execution |
-| DD-046 | DomainCapability ABC — behavioral contract for domain plugins |
-| DD-047 | WorkdayCapability stub — interface-complete before API is connected |
-| DD-048 | ToolResult envelope — compact context enforcement at execute_tool boundary |
-| DD-049 | ToolRegistry v2 — namespaced, phase-gated, dual-key executor |
-| DD-050 | AgentState trifurcation — artifacts/facts/debug separated from transcript |
+| DD-048 | `ToolResult` envelope — compact context enforcement at `execute_tool` boundary |
 | DD-051 | Patch IR schema — LLM emits ops, compiler derives handle IDs deterministically |
-| DD-052 | WriteGuard — same-iteration SHA-256 hash enforcement before any Flowise write |
+| DD-052 | WriteGuard — SHA-256 hash gate before every Flowise write |
+| DD-066 | Capability-first default + `FLOWISE_COMPAT_LEGACY` escape hatch |
 
 ---
 
-## Performance
+## 🗂️ Project Structure
 
-See [PERFORMANCE.md](PERFORMANCE.md) for observed token costs and the root cause
-analysis of quadratic context accumulation.
-
-**Compact context (shipped — DD-048):** `execute_tool()` now returns a `ToolResult`;
-`result_to_str(ToolResult)` injects only the compact `.summary` into LLM context.
-Raw API responses (previously up to 162k tokens for `list_nodes`) are stored in
-`state['debug']` only and never reach the prompt. This eliminates the primary source
-of context bloat at the tool execution boundary.
+```
+flowise_dev_agent/
+├── api.py                        # FastAPI endpoints + SSE streaming
+├── agent/
+│   ├── graph.py                  # LangGraph StateGraph (9 nodes)
+│   ├── domain.py                 # DomainCapability ABC + result models
+│   ├── patch_ir.py               # AddNode / SetParam / Connect / BindCredential
+│   ├── compiler.py               # GraphIR + compile_patch_ops()
+│   ├── plan_schema.py            # PlanContract dataclass
+│   ├── metrics.py                # PhaseMetrics + MetricsCollector
+│   ├── pattern_store.py          # SQLite pattern library
+│   ├── registry.py               # ToolRegistry v2 (namespaced + dual-key)
+│   ├── state.py                  # AgentState TypedDict
+│   ├── tools.py                  # DomainTools + ToolResult + execute_tool
+│   └── domains/
+│       └── workday.py            # WorkdayCapability (Custom MCP blueprint wiring)
+├── knowledge/
+│   ├── provider.py               # NodeSchemaStore + CredentialStore
+│   ├── workday_provider.py       # WorkdayMcpStore + WorkdayApiStore
+│   └── refresh.py                # CLI: python -m flowise_dev_agent.knowledge.refresh
+├── skills/
+│   └── flowise_builder.md        # Active skill: chatflow construction rules
+├── static/
+│   └── index.html                # Single-file web UI (no build step)
+└── cli.py                        # flowise-agent-cli entry point
+schemas/                          # Local-first snapshots (refresh with CLI above)
+├── flowise_nodes.snapshot.json
+├── flowise_credentials.snapshot.json
+└── workday_mcp.snapshot.json
+tests/                            # pytest suite (159 tests)
+roadmap_archive/                  # Historical roadmap files
+```
 
 ---
 
-## Related
+## 🔗 Related
 
-- [cursorwise](https://github.com/jon-ribera/cursorwise) — Flowise MCP server for Cursor IDE (dependency)
+- [cursorwise](https://github.com/jon-ribera/cursorwise) — Flowise MCP server for Cursor IDE (pip dependency)
 - [Flowise](https://github.com/FlowiseAI/Flowise) — the chatflow platform this agent builds on
-- [ROADMAP2.md](ROADMAP2.md) — next-wave enhancement backlog
-- [roadmap3_architecture_optimization.md](roadmap3_architecture_optimization.md) — Architecture blueprint: M1 ToolResult + ToolRegistry + DomainCapability (complete), M2 Patch IR + deterministic compiler + WriteGuard (complete)
-- [roadmap4_workday_cross_domain.md](roadmap4_workday_cross_domain.md) — M4.1 Workday MCP wiring, M4.2 cross-domain planner, M4.3 PatternCapability (planning)
-- [roadmap5_embedded_ux.md](roadmap5_embedded_ux.md) — M5.1 `/sessions/complete` + auto_approve, M5.2 Custom Tool template, M5.3 TypeScript Custom Node (planning; independent of R4)
+
+---
+
+## 📄 License
+
+MIT — [Jon Ribera](mailto:riberajon@gmail.com)

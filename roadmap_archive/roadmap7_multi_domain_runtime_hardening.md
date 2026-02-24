@@ -300,82 +300,143 @@ Extracted from `debug["flowise"].get("phase_metrics", [])`.
 ## Milestone 7.5 — Workday M3: MCP-in-Flowise
 
 ### Problem
-`WorkdayCapability` is fully stubbed. The correct integration model is to generate Flowise chatflows that include Workday MCP nodes — not to call Workday APIs directly from the co-pilot. The knowledge layer stubs (M4) need real data and real implementations.
+`WorkdayCapability` is fully stubbed. The correct integration model is to generate Flowise **chatflows** that include Workday integration via Flowise's existing **Custom MCP** tool configuration — not a dedicated Workday node, and not a direct Workday API call from the co-pilot process.
+
+Flowise currently represents MCP tooling by embedding a `customMCP` tool config inside a Tool node. The agent must learn to emit Patch IR ops that produce exactly this config shape. No live MCP discovery or catalog ingestion is required for this milestone.
+
+### How Flowise wires Custom MCP
+
+The persisted structure the agent must produce is:
+
+```
+selectedTool = "customMCP"
+
+selectedToolConfig:
+  mcpServerConfig   = STRINGIFIED JSON:
+                      {
+                        "url": "<MCP_SERVER_URL>",
+                        "headers": {
+                          "Authorization": "<Flowise variable expression>"
+                        }
+                      }
+  mcpActions        = ["getMyInfo", "searchForWorker", "getWorkers"]
+```
+
+Important constraints:
+- `mcpServerConfig` is stored as a **string**, not a nested object.
+- The `Authorization` value uses a Flowise variable expression (e.g. `$vars.beartoken`) and is **never hard-coded** by the agent.
+- `mcpActions` is the list of MCP tool names Flowise exposes to the agent/tool layer.
+- The output must be a **chatflow scaffold** — not an agentflow.
+
+### Default action list
+
+When no narrower action set is requested, the following three actions are used:
+
+```
+getMyInfo
+searchForWorker
+getWorkers
+```
+
+Additional actions may be selected based on the plan, but these three form the baseline.
 
 ### Key files
+- `flowise_dev_agent/agent/domains/workday.py` — implement `discover()` + `compile_ops()`
 - `flowise_dev_agent/knowledge/workday_provider.py` — implement `WorkdayMcpStore`
 - `flowise_dev_agent/knowledge/refresh.py` — implement `refresh_workday_mcp()`
-- `flowise_dev_agent/agent/domains/workday.py` — implement `discover()` + `compile_ops()`
-- `schemas/workday_mcp.snapshot.json` — replace `[]` with real catalog entries
-- `tests/test_workday_mcp_integration.py` (**new**) — integration smoke tests
+- `schemas/workday_mcp.snapshot.json` — replace `[]` with MCP wiring blueprint entries
+- `tests/test_workday_mcp_integration.py` (**new**) — mocked smoke tests
 
 ### Changes
 
-**A. Implement `WorkdayMcpStore`** (`workday_provider.py`)
+**A. MCP wiring blueprint** (`schemas/workday_mcp.snapshot.json`)
 
-Replace `NotImplementedError` stubs with `NodeSchemaStore`-style implementations:
-- Lazy `_load()` from snapshot
-- `get(endpoint_name) -> dict | None` — O(1) index lookup
-- `find(tags, limit=3) -> list[dict]` — keyword search on name/description/category
-- `is_stale(ttl_seconds) -> bool` — TTL from `WORKDAY_MCP_SNAPSHOT_TTL_SECONDS` env var
-- `item_count -> int`
+Replace the empty stub array with a small catalog of blueprint entries. Each entry describes one MCP action set that the agent can wire. Example entry shape:
 
-Snapshot entry format:
 ```json
 {
-  "node_type": "WorkdayHireEmployee",
-  "flowise_node_name": "workdayMCP",
-  "mcp_tool": "hire_employee",
+  "blueprint_id": "workday_default",
+  "description": "Default Workday MCP actions for worker lookup and self-service",
+  "selected_tool": "customMCP",
+  "mcp_server_url_placeholder": "<WORKDAY_MCP_SERVER_URL>",
+  "auth_var": "$vars.beartoken",
+  "mcp_actions": ["getMyInfo", "searchForWorker", "getWorkers"],
   "credential_type": "workdayOAuth",
-  "required_params": ["workerId", "hireDate"],
-  "description": "Hire an employee via the Workday Staffing API",
-  "category": "HR"
+  "chatflow_only": true
 }
 ```
 
-**B. Implement `refresh_workday_mcp()`** (`refresh.py`)
+`chatflow_only: true` signals that this blueprint is valid only in a chatflow context and must not be applied to agentflows.
 
-Replace no-op stub with:
-- Reads `WORKDAY_MCP_CATALOG_PATH` env var (path to a local JSON or from Flowise node catalog)
-- Normalizes to snapshot format
+**B. Implement `WorkdayMcpStore`** (`workday_provider.py`)
+
+Replace `NotImplementedError` stubs following the `NodeSchemaStore` pattern:
+- Lazy `_load()` from `schemas/workday_mcp.snapshot.json`
+- `get(blueprint_id) -> dict | None` — O(1) index lookup by `blueprint_id`
+- `find(tags, limit=3) -> list[dict]` — keyword search across `description` and `mcp_actions`
+- `is_stale(ttl_seconds) -> bool` — TTL from `WORKDAY_MCP_SNAPSHOT_TTL_SECONDS` env var
+- `item_count -> int`
+
+**C. Implement `refresh_workday_mcp()`** (`refresh.py`)
+
+Replace the no-op stub:
+- Reads `WORKDAY_MCP_CATALOG_PATH` env var (path to a local JSON catalog)
+- Normalizes entries to blueprint format
 - Writes `schemas/workday_mcp.snapshot.json` + `workday_mcp.meta.json`
 - Diff reporting (added/changed/removed entries)
+- Falls back to writing the built-in default blueprint if `WORKDAY_MCP_CATALOG_PATH` is not set
 
-**C. Implement `WorkdayCapability.discover()`** (`domains/workday.py`)
+**D. Implement `WorkdayCapability.discover()`** (`domains/workday.py`)
 
-Replace hardcoded stub:
-```python
-async def discover(self, context) -> DomainDiscoveryResult:
-    # 1. Query workday_knowledge_provider.mcp_store.find(keywords from context)
-    # 2. Check credential_store.all_by_type("workdayOAuth")
-    # 3. Return summary + facts + artifacts
-```
+Replace hardcoded mock with real blueprint-driven discovery:
 
-Return:
-- `summary`: "Found N Workday MCP node(s): [...]. OAuth credential: present/missing."
-- `facts`: `{"available_mcp_nodes": [...], "oauth_credential_id": "..."}`
-- `artifacts`: `{"mcp_node_types": [...]}`
+1. Query `workday_knowledge_provider.mcp_store.find(keywords from context)` for relevant blueprints
+2. Check `credential_store.all_by_type("workdayOAuth")` for available OAuth credentials
+3. Select the best-matching action list (defaults to `["getMyInfo", "searchForWorker", "getWorkers"]` when no narrower match)
+4. Return `DomainDiscoveryResult` with:
+   - `summary`: `"Found N Workday MCP blueprint(s). OAuth credential: present/missing. Actions selected: [...]"`
+   - `facts`: `{"selected_blueprint_id": "...", "mcp_actions": [...], "oauth_credential_id": "..."}`
+   - `artifacts`: `{"selected_tool": "customMCP", "mcp_actions": [...]}`
 
-**D. Implement `WorkdayCapability.compile_ops()`** (`domains/workday.py`)
+**E. Implement `WorkdayCapability.compile_ops()`** (`domains/workday.py`)
 
-Given plan text, generate `AddNode` + `BindCredential` ops for Workday MCP wiring:
-- Parse plan for Workday MCP node references
-- Emit `AddNode(node_name="workdayMCP", ...)` with `params` for `mcp_tool`
-- Emit `BindCredential(credential_type="workdayOAuth")`
-- Return `DomainPatchResult(ops=ops, stub=False)`
+Given the plan text and the `facts`/`artifacts` produced by `discover()`, emit Patch IR ops that produce the Custom MCP tool config shape:
 
-**E. Integration smoke tests** (`tests/test_workday_mcp_integration.py`)
+1. Emit `AddNode` for the Tool node that will hold the Custom MCP config, with params:
+   - `selectedTool` = `"customMCP"`
+   - `selectedToolConfig.mcpServerConfig` = stringified JSON `{"url": "<MCP_SERVER_URL>", "headers": {"Authorization": "$vars.beartoken"}}` (URL placeholder, auth via Flowise variable)
+   - `selectedToolConfig.mcpActions` = the selected action list from `facts`
+2. Emit `BindCredential` for `credential_type="workdayOAuth"` on the Tool node
+3. Return `DomainPatchResult(ops=ops, stub=False)`
 
-Mocked tests (no live Workday API) that verify:
-- `WorkdayCapability.discover()` returns non-stub data when `WorkdayMcpStore` has entries
-- `compile_ops()` produces at least one `AddNode` for `workdayMCP` + one `BindCredential` for `workdayOAuth`
-- The generated ops list passes `validate_patch_ops()`
+The MCP server URL placeholder is intentional — the developer supplies the real URL when they apply the chatflow to their Workday tenant.
+
+**F. Integration smoke tests** (`tests/test_workday_mcp_integration.py`)
+
+Mocked tests (no live Workday API or MCP server) that verify:
+
+- `WorkdayCapability.discover()` returns non-stub data from `WorkdayMcpStore` when the snapshot has entries
+- `compile_ops()` produces at least one `AddNode` op with:
+  - `selectedTool` param = `"customMCP"`
+  - `selectedToolConfig.mcpServerConfig` param containing a stringified JSON with `url` and `Authorization` keys
+  - `selectedToolConfig.mcpActions` param containing at least the three default actions
+- `compile_ops()` produces at least one `BindCredential` op with `credential_type="workdayOAuth"`
+- The full ops list passes `validate_patch_ops()`
+- No agentflow-specific keys appear in the produced op params
+
+### Non-goals (this milestone)
+- Full MCP catalog ingestion from a live Workday MCP server (no `tools/list` call)
+- Live action discovery — the default action list is embedded in the blueprint
+- Workday REST custom tools (placeholder only; full implementation is a future milestone)
+- Agentflow support for the Workday MCP wiring
 
 ### Acceptance criteria
-- `WorkdayCapability.discover()` returns real data from `WorkdayMcpStore` (not hardcoded)
-- `compile_ops()` produces valid, compiler-ready ops for at least one Workday MCP scenario
-- Integration smoke tests pass
-- 28/28 + new Workday tests all pass
+- `WorkdayMcpStore` loads the blueprint snapshot and returns entries without raising
+- `WorkdayCapability.discover()` returns `stub=False` data when the snapshot is populated
+- `compile_ops()` produces ops that set `selectedTool="customMCP"`, `mcpServerConfig` (stringified), and `mcpActions` (default list or subset)
+- Output is clearly a chatflow scaffold — no agentflow-only keys present
+- All integration smoke tests pass (mocked, no live dependencies)
+- Full regression: all prior tests + new Workday tests pass
 
 ---
 

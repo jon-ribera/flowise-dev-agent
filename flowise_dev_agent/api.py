@@ -40,6 +40,15 @@ from slowapi.util import get_remote_address
 logger = logging.getLogger("flowise_dev_agent.api")
 
 # ---------------------------------------------------------------------------
+# Runtime mode (M7.1, DD-066)
+# ---------------------------------------------------------------------------
+# FLOWISE_COMPAT_LEGACY=1/true/yes → pass capabilities=None (pre-refactor behaviour).
+# Unset or any other value         → capability-first default (DomainCapability path).
+_COMPAT_LEGACY: bool = os.environ.get("FLOWISE_COMPAT_LEGACY", "").lower() in (
+    "1", "true", "yes"
+)
+
+# ---------------------------------------------------------------------------
 # API key authentication (optional — enabled when AGENT_API_KEY is set)
 # ---------------------------------------------------------------------------
 
@@ -76,7 +85,7 @@ async def lifespan(app: FastAPI):
     except ImportError:
         pass
 
-    from flowise_dev_agent.agent.graph import build_graph, create_engine
+    from flowise_dev_agent.agent.graph import build_graph, create_engine, make_default_capabilities
     from flowise_dev_agent.agent.tools import FloviseDomain
     from flowise_dev_agent.instance_pool import FlowiseClientPool
     from flowise_dev_agent.reasoning import ReasoningSettings
@@ -111,13 +120,20 @@ async def lifespan(app: FastAPI):
         domains = [FloviseDomain(default_client)]
         pattern_store = await PatternStore.open(pattern_db_path)
 
+        # M7.1 (DD-066): capability-first is the default; compat_legacy only when opted in.
+        _capabilities = None if _COMPAT_LEGACY else make_default_capabilities(engine, domains)
+        _runtime_mode = "compat_legacy" if _COMPAT_LEGACY else "capability_first"
+        logger.info("Runtime mode: %s (FLOWISE_COMPAT_LEGACY=%s)", _runtime_mode, _COMPAT_LEGACY)
+
         graph = build_graph(
             engine,
             domains,
             checkpointer=checkpointer,
             client=default_client,
             pattern_store=pattern_store,
+            capabilities=_capabilities,
         )
+        app.state.runtime_mode = _runtime_mode
 
         app.state.graph = graph
         app.state.pool = pool
@@ -267,6 +283,9 @@ class SessionSummary(BaseModel):
     total_input_tokens: int = Field(0, description="Cumulative LLM prompt tokens used this session.")
     total_output_tokens: int = Field(0, description="Cumulative LLM completion tokens used this session.")
     session_name: str | None = Field(None, description="Short display title generated at session creation.")
+    runtime_mode: str | None = Field(None, description="'capability_first' or 'compat_legacy' — routing mode used for this session (M7.1).")
+    total_repair_events: int = Field(0, description="Total schema/credential repair events this session (M7.4).")
+    total_phases_timed: int = Field(0, description="Number of phases with captured timing data (M7.4).")
 
 
 class RenameSessionRequest(BaseModel):
@@ -433,11 +452,13 @@ def _initial_state(
     flowise_instance_id: str | None = None,
     webhook_url: str | None = None,
     session_name: str | None = None,
+    runtime_mode: str | None = None,
 ) -> dict:
     """Build the initial AgentState dict for a new session."""
     return {
         "requirement": requirement,
         "session_name": session_name,
+        "runtime_mode": runtime_mode,
         "messages": [],
         "chatflow_id": None,
         "discovery_summary": None,
@@ -607,7 +628,14 @@ async def create_session(request: Request, body: StartSessionRequest) -> Session
 
     try:
         await graph.ainvoke(
-            _initial_state(body.requirement, body.test_trials, body.flowise_instance_id, body.webhook_url, session_name),
+            _initial_state(
+                body.requirement,
+                body.test_trials,
+                body.flowise_instance_id,
+                body.webhook_url,
+                session_name,
+                runtime_mode=getattr(request.app.state, "runtime_mode", None),
+            ),
             config=config,
         )
     except Exception as e:
@@ -753,6 +781,15 @@ async def list_sessions(request: Request) -> list[SessionSummary]:
             else:
                 status = "in_progress"
 
+            # M7.4: extract phase_metrics telemetry from debug state
+            _phase_metrics: list = (
+                (sv.get("debug") or {}).get("flowise", {}).get("phase_metrics") or []
+            )
+            _repair_events = sum(
+                m.get("repair_events", 0)
+                for m in _phase_metrics
+                if isinstance(m, dict)
+            )
             summaries.append(SessionSummary(
                 thread_id=tid,
                 status=status,
@@ -761,6 +798,9 @@ async def list_sessions(request: Request) -> list[SessionSummary]:
                 total_input_tokens=sv.get("total_input_tokens", 0) or 0,
                 total_output_tokens=sv.get("total_output_tokens", 0) or 0,
                 session_name=sv.get("session_name"),
+                runtime_mode=sv.get("runtime_mode"),
+                total_repair_events=_repair_events,
+                total_phases_timed=len(_phase_metrics),
             ))
         except Exception as e:
             logger.warning("Could not read state for thread %s: %s", tid, e)

@@ -7403,9 +7403,14 @@ try {
 
 ### In-Memory Vector Store (`memoryVectorStore`)
 
-**Version:** 1  
-**Description:** In-memory vectorstore that stores embeddings and does an exact, linear search for the most similar embeddings.  
-**Base Classes:** `Memory`, `VectorStoreRetriever`, `BaseRetriever`  
+**Version:** 1
+**Description:** In-memory vectorstore that stores embeddings and does an exact, linear search for the most similar embeddings.
+**Base Classes:** `Memory`, `VectorStoreRetriever`, `BaseRetriever`
+
+> **RUNTIME CONSTRAINT:** A document loader node (e.g. `plainText`, `textFile`, `pdfFile`) MUST
+> be wired to the `document` input anchor. Without a document source the node cannot initialize
+> and Flowise returns "Expected a Runnable" (HTTP 500) on every prediction. Always include a
+> document loader when using this node in a RAG flow.
 
 **Optional Inputs:**
 

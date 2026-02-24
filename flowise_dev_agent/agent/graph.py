@@ -111,8 +111,16 @@ WHAT TO GATHER:
 3. Credentials already saved in Flowise (list_credentials)
 4. Marketplace templates that might apply (list_marketplace_templates)
 
-RULE: Call get_node for EVERY node type you plan to use. Input parameter names and baseClasses
-vary significantly between nodes and cannot be assumed from the node's label.
+RULE: Call get_node for EVERY node you intend to include in the flow — do not call it for nodes
+you are merely exploring. All get_node results are served from a local schema cache; there are no
+network calls for any of the 303 known nodes. Call it freely — never guess or skip it. Input
+parameter names and baseClasses vary significantly between nodes and cannot be assumed from the
+node's label.
+
+RAG CONSTRAINT: Vector stores (memoryVectorStore, pinecone, faiss, etc.) require a document
+loader node (plainText, textFile, pdfFile, etc.) wired to their "document" input anchor. Without
+a document source the retriever fails at Flowise runtime with "Expected a Runnable" (HTTP 500).
+Always include a document loader when planning any RAG flow.
 
 When you have enough information, write a concise Discovery Summary:
 - What chatflows currently exist (relevant ones)
@@ -262,6 +270,8 @@ RULES:
 4. EVERY credential-bearing node (LLM, embedding, etc.) MUST have a BindCredential op
 5. Include ALL required nodes + connections for a working flow — never omit the chain/agent node
 6. Do NOT write handle strings, edge IDs, or raw flowData JSON — the compiler derives all of that
+7. source_anchor and target_anchor MUST match real anchor names from get_node — all 303 node
+   schemas are available locally at zero cost. Never invent anchor names or param keys.
 
 OUTPUT: A single JSON array only, nothing else.
 """
@@ -1469,6 +1479,17 @@ def _make_patch_node_v2(
 
                 m_d.cache_hits = len(new_node_names) - len(_phase_d_repair_events)
                 m_d.repair_events = len(_phase_d_repair_events)
+
+                # M8.2: record total get_node calls in debug for session telemetry
+                if node_store is not None and node_store._call_count > 0:
+                    _gn_flowise = _phase_d_debug.get("flowise") or (
+                        (state.get("debug") or {}).get("flowise") or {}
+                    )
+                    _prior_calls = _gn_flowise.get("get_node_calls_total", 0)
+                    _phase_d_debug["flowise"] = {
+                        **_gn_flowise,
+                        "get_node_calls_total": _prior_calls + node_store._call_count,
+                    }
 
         _v2_phase_metrics.append(m_d.to_dict())
 

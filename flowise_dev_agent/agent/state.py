@@ -89,6 +89,10 @@ class AgentState(TypedDict):
     # The developer's original requirement, set at start and never changed.
     requirement: str
 
+    # Short LLM-generated display title (4–6 words). Set at session creation.
+    # Editable by the developer via PATCH /sessions/{id}/name. See DD-061.
+    session_name: str | None
+
     # -----------------------------------------------------------------------
     # Conversation + tool history (append-only)
     # -----------------------------------------------------------------------

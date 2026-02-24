@@ -58,6 +58,7 @@ from flowise_dev_agent.agent.domain import (
 )
 from flowise_dev_agent.agent.patch_ir import (
     AddNode,
+    BindCredential,
     op_to_dict,
     ops_from_json,
     validate_patch_ops,
@@ -77,6 +78,7 @@ from flowise_dev_agent.agent.tools import (
 from cursorwise.client import FlowiseClient
 from cursorwise.config import Settings
 from flowise_dev_agent.reasoning import Message, ReasoningEngine, ReasoningSettings, ToolDef, create_engine
+from flowise_dev_agent.knowledge.provider import FlowiseKnowledgeProvider, TemplateStore
 
 logger = logging.getLogger("flowise_dev_agent.agent")
 
@@ -143,6 +145,15 @@ Your plan MUST include ALL of these sections:
 7. ACTION
    - CREATE a new chatflow (name it), OR
    - UPDATE chatflow_id <id> (name the existing chatflow)
+
+8. APPROACHES (optional — only when multiple strategies are genuinely viable)
+   If there are two or more meaningfully different implementation paths the developer
+   should choose between, list them under this exact heading:
+   ## APPROACHES
+   1. <short label>: <one-sentence description>
+   2. <short label>: <one-sentence description>
+   Omit this section entirely if there is only one clear path forward.
+   Do NOT list sub-steps of the same approach as separate approaches.
 
 Keep the plan concise. The developer will approve it before any writes happen.
 """
@@ -767,8 +778,21 @@ _ERROR_PLAYBOOK: dict[str, str] = {
 }
 
 
-def _make_plan_node(engine: ReasoningEngine, domains: list[DomainTools]):
+def _make_plan_node(
+    engine: ReasoningEngine,
+    domains: list[DomainTools],
+    template_store: TemplateStore | None = None,
+):
     system = _build_system_prompt(_PLAN_BASE, domains, "discover")  # plan uses discover context
+
+    # Stop-words filtered out when extracting keywords for template matching.
+    _STOP = frozenset({
+        "with", "that", "this", "from", "have", "will", "what", "when", "where",
+        "which", "about", "into", "also", "some", "over", "then", "than", "your",
+        "their", "would", "could", "should", "using", "used", "uses", "make",
+        "need", "want", "help", "like", "know", "just", "more", "create", "build",
+        "such", "each", "very", "much", "many", "need", "data",
+    })
 
     async def plan(state: AgentState) -> dict:
         """Phase 2: Create a structured plan. No tool calls."""
@@ -787,16 +811,44 @@ def _make_plan_node(engine: ReasoningEngine, domains: list[DomainTools]):
             )
 
         user_msg = Message(role="user", content=user_content)
+
+        # Narrow template hint (Milestone 2 — knowledge layer).
+        # Extract meaningful keywords from the requirement, query the local
+        # TemplateStore, and inject a brief note when relevant matches exist.
+        # NEVER injects more than 3 entries; description is capped at 120 chars.
+        template_hint = ""
+        if template_store is not None and template_store.template_count > 0:
+            keywords = list(dict.fromkeys(
+                w for w in re.findall(r"[a-zA-Z]{4,}", state["requirement"])
+                if w.lower() not in _STOP
+            ))[:15]
+            matches = template_store.find(keywords, limit=3)
+            if matches:
+                lines = [
+                    "Possibly relevant marketplace templates "
+                    "(mention in plan if applicable; developer can import manually):"
+                ]
+                for m in matches:
+                    name = m.get("templateName") or ""
+                    desc = (m.get("description") or "")[:120]
+                    lines.append(f'  - "{name}": {desc}')
+                template_hint = "\n".join(lines)
+                logger.debug(
+                    "[PLAN] Template hint injected: %d match(es) for requirement",
+                    len(matches),
+                )
+
         # Build a compact context from structured state fields — never use the raw
         # state["messages"] which may contain huge tool call blobs from discover.
+        base_content = (
+            f"Requirement:\n{state['requirement']}\n\n"
+            f"Discovery summary:\n{state.get('discovery_summary') or '(none)'}"
+        )
+        if template_hint:
+            base_content += f"\n\n{template_hint}"
+
         ctx: list[Message] = [
-            Message(
-                role="user",
-                content=(
-                    f"Requirement:\n{state['requirement']}\n\n"
-                    f"Discovery summary:\n{state.get('discovery_summary') or '(none)'}"
-                ),
-            ),
+            Message(role="user", content=base_content),
         ]
         if state.get("plan"):
             # Revision loop: include previous plan so LLM can see what to revise.
@@ -842,6 +894,29 @@ def _make_plan_node(engine: ReasoningEngine, domains: list[DomainTools]):
     return plan
 
 
+def _parse_plan_options(plan_text: str) -> list[str] | None:
+    """Extract selectable approach labels from an ## APPROACHES section in the plan.
+
+    Returns a list of label strings (e.g. ["Update existing chatflow", "Fresh rebuild"])
+    or None if the section is absent or empty.
+    """
+    if not plan_text:
+        return None
+    match = re.search(
+        r"##\s*APPROACHES\s*\n((?:\s*\d+\..+\n?)+)",
+        plan_text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    options = []
+    for line in match.group(1).split("\n"):
+        m = re.match(r"\s*\d+\.\s*(.+)", line)
+        if m:
+            options.append(m.group(1).strip())
+    return options or None
+
+
 def _make_human_plan_approval_node():
     async def human_plan_approval(state: AgentState) -> dict:
         """INTERRUPT: surface plan to developer and wait for approval or feedback.
@@ -856,10 +931,12 @@ def _make_human_plan_approval_node():
         """
         logger.info("[HUMAN PLAN APPROVAL] waiting for developer input")
 
+        options = _parse_plan_options(state["plan"])
         interrupt_payload = {
             "type": "plan_approval",
             "plan": state["plan"],
             "iteration": state.get("iteration", 0),
+            "options": options,
             "prompt": (
                 "Review the plan above.\n"
                 "Reply 'approved' to proceed with implementation, "
@@ -893,6 +970,23 @@ def _make_patch_node(engine: ReasoningEngine, domains: list[DomainTools]):
         iteration = state.get("iteration", 0)
         logger.info("[PATCH] iteration=%d", iteration)
 
+        # Build context note: tell the LLM about the existing chatflow (if any)
+        # and the developer's selected approach (if provided at plan_approval).
+        # Without this, the LLM re-reads the original plan ("CREATE…") and blindly
+        # calls create_chatflow on every iteration — creating duplicate chatflows.
+        chatflow_id = state.get("chatflow_id")
+        developer_feedback = state.get("developer_feedback") or ""
+
+        existing_note = ""
+        if chatflow_id:
+            existing_note = (
+                f"\n\nIMPORTANT: Chatflow '{chatflow_id}' already exists for this session. "
+                "Use `update_chatflow` to modify it. Do NOT call `create_chatflow` — "
+                "that would create a duplicate."
+            )
+        if developer_feedback:
+            existing_note += f"\n\nDeveloper selected approach: {developer_feedback}"
+
         user_msg = Message(
             role="user",
             content=(
@@ -910,6 +1004,7 @@ def _make_patch_node(engine: ReasoningEngine, domains: list[DomainTools]):
                 content=(
                     f"Requirement:\n{state['requirement']}\n\n"
                     f"Discovery summary:\n{state.get('discovery_summary') or '(none)'}"
+                    f"{existing_note}"
                 ),
             ),
             Message(role="assistant", content=f"Approved plan:\n{state.get('plan') or ''}"),
@@ -1065,15 +1160,69 @@ def _make_patch_node_v2(
             Message(role="assistant", content=raw_ops_text),
         ]
 
-        # ---- Phase C: Parse + validate IR ops --------------------------------
+        # ---- Phase C: Parse → resolve credentials → validate IR ops ----------
         ops: list = []
         ir_errors: list[str] = []
+        _phase_cred_repair_events: list[dict] = []   # populated on credential repair
+        _resolved_credentials: dict[str, str] = {}   # query → credential_id map
+
+        # C.1: Parse
         try:
             ops = ops_from_json(raw_ops_text)
-            ir_errors = validate_patch_ops(ops, base_graph.node_ids())
         except Exception as e:
             ir_errors = [f"Failed to parse Patch IR JSON: {e}"]
             logger.warning("[PATCH v2] Ops parse failed: %s", e)
+
+        if not ir_errors:
+            # C.2: Credential resolution via CredentialStore (Roadmap 6 M3).
+            # Fills in empty credential_ids on BindCredential ops using the local
+            # snapshot first; falls back to list_credentials API ONLY on cache miss.
+            # This runs BEFORE validate_patch_ops so that auto-resolved credentials
+            # pass the "credential_id is required" check in the validator.
+            _provider = flowise_cap.knowledge if flowise_cap else None
+            _cred_store = _provider.credential_store if _provider else None
+
+            if _cred_store is not None:
+                if _cred_store.credential_count > 0:
+                    logger.info(
+                        "[PATCH v2] Credentials available: %d (from snapshot)",
+                        _cred_store.credential_count,
+                    )
+
+                async def _cred_api_fetcher() -> list[dict]:
+                    """Single list_credentials call — invoked ONLY on cache miss."""
+                    _r = await execute_tool(
+                        "list_credentials", {}, discover_executor
+                    )
+                    if (
+                        isinstance(_r, ToolResult)
+                        and _r.ok
+                        and isinstance(_r.data, list)
+                    ):
+                        return _r.data
+                    return []
+
+                for _op in ops:
+                    if isinstance(_op, BindCredential) and not _op.credential_id:
+                        _query = (_op.credential_type or "").strip()
+                        if not _query:
+                            continue
+                        _resolved = await _cred_store.resolve_or_repair(
+                            _query,
+                            _cred_api_fetcher,
+                            repair_events_out=_phase_cred_repair_events,
+                        )
+                        if _resolved:
+                            _op.credential_id = _resolved
+                            _resolved_credentials[_query] = _resolved
+                            logger.info(
+                                "[PATCH v2] Credential auto-resolved: type=%r → id=%s…",
+                                _query,
+                                _resolved[:8],
+                            )
+
+            # C.3: IR validation (after credential auto-fill)
+            ir_errors = validate_patch_ops(ops, base_graph.node_ids())
 
         if ir_errors:
             logger.warning("[PATCH v2] IR validation errors: %s", ir_errors[:3])
@@ -1091,23 +1240,67 @@ def _make_patch_node_v2(
                 "total_output_tokens": out_tok,
             }
 
-        # ---- Phase D: Fetch schemas for new node types -----------------------
+        # ---- Phase D: Resolve schemas for new node types (local-first) -------
+        # Roadmap 6 M1: check FlowiseKnowledgeProvider snapshot first.
+        # A targeted get_node API call is made ONLY for node types absent from
+        # the local snapshot (repair-only — never fetched when snapshot has the node).
+        # Repair events are accumulated and written to debug["flowise"]["knowledge_repair_events"].
         schema_cache: dict[str, dict] = {}
+        _phase_d_repair_events: list[dict] = []   # populated only on cache miss
+        _phase_d_debug: dict = {}                  # merged into final return's "debug" key
+
         new_node_names = {
             op.node_name for op in ops
             if isinstance(op, AddNode) and op.node_name
         }
         if new_node_names:
-            schema_tasks = [
-                execute_tool("get_node", {"name": name}, discover_executor)
-                for name in new_node_names
-            ]
-            schema_results = await asyncio.gather(*schema_tasks, return_exceptions=True)
-            for name, result in zip(new_node_names, schema_results):
-                if isinstance(result, ToolResult) and result.ok and isinstance(result.data, dict):
-                    schema_cache[name] = result.data
+            provider = flowise_cap.knowledge if flowise_cap else None
+            node_store = provider.node_schemas if provider else None
+
+            async def _api_fetcher(node_type: str) -> dict:
+                """Single targeted get_node API call — invoked ONLY on cache miss."""
+                _result = await execute_tool(
+                    "get_node", {"name": node_type}, discover_executor
+                )
+                if isinstance(_result, ToolResult) and _result.ok and isinstance(_result.data, dict):
+                    return _result.data
+                return {}
+
+            for _name in new_node_names:
+                if node_store is not None:
+                    # Fast path: local snapshot hit → zero API calls
+                    # Slow path: cache miss → ONE targeted get_node call (repair)
+                    _schema = await node_store.get_or_repair(
+                        _name, _api_fetcher, repair_events_out=_phase_d_repair_events
+                    )
                 else:
-                    logger.warning("[PATCH v2] Schema fetch for '%s' failed: %s", name, result)
+                    # capabilities=None legacy path — always calls API (unchanged behaviour)
+                    _legacy = await execute_tool(
+                        "get_node", {"name": _name}, discover_executor
+                    )
+                    _schema = (
+                        _legacy.data
+                        if isinstance(_legacy, ToolResult) and _legacy.ok and isinstance(_legacy.data, dict)
+                        else None
+                    )
+
+                if _schema:
+                    schema_cache[_name] = _schema
+                else:
+                    logger.warning("[PATCH v2] Schema unavailable for '%s' — AddNode will fail", _name)
+
+            # Build debug update for repair events (written to state via return dict)
+            if _phase_d_repair_events:
+                logger.info("[PATCH v2] Knowledge repair events: %d", len(_phase_d_repair_events))
+                _existing_events = state.get("debug", {}).get("flowise", {}).get(
+                    "knowledge_repair_events", []
+                )
+                _phase_d_debug = {
+                    "flowise": {
+                        **state.get("debug", {}).get("flowise", {}),
+                        "knowledge_repair_events": _existing_events + _phase_d_repair_events,
+                    }
+                }
 
         # ---- Phase E: Deterministic compile ----------------------------------
         compile_result = compile_patch_ops(base_graph, ops, schema_cache)
@@ -1231,6 +1424,47 @@ def _make_patch_node_v2(
             final_chatflow_id, write_result.ok, validated_hash[:12],
         )
 
+        # Roadmap 6 M3: write resolved_credentials to facts["flowise"].
+        # Merges with any credentials resolved in earlier patch iterations
+        # without overwriting other flowise fact keys (e.g. available_node_types).
+        _phase_c_facts: dict = {}
+        if _resolved_credentials:
+            _existing_flowise_facts = (state.get("facts") or {}).get("flowise") or {}
+            _existing_resolved = _existing_flowise_facts.get("resolved_credentials") or {}
+            _phase_c_facts = {
+                "flowise": {
+                    **_existing_flowise_facts,
+                    "resolved_credentials": {
+                        **_existing_resolved,
+                        **_resolved_credentials,
+                    },
+                }
+            }
+
+        # Combine credential repair events with node-schema repair events in debug
+        if _phase_cred_repair_events:
+            _existing_cred_events = (
+                (state.get("debug") or {})
+                .get("flowise", {})
+                .get("credential_repair_events", [])
+            )
+            _cred_debug: dict = {
+                "flowise": {
+                    **((state.get("debug") or {}).get("flowise") or {}),
+                    "credential_repair_events": (
+                        _existing_cred_events + _phase_cred_repair_events
+                    ),
+                }
+            }
+            # Merge cred_debug into _phase_d_debug (node repair events may also exist)
+            if _phase_d_debug:
+                _phase_d_debug["flowise"] = {
+                    **_phase_d_debug.get("flowise", {}),
+                    **_cred_debug["flowise"],
+                }
+            else:
+                _phase_d_debug = _cred_debug
+
         return {
             "messages": new_msgs,
             "chatflow_id": final_chatflow_id,
@@ -1238,6 +1472,12 @@ def _make_patch_node_v2(
             "validated_payload_hash": validated_hash,
             "total_input_tokens": in_tok,
             "total_output_tokens": out_tok,
+            # Roadmap 6 M1: node schema repair events
+            # Roadmap 6 M3: credential repair events (merged into same debug key)
+            # _phase_d_debug is {} when no repairs occurred — reducer ignores empty dict
+            "debug": _phase_d_debug,
+            # Roadmap 6 M3: resolved_credentials written to facts (empty dict = no-op)
+            "facts": _phase_c_facts,
         }
 
     return patch
@@ -1430,6 +1670,8 @@ class FlowiseCapability(DomainCapability):
         self._registry.register_context("flowise", "discover", flowise_domain.discover_context)
         self._registry.register_context("flowise", "patch", flowise_domain.patch_context)
         self._registry.register_context("flowise", "test", flowise_domain.test_context)
+        # Roadmap 6 M1: local-first node schema provider (no parallel orchestrator fork)
+        self._knowledge = FlowiseKnowledgeProvider()
 
     @property
     def name(self) -> str:
@@ -1442,6 +1684,11 @@ class FlowiseCapability(DomainCapability):
     @property
     def domain_tools(self) -> "DomainTools":
         return self._flowise_domain
+
+    @property
+    def knowledge(self) -> FlowiseKnowledgeProvider:
+        """Local-first platform knowledge provider (Roadmap 6 M1)."""
+        return self._knowledge
 
     async def discover(self, context: dict) -> DomainDiscoveryResult:
         """Run the Flowise discover ReAct loop and return structured results.
@@ -1724,13 +1971,26 @@ def _make_human_result_review_node():
             asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
         developer_response: str = interrupt(interrupt_payload)
 
-        accepted = developer_response.strip().lower() in (
+        response_lower = developer_response.strip().lower()
+
+        rollback = response_lower in ("rollback", "revert")
+        accepted = response_lower in (
             "accepted", "accept", "done", "yes", "y", "looks good", "lgtm", "ship it"
         )
 
-        logger.info("[HUMAN RESULT REVIEW] accepted=%s", accepted)
+        logger.info(
+            "[HUMAN RESULT REVIEW] accepted=%s rollback=%s", accepted, rollback
+        )
 
-        if accepted:
+        if rollback:
+            # Developer wants to revert to the previous chatflow snapshot.
+            # Mark session complete so the graph exits; the API caller can then
+            # POST /sessions/{id}/rollback to restore a prior version in Flowise.
+            return {
+                "done": True,
+                "developer_feedback": "[rollback requested by developer]",
+            }
+        elif accepted:
             return {"done": True, "developer_feedback": None}
         else:
             return {
@@ -1833,10 +2093,18 @@ def build_graph(
     else:
         patch_node = _make_patch_node(engine, domains)
 
+    # Extract TemplateStore from capabilities for planning hints (Milestone 2).
+    _template_store: TemplateStore | None = None
+    if capabilities:
+        for _cap in capabilities:
+            if hasattr(_cap, "knowledge") and hasattr(_cap.knowledge, "template_store"):
+                _template_store = _cap.knowledge.template_store
+                break
+
     builder.add_node("clarify",             _make_clarify_node(engine))
     builder.add_node("discover",            _make_discover_node(engine, domains, capabilities))
     builder.add_node("check_credentials",   _make_check_credentials_node())
-    builder.add_node("plan",                _make_plan_node(engine, domains))
+    builder.add_node("plan",                _make_plan_node(engine, domains, _template_store))
     builder.add_node("human_plan_approval", _make_human_plan_approval_node())
     builder.add_node("patch",               patch_node)
     builder.add_node("test",                _make_test_node(engine, domains))

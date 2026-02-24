@@ -100,6 +100,7 @@
       padding: 8px 14px; cursor: pointer;
       border-left: 3px solid transparent;
       transition: background .1s;
+      position: relative;
     }
     .s-item:hover { background: var(--surface); }
     .s-item.active { border-left-color: var(--accent); background: var(--surface); }
@@ -251,6 +252,48 @@
       color: white; font-weight: 500; font-size: 14px; border-radius: 6px; cursor: pointer;
     }
     .btn-send:hover { background: var(--accent-h); }
+    .btn-danger {
+      padding: 9px 20px; background: var(--red); border: none;
+      color: white; font-weight: 600; font-size: 14px; border-radius: 6px; cursor: pointer;
+    }
+    .btn-danger:hover { background: #b91c1c; }
+
+    /* Approach option buttons */
+    .approach-opts { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; margin-bottom: 4px; }
+    .approach-btn {
+      padding: 8px 14px; background: var(--surface);
+      border: 1px solid var(--border); color: var(--text);
+      font-size: 13px; border-radius: 6px; cursor: pointer; text-align: left;
+    }
+    .approach-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .approach-btn.selected { border-color: var(--accent); background: var(--accent-dim); color: var(--accent); font-weight: 600; }
+    #approve-approach-btn:disabled { cursor: not-allowed; }
+
+    /* Session name row */
+    .s-name-row { display: flex; align-items: center; padding-right: 24px; gap: 4px; }
+    .s-name {
+      font-size: 12px; color: var(--text); font-weight: 500;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1;
+    }
+    .s-pencil {
+      opacity: 0; cursor: pointer; font-size: 11px; color: var(--muted);
+      background: none; border: none; padding: 0 3px; flex-shrink: 0;
+    }
+    .s-item:hover .s-pencil { opacity: 1; }
+    .s-pencil:hover { color: var(--accent); }
+    .s-delete {
+      position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+      background: none; border: none; color: var(--muted); cursor: pointer;
+      font-size: 13px; padding: 3px 6px; border-radius: 4px;
+      opacity: 0; transition: opacity .15s;
+    }
+    .s-item:hover .s-delete { opacity: 1; }
+    .s-delete:hover { background: var(--bg); color: var(--red); }
+    .s-rename-input {
+      flex: 1; background: var(--bg); border: 1px solid var(--accent);
+      color: var(--text); padding: 2px 6px; border-radius: 4px;
+      font-size: 12px; font-family: inherit; min-width: 0;
+    }
 
     /* ── Completed ── */
     #panel-completed { align-items: center; justify-content: center; padding: 40px; gap: 20px; }
@@ -626,9 +669,19 @@ function renderInterruptPanel() {
 
   } else if (kind === 'plan_approval') {
     const planHtml = md ? marked.parse(pl.plan || '') : `<pre>${esc(pl.plan || '')}</pre>`;
-    body.innerHTML = `<div class="md">${planHtml}</div>`;
+    let optionsHtml = '';
+    if (pl.options && pl.options.length > 0) {
+      optionsHtml = '<div class="approach-opts">' +
+        pl.options.map((opt, i) =>
+          `<button class="approach-btn" onclick="selectApproach(${i})">${esc(opt)}</button>`
+        ).join('') +
+        '</div>';
+    }
+    body.innerHTML = `<div class="md">${planHtml}</div>${optionsHtml}`;
     document.getElementById('intr-form-label').textContent =
-      'Reply "approved" to proceed, or describe what to change:';
+      pl.options && pl.options.length > 0
+        ? 'Select an approach above, or describe changes in the text box:'
+        : 'Reply "approved" to proceed, or describe what to change:';
     document.getElementById('resp-input').placeholder = 'approved';
 
   } else if (kind === 'result_review') {
@@ -654,17 +707,35 @@ function renderInterruptPanel() {
   const row = document.getElementById('btn-row');
   row.innerHTML = '';
   if (kind === 'plan_approval') {
-    const b = document.createElement('button');
-    b.className   = 'btn-approve';
-    b.textContent = '✓ Approve Plan';
-    b.onclick = () => quickReply('approved');
-    row.appendChild(b);
+    if (pl.options && pl.options.length > 0) {
+      _selectedApproach = null;
+      const b = document.createElement('button');
+      b.className   = 'btn-approve';
+      b.id          = 'approve-approach-btn';
+      b.textContent = '✓ Approve Selected Approach';
+      b.disabled    = true;
+      b.style.opacity = '0.5';
+      b.onclick = () => approveWithApproach();
+      row.appendChild(b);
+    } else {
+      const b = document.createElement('button');
+      b.className   = 'btn-approve';
+      b.textContent = '✓ Approve Plan';
+      b.onclick = () => quickReply('approved');
+      row.appendChild(b);
+    }
   } else if (kind === 'result_review') {
-    const b = document.createElement('button');
-    b.className   = 'btn-approve';
-    b.textContent = '✓ Accept';
-    b.onclick = () => quickReply('accepted');
-    row.appendChild(b);
+    const bAccept = document.createElement('button');
+    bAccept.className   = 'btn-approve';
+    bAccept.textContent = '✓ Accept';
+    bAccept.onclick = () => quickReply('accepted');
+    row.appendChild(bAccept);
+
+    const bRollback = document.createElement('button');
+    bRollback.className   = 'btn-danger';
+    bRollback.textContent = '↩ Rollback';
+    bRollback.onclick = () => quickReply('rollback');
+    row.appendChild(bRollback);
   }
   const send = document.createElement('button');
   send.className   = 'btn-send';
@@ -718,14 +789,17 @@ function renderSessionList() {
   list.innerHTML = [...state.sessions].reverse().map(s => `
     <li class="s-item${state.threadId === s.thread_id ? ' active' : ''}"
         onclick="loadSession('${esc(s.thread_id)}')">
-      <div class="s-id">
+      <div class="s-name-row">
         <span class="s-dot" style="background:${statusColor(s.status)}"></span>
-        ${esc(s.thread_id.slice(0, 13))}…
+        <span class="s-name" id="s-name-${esc(s.thread_id)}">${esc(s.session_name || s.thread_id.slice(0, 13) + '\u2026')}</span>
+        <button class="s-pencil" onclick="startRenameSession(event,'${esc(s.thread_id)}')" title="Rename">✎</button>
       </div>
       <div class="s-meta">
-        ${s.chatflow_id ? esc(s.chatflow_id.slice(0, 22)) + '…' : 'no chatflow yet'}
+        <span style="font-family:var(--mono)">${esc(s.thread_id.slice(0, 13))}\u2026</span>
+        &middot; ${s.chatflow_id ? esc(s.chatflow_id.slice(0, 18)) + '\u2026' : 'no chatflow'}
         &middot; iter ${s.iteration || 0}
       </div>
+      <button class="s-delete" onclick="deleteSession(event,'${esc(s.thread_id)}')" title="Delete session">&#x1F5D1;</button>
     </li>`).join('');
 }
 
@@ -827,6 +901,80 @@ async function viewAuditTrail() {
     document.getElementById('audit-content').innerHTML =
       '<em style="color:var(--red)">Failed to load audit trail.</em>';
   }
+}
+
+// ─────────────────────────────────────────────────────────
+//  Plan approach selection (C2)
+// ─────────────────────────────────────────────────────────
+let _selectedApproach = null;
+
+function selectApproach(idx) {
+  _selectedApproach = idx;
+  document.querySelectorAll('.approach-btn').forEach((btn, i) => {
+    btn.classList.toggle('selected', i === idx);
+  });
+  const approveBtn = document.getElementById('approve-approach-btn');
+  if (approveBtn) {
+    approveBtn.disabled = false;
+    approveBtn.style.opacity = '1';
+  }
+}
+
+function approveWithApproach() {
+  const pl = state.interruptPayload;
+  if (!pl || !pl.options || _selectedApproach === null) return;
+  const label = pl.options[_selectedApproach];
+  quickReply(`approved - approach: ${label}`);
+}
+
+// ─────────────────────────────────────────────────────────
+//  Session delete & rename (C4, C5)
+// ─────────────────────────────────────────────────────────
+async function deleteSession(evt, threadId) {
+  evt.stopPropagation();
+  if (!confirm('Delete this session? This cannot be undone.')) return;
+  await apiFetch(`/sessions/${threadId}`, { method: 'DELETE' });
+  state.sessions = state.sessions.filter(s => s.thread_id !== threadId);
+  if (state.threadId === threadId) transition('idle');
+  renderSessionList();
+}
+
+function startRenameSession(evt, threadId) {
+  evt.stopPropagation();
+  const nameEl = document.getElementById(`s-name-${threadId}`);
+  if (!nameEl) return;
+  const current = nameEl.textContent;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 's-rename-input';
+  input.value = current;
+  input.onclick = e => e.stopPropagation();
+  let saved = false;
+  const save = () => {
+    if (saved) return;
+    saved = true;
+    saveRenameSession(threadId, input.value.trim());
+  };
+  input.onkeydown = e => {
+    if (e.key === 'Enter')  { e.preventDefault(); save(); }
+    if (e.key === 'Escape') { saved = true; renderSessionList(); }
+  };
+  input.onblur = save;
+  nameEl.replaceWith(input);
+  input.focus();
+  input.select();
+}
+
+async function saveRenameSession(threadId, newName) {
+  if (!newName) { renderSessionList(); return; }
+  const s = state.sessions.find(s => s.thread_id === threadId);
+  if (s) s.session_name = newName;
+  renderSessionList();  // optimistic update
+  await apiFetch(`/sessions/${threadId}/name`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: newName }),
+  });
 }
 
 // ─────────────────────────────────────────────────────────

@@ -41,3 +41,10 @@ sessions.db
 
 # Docker
 *.tar
+
+# Credential knowledge snapshot — contains instance-specific metadata (credential IDs,
+# names, types) that are machine-specific and must not be committed to source control.
+# Refresh via: python -m flowise_dev_agent.knowledge.refresh --credentials
+# See DD-064 and ROADMAP6_Platform Knowledge.md section B.4.
+schemas/flowise_credentials.snapshot.json
+schemas/flowise_credentials.meta.json

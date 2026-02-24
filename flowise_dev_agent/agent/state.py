@@ -89,6 +89,15 @@ class AgentState(TypedDict):
     # The developer's original requirement, set at start and never changed.
     requirement: str
 
+    # Short LLM-generated display title (4–6 words). Set at session creation.
+    # Editable by the developer via PATCH /sessions/{id}/name. See DD-061.
+    session_name: str | None
+
+    # Graph routing mode set once at session creation (M7.1, DD-066).
+    # "capability_first" — DomainCapability path (default when FLOWISE_COMPAT_LEGACY unset).
+    # "compat_legacy"    — pre-refactor DomainTools merge path (FLOWISE_COMPAT_LEGACY=true).
+    runtime_mode: str | None
+
     # -----------------------------------------------------------------------
     # Conversation + tool history (append-only)
     # -----------------------------------------------------------------------

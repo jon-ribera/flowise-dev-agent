@@ -1,0 +1,14 @@
+[
+  {
+    "blueprint_id": "workday_default",
+    "description": "Default Workday MCP actions for worker lookup and self-service (getMyInfo, searchForWorker, getWorkers)",
+    "selected_tool": "customMCP",
+    "mcp_server_url_placeholder": "https://<tenant>.workday.com/mcp",
+    "auth_var": "$vars.beartoken",
+    "mcp_actions": ["getMyInfo", "searchForWorker", "getWorkers"],
+    "credential_type": "workdayOAuth",
+    "chatflow_only": true,
+    "category": "HR",
+    "tags": ["workday", "mcp", "worker", "hr", "custom-mcp"]
+  }
+]

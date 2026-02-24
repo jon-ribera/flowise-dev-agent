@@ -20,8 +20,6 @@ Human-in-the-loop flow:
 See DESIGN_DECISIONS.md — DD-011, DD-012.
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import os
@@ -40,6 +38,15 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 logger = logging.getLogger("flowise_dev_agent.api")
+
+# ---------------------------------------------------------------------------
+# Runtime mode (M7.1, DD-066)
+# ---------------------------------------------------------------------------
+# FLOWISE_COMPAT_LEGACY=1/true/yes → pass capabilities=None (pre-refactor behaviour).
+# Unset or any other value         → capability-first default (DomainCapability path).
+_COMPAT_LEGACY: bool = os.environ.get("FLOWISE_COMPAT_LEGACY", "").lower() in (
+    "1", "true", "yes"
+)
 
 # ---------------------------------------------------------------------------
 # API key authentication (optional — enabled when AGENT_API_KEY is set)
@@ -78,7 +85,7 @@ async def lifespan(app: FastAPI):
     except ImportError:
         pass
 
-    from flowise_dev_agent.agent.graph import build_graph, create_engine
+    from flowise_dev_agent.agent.graph import build_graph, create_engine, make_default_capabilities
     from flowise_dev_agent.agent.tools import FloviseDomain
     from flowise_dev_agent.instance_pool import FlowiseClientPool
     from flowise_dev_agent.reasoning import ReasoningSettings
@@ -113,17 +120,25 @@ async def lifespan(app: FastAPI):
         domains = [FloviseDomain(default_client)]
         pattern_store = await PatternStore.open(pattern_db_path)
 
+        # M7.1 (DD-066): capability-first is the default; compat_legacy only when opted in.
+        _capabilities = None if _COMPAT_LEGACY else make_default_capabilities(engine, domains)
+        _runtime_mode = "compat_legacy" if _COMPAT_LEGACY else "capability_first"
+        logger.info("Runtime mode: %s (FLOWISE_COMPAT_LEGACY=%s)", _runtime_mode, _COMPAT_LEGACY)
+
         graph = build_graph(
             engine,
             domains,
             checkpointer=checkpointer,
             client=default_client,
             pattern_store=pattern_store,
+            capabilities=_capabilities,
         )
+        app.state.runtime_mode = _runtime_mode
 
         app.state.graph = graph
         app.state.pool = pool
         app.state.pattern_store = pattern_store
+        app.state.engine = engine
 
         yield
 
@@ -212,8 +227,10 @@ class ResumeSessionRequest(BaseModel):
         ...,
         description=(
             "Developer's reply to the current interrupt. "
-            "For plan_approval: 'approved' to proceed, or describe what to change. "
-            "For result_review: 'accepted' to finish, or describe what to iterate."
+            "For plan_approval: 'approved' to proceed, 'approved - approach: <label>' to select "
+            "a specific approach, or describe what to change. "
+            "For result_review: 'accepted' to finish, 'rollback' to revert, "
+            "or describe what to iterate."
         ),
         examples=["approved", "Change the model to claude-sonnet-4-6 instead of gpt-4o"],
     )
@@ -237,6 +254,14 @@ class InterruptPayload(BaseModel):
     test_results: str | None = Field(None, description="Test output (present on result_review).")
     chatflow_id: str | None = Field(None, description="Chatflow being worked on (if known).")
     iteration: int = Field(0, description="Which iteration this is (0-indexed).")
+    options: list[str] | None = Field(
+        None,
+        description=(
+            "Selectable approach labels extracted from the plan's ## APPROACHES section. "
+            "Present only on plan_approval when the plan offers multiple implementation paths. "
+            "Send 'approved - approach: <label>' to select one."
+        ),
+    )
     missing_credentials: list[str] | None = Field(
         None,
         description=(
@@ -257,6 +282,16 @@ class SessionSummary(BaseModel):
     chatflow_id: str | None = Field(None, description="The Flowise chatflow ID being built.")
     total_input_tokens: int = Field(0, description="Cumulative LLM prompt tokens used this session.")
     total_output_tokens: int = Field(0, description="Cumulative LLM completion tokens used this session.")
+    session_name: str | None = Field(None, description="Short display title generated at session creation.")
+    runtime_mode: str | None = Field(None, description="'capability_first' or 'compat_legacy' — routing mode used for this session (M7.1).")
+    total_repair_events: int = Field(0, description="Total schema/credential repair events this session (M7.4).")
+    total_phases_timed: int = Field(0, description="Number of phases with captured timing data (M7.4).")
+
+
+class RenameSessionRequest(BaseModel):
+    """Request body for PATCH /sessions/{thread_id}/name."""
+
+    name: str = Field(..., max_length=120, description="New display name for the session.")
 
 
 class SessionResponse(BaseModel):
@@ -340,6 +375,7 @@ async def _build_response(graph, config: dict, thread_id: str) -> SessionRespons
             test_results=raw.get("test_results"),
             chatflow_id=raw.get("chatflow_id") or state.get("chatflow_id"),
             iteration=raw.get("iteration", state.get("iteration", 0)),
+            options=raw.get("options"),
             missing_credentials=raw.get("missing_credentials"),
         )
         return SessionResponse(
@@ -380,15 +416,49 @@ async def _build_response(graph, config: dict, thread_id: str) -> SessionRespons
     )
 
 
+async def _generate_session_name(requirement: str, engine) -> str:
+    """Generate a concise 4–6 word display title from the session requirement.
+
+    Makes a single low-cost LLM call. Falls back to the first 60 chars of the
+    requirement if the call fails or returns empty output. See DD-061.
+    """
+    from flowise_dev_agent.reasoning import Message as _Msg
+
+    try:
+        messages = [
+            _Msg(
+                role="user",
+                content=(
+                    "Generate a concise 4–6 word title for this task. "
+                    "No quotes, no punctuation at the end, no markdown:\n"
+                    f"{requirement[:300]}"
+                ),
+            )
+        ]
+        response = await engine.complete(messages, temperature=0.3)
+        title = (response.content or "").strip()
+        if title:
+            return title[:80]
+    except Exception:
+        pass
+    # Fallback: first 60 chars
+    short = requirement[:60].rstrip()
+    return short + ("\u2026" if len(requirement) > 60 else "")
+
+
 def _initial_state(
     requirement: str,
     test_trials: int = 1,
     flowise_instance_id: str | None = None,
     webhook_url: str | None = None,
+    session_name: str | None = None,
+    runtime_mode: str | None = None,
 ) -> dict:
     """Build the initial AgentState dict for a new session."""
     return {
         "requirement": requirement,
+        "session_name": session_name,
+        "runtime_mode": runtime_mode,
         "messages": [],
         "chatflow_id": None,
         "discovery_summary": None,
@@ -548,14 +618,24 @@ async def create_session(request: Request, body: StartSessionRequest) -> Session
     Returns a thread_id that must be stored to resume the session.
     """
     graph = _get_graph(request)
+    engine = request.app.state.engine
     thread_id = body.thread_id or str(uuid4())
     config = {"configurable": {"thread_id": thread_id}}
 
     logger.info("Creating session %s: %r", thread_id, body.requirement[:80])
 
+    session_name = await _generate_session_name(body.requirement, engine)
+
     try:
         await graph.ainvoke(
-            _initial_state(body.requirement, body.test_trials, body.flowise_instance_id, body.webhook_url),
+            _initial_state(
+                body.requirement,
+                body.test_trials,
+                body.flowise_instance_id,
+                body.webhook_url,
+                session_name,
+                runtime_mode=getattr(request.app.state, "runtime_mode", None),
+            ),
             config=config,
         )
     except Exception as e:
@@ -701,6 +781,15 @@ async def list_sessions(request: Request) -> list[SessionSummary]:
             else:
                 status = "in_progress"
 
+            # M7.4: extract phase_metrics telemetry from debug state
+            _phase_metrics: list = (
+                (sv.get("debug") or {}).get("flowise", {}).get("phase_metrics") or []
+            )
+            _repair_events = sum(
+                m.get("repair_events", 0)
+                for m in _phase_metrics
+                if isinstance(m, dict)
+            )
             summaries.append(SessionSummary(
                 thread_id=tid,
                 status=status,
@@ -708,6 +797,10 @@ async def list_sessions(request: Request) -> list[SessionSummary]:
                 chatflow_id=sv.get("chatflow_id"),
                 total_input_tokens=sv.get("total_input_tokens", 0) or 0,
                 total_output_tokens=sv.get("total_output_tokens", 0) or 0,
+                session_name=sv.get("session_name"),
+                runtime_mode=sv.get("runtime_mode"),
+                total_repair_events=_repair_events,
+                total_phases_timed=len(_phase_metrics),
             ))
         except Exception as e:
             logger.warning("Could not read state for thread %s: %s", tid, e)
@@ -739,6 +832,30 @@ async def delete_session(thread_id: str, request: Request) -> dict:
     await checkpointer.adelete_thread(thread_id)
     logger.info("Deleted session %s", thread_id)
     return {"deleted": True, "thread_id": thread_id}
+
+
+@app.patch("/sessions/{thread_id}/name", tags=["sessions"], dependencies=[Depends(_verify_api_key)])
+async def rename_session(thread_id: str, body: RenameSessionRequest, request: Request) -> dict:
+    """Update the display name of a session (DD-061).
+
+    Stores the new name in the session's checkpointed state so it persists
+    across page refreshes. The name is shown in the sidebar instead of the
+    raw thread UUID.
+    """
+    graph = _get_graph(request)
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # Verify session exists
+    try:
+        snap = await graph.aget_state(config)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Session '{thread_id}' not found.")
+    if not snap.values:
+        raise HTTPException(status_code=404, detail=f"Session '{thread_id}' not found.")
+
+    await graph.aupdate_state(config, {"session_name": body.name})
+    logger.info("Renamed session %s → %r", thread_id, body.name)
+    return {"thread_id": thread_id, "session_name": body.name}
 
 
 @app.get("/sessions/{thread_id}/versions", tags=["sessions"], dependencies=[Depends(_verify_api_key)])
@@ -838,16 +955,19 @@ async def stream_create_session(request: Request, body: StartSessionRequest) -> 
     See DESIGN_DECISIONS.md — DD-025.
     """
     graph = _get_graph(request)
+    engine = request.app.state.engine
     thread_id = body.thread_id or str(uuid4())
     config = {"configurable": {"thread_id": thread_id}}
 
     logger.info("Streaming new session %s: %r", thread_id, body.requirement[:80])
 
+    session_name = await _generate_session_name(body.requirement, engine)
+
     async def event_stream():
         yield ": connected\n\n"  # flush immediately so the browser sees open connection
         try:
             async for event in graph.astream_events(
-                _initial_state(body.requirement, body.test_trials, body.flowise_instance_id, body.webhook_url),
+                _initial_state(body.requirement, body.test_trials, body.flowise_instance_id, body.webhook_url, session_name),
                 config=config,
                 version="v2",
                 stream_mode="custom",

@@ -1235,3 +1235,617 @@ write's input, all the same bytes.
 - Requiring an explicit `authorized_hash` parameter on `create_chatflow` / `update_chatflow`:
   changes tool signatures; requires LLM to pass the hash it doesn't know. The guard closure
   is transparent to callers.
+
+---
+
+## DD-059 — v1 Patch Node: Chatflow Context Injection
+
+**Decision**: In `_make_patch_node()` (v1 LLM-driven path), inject `chatflow_id` and
+`developer_feedback` into the LLM user context message before invoking the model.
+
+**Reason**: The v1 patch node previously built its context from `requirement` +
+`discovery_summary` only. On the first iteration, the LLM correctly called `create_chatflow`.
+On subsequent iterations, the LLM re-read the original plan (which said "CREATE…") and called
+`create_chatflow` again, producing a duplicate chatflow. By injecting an explicit
+`IMPORTANT: Chatflow '{id}' already exists — use update_chatflow` note, the LLM is correctly
+oriented on every iteration without modifying any tool signatures or graph topology.
+
+`developer_feedback` (which may carry a selected approach label from the plan_approval
+interrupt) is also appended so the patch node acts on the developer's choice.
+
+**v2 patch node**: Unaffected — it uses programmatic CREATE vs UPDATE logic (not LLM) and
+already reads `chatflow_id` directly from state at line 1186.
+
+**Rejected alternatives**:
+- Modifying the system prompt to always mention chatflow_id: system prompts are static strings;
+  the chatflow_id is only known at runtime.
+- Adding a graph edge to re-run discover before patch: adds latency; discover already ran.
+
+---
+
+## DD-060 — Structured Plan `## APPROACHES` Section
+
+**Decision**: Instruct the plan node to emit an optional `## APPROACHES` section in the plan
+when two or more meaningfully different implementation strategies exist. The section lists
+numbered approaches with a short label and one-sentence description. A `_parse_plan_options()`
+helper extracts the labels via regex and adds them to `InterruptPayload.options`. The UI
+renders each option as a clickable card; selecting one and clicking "Approve Selected Approach"
+resumes the graph with `"approved - approach: <label>"`, which the v1 patch node reads from
+`developer_feedback` to execute the chosen strategy.
+
+**Reason**: During testing, the plan node produced plans with two alternatives (e.g. "UPDATE
+OR CREATE new chatflow") and the Approve button sent only the opaque string `"approved"` with
+no way for the developer to specify which path to take. The LLM then guessed. A structured
+approach list makes the choice explicit and machine-readable end-to-end.
+
+**Format contract**:
+```
+## APPROACHES
+1. Update existing: Locate the existing chatflow and apply targeted edits.
+2. Create fresh: Delete the old chatflow and build a new one from scratch.
+```
+Section omitted entirely when there is only one clear path.
+
+**Rejected alternatives**:
+- Separate clarification interrupt before plan: adds a full round-trip; approach selection
+  belongs at plan review time, not before the plan exists.
+- Freeform text parsing in the patch node: brittle; `## APPROACHES` + numbered list is a
+  well-defined, easily regex-parseable contract.
+
+---
+
+## DD-061 — Session Naming and UI Iteration Fixes (Roadmap 6)
+
+**Decision**: Bucket the following UI and agent quality-of-life improvements under a single DD
+to avoid proliferating low-signal entries:
+
+1. **Session names** (`session_name` in `AgentState`): At session creation, a single LLM
+   `complete()` call generates a 4–6 word display title. Stored in checkpointed state; editable
+   via `PATCH /sessions/{id}/name` (persists across refreshes using `aupdate_state()`). The
+   sidebar shows the name as the primary row title; thread UUID demoted to the secondary
+   `.s-meta` line. Pencil icon on hover opens an inline `<input>` that saves on Enter/blur and
+   cancels on Escape.
+
+2. **Session delete** (UI only): `DELETE /sessions/{id}` already existed. A trash icon button
+   added to each sidebar row (visible on hover) calls it with a confirmation dialog, removes
+   the session from `state.sessions`, and navigates to idle if the deleted session was active.
+
+3. **Rollback button on result_review**: The `human_result_review` node now recognises
+   `"rollback"` / `"revert"` as terminal responses (sets `done=True` with a rollback note).
+   A red "↩ Rollback" button alongside "✓ Accept" in the result_review interrupt card calls
+   `quickReply('rollback')` — no new API endpoint needed; `POST /sessions/{id}/rollback`
+   already exists.
+
+4. **Approach selection for plan_approval** (UI counterpart to DD-060): When
+   `InterruptPayload.options` is present, the UI renders selectable approach cards instead of
+   the plain "Approve Plan" button. Selecting a card enables "Approve Selected Approach"; the
+   resume payload becomes `"approved - approach: <label>"`.
+
+**Why one DD**: All four changes are UI/UX polish items that improve developer ergonomics
+without altering the core orchestration loop, state machine, or tool contracts. Bucketing them
+avoids fragmentation while preserving a traceable record of what was changed and why.
+
+---
+
+## DD-062 — Local-First Node Schema Snapshot (Roadmap 6, Milestone 1)
+
+**Decision**: Introduce a `FlowiseKnowledgeProvider` that loads `schemas/flowise_nodes.snapshot.json`
+at startup and provides O(1) node schema lookups. The `_make_patch_node_v2` Phase D loop, which
+previously called `execute_tool("get_node", ...)` for every new node type on every patch iteration,
+now reads from the local snapshot first. A targeted API call is made **only** when the requested
+`node_type` is absent from the snapshot (repair-only, not discovery-every-run).
+
+**Problem it solves**: Building a chatflow with three node types caused three sequential `get_node`
+API calls on every patch iteration. Node schemas are stable between Flowise releases — fetching
+them every run is wasteful by design.
+
+**Implementation**:
+
+- `flowise_dev_agent/knowledge/provider.py` — `NodeSchemaStore` loads the snapshot, validates its
+  SHA-256 fingerprint, and builds an in-memory `{node_type → schema}` index. On cache miss,
+  `get_or_repair()` calls the provided `api_fetcher` coroutine for that one node type only,
+  normalises the result to match the exact output shape of `_get_node_processed()` in tools.py,
+  patches the index, and persists to disk with a refreshed fingerprint.
+
+- `flowise_dev_agent/knowledge/refresh.py` — CLI job that parses `FLOWISE_NODE_REFERENCE.md`
+  (303 nodes, 24 categories) into the snapshot JSON. The markdown is **never loaded at runtime**.
+  Run: `python -m flowise_dev_agent.knowledge.refresh --nodes [--dry-run]`
+
+- `schemas/flowise_nodes.snapshot.json` — 303 node schema objects. Each entry: `node_type`,
+  `label`, `category`, `version`, `baseClasses`, `credential_required` (when present),
+  `inputAnchors`, `inputParams`, `outputAnchors`, `outputs`. Format exactly matches
+  `_get_node_processed()` output so `schema_cache` entries are structurally identical to
+  live API-fetched entries.
+
+- `schemas/flowise_nodes.meta.json` — SHA-256 fingerprint, `generated_at`, `source`, `node_count`.
+
+**Narrow integration points** (only two files edited):
+1. `FlowiseCapability.__init__` — instantiates `FlowiseKnowledgeProvider()` as `self._knowledge`,
+   exposed via a `knowledge` property.
+2. `_make_patch_node_v2` Phase D — replaces the `asyncio.gather(get_node...)` fan-out with a
+   per-name `node_store.get_or_repair()` call. Repair events written to
+   `debug["flowise"]["knowledge_repair_events"]`.
+
+**Version/schema-hash gating on repair**: `skip_same_version` (no overwrite), `update_changed_version_or_hash`,
+`update_no_version_info`, `update_new_node`. Prevents redundant disk writes when API and local agree.
+
+**`capabilities=None` legacy path**: `node_store` is `None` → falls back to the original
+`execute_tool("get_node", ...)` call. Pre-refactor behaviour preserved exactly.
+
+**Prompt hygiene**: Snapshot data is never injected into LLM prompts. `schema_cache` goes only
+to `compile_patch_ops()` (deterministic compiler), not to any message-building function.
+
+**Rejected alternatives**:
+- In-process TTL cache inside `_get_node_processed`: not durable across restarts, not inspectable.
+- System-prompt injection of all node schemas: violates the no-full-snapshot-injection constraint.
+- `list_nodes` at startup: returns slim objects only — full `inputs`/`outputAnchors` still needed.
+
+---
+
+## DD-063 — Marketplace Template Metadata Snapshot (Roadmap 6, Milestone 2)
+
+**Decision**: Extend `FlowiseKnowledgeProvider` with a `TemplateStore` that holds a
+metadata-only snapshot of the Flowise marketplace templates (no `flowData`).
+The plan node uses `TemplateStore.find()` to inject a brief hint (≤3 entries,
+description ≤120 chars) when templates are relevant to the requirement.
+
+**Problem it solves**: The plan phase previously had no awareness of existing templates,
+causing the agent to build chatflows from scratch that could have been imported as a
+template starting point.  The existing `list_marketplace_templates` tool call is avoided
+for agents that already have a local snapshot, preventing the ~1.7 MB API response on
+every planning cycle.
+
+**Implementation**:
+
+- `flowise_dev_agent/knowledge/provider.py` — `TemplateStore` class added after `NodeSchemaStore`.
+  Loads `schemas/flowise_templates.snapshot.json` lazily.  `is_stale(ttl_seconds)` reads
+  `generated_at` from `flowise_templates.meta.json`; default TTL 86400 s (overridable via
+  `TEMPLATE_SNAPSHOT_TTL_SECONDS` env var).  `find(tags, limit=3)` does case-insensitive
+  substring matching across `templateName`, `categories`, `usecases`, `description` and
+  returns ranked slim dicts.  `FlowiseKnowledgeProvider` gains a `template_store` property.
+
+- `flowise_dev_agent/knowledge/refresh.py` — `--templates` flag added.  `refresh_templates()`
+  calls `FlowiseClient.list_marketplace_templates()` via `asyncio.run()`, strips all fields
+  except `_TEMPLATE_SLIM_FIELDS` (`templateName`, `type`, `categories`, `usecases`,
+  `description`), writes snapshot + meta.  `--nodes` and `--templates` can be combined.
+
+- `schemas/flowise_templates.snapshot.json` — placeholder `[]` until first `--templates` run.
+- `schemas/flowise_templates.meta.json` — placeholder meta with `"status": "empty"`.
+
+**Narrow integration point** (one file edited):
+- `_make_plan_node()` — accepts optional `template_store: TemplateStore | None`.  Extracts
+  4+ char non-stop-word tokens from `state["requirement"]` (cap 15), calls `find()`, and
+  appends a one-paragraph hint to the plan context when matches exist.  Zero overhead when
+  snapshot is empty or `capabilities=None` (template_store is `None`).
+- `build_graph()` — extracts `template_store` from any capability that exposes
+  `cap.knowledge.template_store`; passes it to `_make_plan_node`.
+
+**Prompt-hygiene guardrail**: `find()` returns at most 3 slim entries; the full catalog is
+never injected.  Stale snapshots still serve cached results (debug log only — no errors).
+
+**`capabilities=None` legacy path**: `_template_store` remains `None` → `_make_plan_node`
+receives `None` → no hint injected.  Pre-refactor behaviour preserved exactly.
+
+**Refresh command**:
+```
+python -m flowise_dev_agent.knowledge.refresh --templates
+```
+Requires `FLOWISE_API_ENDPOINT` (defaults to `http://localhost:3000`) in environment.
+
+**Rejected alternatives**:
+- Per-request `list_marketplace_templates` API call in the plan node: requires network,
+  adds latency, returns 1.7 MB that must be stripped before injection.
+- Injecting all template names into the system prompt: violates no-full-snapshot-injection
+  constraint; templates change rarely — no value in per-request injection.
+
+---
+
+## DD-064 — Credential Metadata Snapshot (Roadmap 6, Milestone 3)
+
+**Decision**: Extend `FlowiseKnowledgeProvider` with a `CredentialStore` that holds an
+allowlisted snapshot of Flowise credential metadata.  `_make_patch_node_v2` uses
+`CredentialStore.resolve_or_repair()` in a new Phase C.2 to auto-fill empty
+`credential_id` fields on `BindCredential` ops before IR validation runs.
+
+**Problem it solves**: The `BindCredential` op requires the developer or LLM to provide
+the credential UUID.  The LLM reliably knows the *type* (e.g. `"openAIApi"`) but frequently
+omits the UUID (which requires a `list_credentials` call to discover).  With local-first
+resolution, the UUID is available in O(1) from the snapshot — no API call needed when the
+credential was previously fetched.
+
+**Security contract** (hard, non-negotiable):
+The snapshot allowlist — `credential_id`, `name`, `type`, `tags`, `created_at`, `updated_at`
+— is enforced at three layers:
+1. **Refresh job** (`_normalize_credential_api`): strips all non-allowlisted keys before
+   writing.  The job then re-validates and aborts if any banned key survived.
+2. **CredentialStore._load()**: validates allowlist on every load; strips defensively and
+   logs an error if violations are found (so a tampered snapshot is not silently used).
+3. **CredentialStore._persist()**: final strip before every disk write (repair path).
+
+The snapshot **MUST NOT be committed to git** — it contains live instance credential IDs
+and names that are machine-specific.  See `.gitignore`.
+
+**`--validate` CI lint step**:
+```
+python -m flowise_dev_agent.knowledge.refresh --credentials --validate
+```
+Reads the existing snapshot, checks for banned keys, exits 1 on any violation.
+Zero API calls — safe to run in CI.
+
+**Implementation**:
+
+- `flowise_dev_agent/knowledge/provider.py` — `_CRED_ALLOWLIST` frozenset (6 keys);
+  `_normalize_credential()` handles both API shape and snapshot shape; `_validate_allowlist()`
+  returns violation messages; `CredentialStore` class with:
+  - `_by_id`, `_by_name`, `_by_type` indices (built lazily at load time).
+  - `resolve(name_or_type_or_id)`: sync, O(1), tries id → name → type.
+  - `resolve_or_repair(q, api_fetcher)`: async, falls back to `list_credentials` API on miss,
+    normalises + persists, retries.
+  - `is_stale(ttl_seconds)`: reads `generated_at` from meta; default TTL 3600 s
+    (`CREDENTIAL_SNAPSHOT_TTL_SECONDS` env var).
+  - `FlowiseKnowledgeProvider` gains `credential_store` property.
+
+- `flowise_dev_agent/knowledge/refresh.py` — `--credentials` flag:
+  `_normalize_credential_api()` maps Flowise API fields to snapshot fields;
+  `validate_credential_snapshot()` is the CI lint function;
+  `refresh_credentials(dry_run, validate_only)` fetches + normalises + diff + writes.
+  `--validate` flag runs lint only (no API call, no write).
+
+- `schemas/flowise_credentials.snapshot.json` — placeholder `[]` (gitignored).
+- `schemas/flowise_credentials.meta.json` — placeholder meta (gitignored).
+
+**Narrow integration point** (one existing function restructured):
+- `_make_patch_node_v2` Phase C restructured into C.1 (parse) → C.2 (credential resolution)
+  → C.3 (IR validation).  C.2 iterates `BindCredential` ops with empty `credential_id`,
+  calls `resolve_or_repair()`, and mutates `op.credential_id` in-place so that C.3
+  (which checks `if not op.credential_id`) sees the filled-in value.
+- Resolved credentials written to `facts["flowise"]["resolved_credentials"]` map.
+- Credential repair events written to `debug["flowise"]["credential_repair_events"]`.
+- `BindCredential` imported into `graph.py` (previously only referenced in string prompts).
+
+**`capabilities=None` legacy path**: `_cred_store` is `None` → Phase C.2 is a no-op →
+all behaviour identical to pre-refactor.
+
+**Repair fallback**: calls `execute_tool("list_credentials", {}, discover_executor)` — the
+same executor used by Phase D for node schemas.  Result is normalised to allowlist before
+any index update or disk write.  Exactly one API call per miss.
+
+**Refresh command**:
+```
+python -m flowise_dev_agent.knowledge.refresh --credentials [--dry-run]
+python -m flowise_dev_agent.knowledge.refresh --credentials --validate  # CI lint
+```
+Requires `FLOWISE_API_ENDPOINT` (defaults to `http://localhost:3000`) in environment.
+
+**Rejected alternatives**:
+- Storing full encrypted credential data: violates security contract; Flowise already
+  handles encryption — the agent only needs the ID for binding, not the secret.
+- Per-patch `list_credentials` call: adds network latency every iteration; credentials
+  change infrequently (user-action required) so caching is appropriate.
+
+---
+
+## DD-065 — Workday Knowledge Provider Stubs (Roadmap 6, Milestone 4)
+
+**Decision**: Introduce `WorkdayKnowledgeProvider`, `WorkdayMcpStore`, and `WorkdayApiStore`
+in `flowise_dev_agent/knowledge/workday_provider.py` as explicit stubs.  All public lookup
+methods raise `NotImplementedError`.  Four stub snapshot files (`workday_mcp.snapshot.json`,
+`workday_mcp.meta.json`, `workday_api.snapshot.json`, `workday_api.meta.json`) are committed
+with `status: stub`.  The refresh CLI gains `--workday-mcp` and `--workday-api` as no-op
+flags that exit 0 and print an informative message.
+
+**Why stubs, not nothing**:
+- Committing the scaffold avoids a "big-bang" Milestone 5 PR that mixes new
+  architecture with a provider implementation — reviewers can evaluate each layer
+  independently.
+- The `NotImplementedError` contract is an explicit promise: callers that
+  accidentally wire `WorkdayCapability` into `build_graph` will get an immediate,
+  descriptive error rather than silent fallback to empty data.
+- Stub meta files (`status: stub`) let tooling (CI, health checks) detect that
+  Workday knowledge is intentionally unpopulated without treating it as a missing file.
+- No-op CLI flags let the refresh job be invoked with `--workday-mcp --workday-api`
+  in scripts that will work correctly once real implementations land in Milestone 5+.
+
+**Structure**:
+- `WorkdayMcpStore` — future: Workday MCP endpoint metadata (loaded from
+  `schemas/workday_mcp.snapshot.json`).
+- `WorkdayApiStore` — future: Workday REST/SOAP API endpoint metadata (loaded from
+  `schemas/workday_api.snapshot.json`).
+- `WorkdayKnowledgeProvider` — mirrors `FlowiseKnowledgeProvider` pattern; holds both
+  sub-stores; safe to instantiate (no network I/O, no errors on construction).
+- `_stub_meta()` helper on each store: non-raising; reads the on-disk meta for
+  informational use (e.g. health check endpoints).
+
+**Integration points (deferred to Milestone 5+)**:
+- `WorkdayCapability` in `agent/domains/workday.py` will accept a
+  `WorkdayKnowledgeProvider` instance once real data is available.
+- `build_graph(capabilities=[..., WorkdayCapability()])` — no graph.py changes needed.
+
+**Rejected alternatives**:
+- Implementing real Workday data in M4: Workday API schema is complex and
+  environment-specific; stub-first keeps M4 small and reviewable.
+- Leaving workday_provider.py absent until M5: makes the M5 PR harder to review
+  and removes the `NotImplementedError` guardrail that prevents accidental use.
+
+---
+
+## DD-066 — Capability-First Default Runtime (Roadmap 7, Milestone 7.1)
+
+**Decision**: Make the DomainCapability path (`capabilities=[FlowiseCapability(...)]`) the
+default at graph construction time. The legacy DomainTools merge path is retained but
+opt-in only via the `FLOWISE_COMPAT_LEGACY` env var. A `runtime_mode` field is added to
+`AgentState` and surfaced in `GET /sessions` so operators can confirm which path a session used.
+
+**Why change the default now**:
+- The capability path has been production-ready since Milestone 1 (Roadmap 3), but
+  `build_graph(capabilities=None)` remained the default because callers explicitly opted in.
+  Roadmap 7 makes cross-domain work (Workday MCP, PlanContract) depend on the capability
+  path, so "opt-in" is no longer the right posture.
+- Keeping the legacy path available via env var gives operators a zero-risk escape hatch
+  during rollout without requiring code changes.
+
+**Implementation**:
+- `_COMPAT_LEGACY: bool` — module-level constant in `api.py`, reads `FLOWISE_COMPAT_LEGACY`
+  env var at import time.  `"1"`, `"true"`, `"yes"` (case-insensitive) activate legacy mode.
+- `make_default_capabilities(engine, domains)` — new public factory in `graph.py`.
+  Encapsulates `_build_system_prompt(_DISCOVER_BASE, ...)` so `api.py` does not import
+  private graph helpers.
+- `AgentState.runtime_mode: str | None` — set once at session creation from `app.state.runtime_mode`.
+  Values: `"capability_first"` | `"compat_legacy"`.  Never mutated after creation.
+- `SessionSummary.runtime_mode` — exposed in `GET /sessions` for observability.
+
+**Guard: no new logic in legacy path**:
+The `build_graph()` signature is unchanged.  No new branches are added inside the legacy
+`discover_legacy` / `_make_patch_node` nodes.  `capabilities=None` produces byte-identical
+behaviour to all pre-Roadmap-7 sessions.
+
+**Rejected alternatives**:
+- Hard-removing the legacy path: too risky before cross-domain features are validated in
+  production; legacy path may be needed for regression testing.
+- Runtime toggle via API request body: env var is the right boundary — the routing mode
+  is an operator/deployment concern, not a per-session developer input.
+
+---
+
+## DD-067 — Cross-Domain PlanContract + TestSuite (Roadmap 7, Milestone 7.2)
+
+**Decision**: Extend the plan node to parse a structured `PlanContract` dataclass from the
+LLM plan output and store it as `facts["flowise"]["plan_contract"]`.  Extend `TestSuite`
+with `domain_scopes` and `integration_tests` fields.  Extend the converge node to inject
+`success_criteria` from the contract into the verdict prompt so the LLM references concrete,
+developer-approved conditions rather than re-deriving them.
+
+**PlanContract fields**:
+- `goal` — one-sentence chatflow description (from `1. GOAL`).
+- `domain_targets` — domains involved (e.g. `["flowise"]` or `["flowise","workday"]`).
+- `credential_requirements` — exact Flowise credentialName values required.
+- `data_fields` / `pii_fields` — fields crossing domain boundaries; PII subset flagged.
+- `success_criteria` — testable conditions from `5. SUCCESS CRITERIA` bullet items.
+- `action` — `"CREATE"` (chatflow_id absent) or `"UPDATE"` (chatflow_id present).
+- `raw_plan` — verbatim plan text for audit.
+
+**Machine-readable sections added to `_PLAN_BASE`**:
+Three sections appended after the optional `## APPROACHES` block:
+`## DOMAINS`, `## CREDENTIALS`, `## DATA_CONTRACTS`.  The LLM is instructed
+to emit them verbatim at the end of every plan.  The parser is tolerant: absent
+or `(none)` sections default to empty lists and never raise.
+
+**Why store in `facts["flowise"]` rather than a new top-level field**:
+- `facts` already uses `_merge_domain_dict` — writing `{"flowise": {...}}` preserves
+  other domain entries (e.g. `"workday"`) without coordination between nodes.
+- Avoids adding a new top-level field to `AgentState` for every new structured output.
+- Consistent with DD-050 (state trifurcation): `facts` is the right layer for
+  structured, machine-readable data (not `debug`, not `messages`).
+
+**Why inject success_criteria in converge context rather than system prompt**:
+The `_CONVERGE_BASE` system prompt is static and shared.  Injecting criteria as a
+`role="user"` message keeps the system prompt clean and allows per-session criteria
+without recompiling the graph.  The criteria text is clearly labelled as coming from
+the developer-approved plan contract to distinguish it from the LLM's own reasoning.
+
+**TestSuite extensions**:
+- `domain_scopes: list[str]` — which DomainCapabilities' tests run for this suite.
+  Empty list = only the owning domain.  Enables future cross-domain test orchestration.
+- `integration_tests: list[str]` — freeform cross-domain scenario strings.
+  Both fields have `field(default_factory=list)` so all existing call-sites are unaffected.
+
+**Rejected alternatives**:
+- Storing `PlanContract` as a separate top-level `AgentState` field: adds schema
+  surface area for every new structured output; `facts` is already the right place.
+- Parsing success criteria from the system prompt at converge time: brittle — the
+  system prompt is static and doesn't reflect the per-session developer-approved plan.
+- Making `domain_scopes` required in `TestSuite`: would break every existing
+  `generate_tests()` call site; default-to-empty is the correct migration strategy.
+
+---
+
+## DD-068 — PatternCapability Upgrade (Roadmap 7, Milestone 7.3)
+
+**Decision**: Extend the pattern library with structured metadata columns (domain, node_types,
+category, schema_fingerprint, last_used_at), a filtered search method, and an
+`apply_as_base_graph()` method that seeds patch v2 with a prior pattern's GraphIR.
+The plan node searches the library before LLM planning; patch v2 reads the result
+from `artifacts["flowise"]["base_graph_ir"]` to reduce unnecessary AddNode ops.
+
+**Schema migration strategy**:
+`PatternStore.setup()` calls `_migrate_schema()` which reads `PRAGMA table_info(patterns)`,
+detects absent columns, and issues `ALTER TABLE patterns ADD COLUMN` for each missing one.
+This is safe to re-run on any existing DB (idempotent) and future-proof (new columns added
+to `_M73_COLUMNS` list will be picked up automatically). Fresh DBs receive all columns via
+the updated `_CREATE_TABLE` DDL.  No data is lost during migration.
+
+**New columns**:
+- `domain TEXT DEFAULT 'flowise'` — which DomainCapability produced the pattern.
+- `node_types TEXT DEFAULT ''` — JSON array string of node type names in the chatflow.
+- `category TEXT DEFAULT ''` — chatflow category from `6. PATTERN` section of the plan.
+- `schema_fingerprint TEXT DEFAULT ''` — `NodeSchemaStore.meta_fingerprint` at save time.
+- `last_used_at REAL DEFAULT NULL` — Unix timestamp set by `apply_as_base_graph()`.
+
+**`search_patterns_filtered()` design**:
+- SQL WHERE on `domain` and `category` (exact match).
+- Keyword scoring (same CASE/LIKE technique as `search_patterns()`) for ranking.
+- `node_types` filter is Python-side after fetch (JSON array overlap check) because
+  SQLite JSON functions are not guaranteed across all deployment environments.
+- When no keywords are provided it falls back to success_count ordering (no crash).
+
+**`apply_as_base_graph()` design**:
+- Fetches `flow_data` then calls `GraphIR.from_flow_data()` — same parser used by
+  the legacy `get_chatflow` path, ensuring identical node representation.
+- Increments `success_count` and sets `last_used_at` on every call.
+- Returns empty `GraphIR()` on missing ID or empty flow_data (never raises).
+- Local import `from flowise_dev_agent.agent.compiler import GraphIR` avoids
+  a module-level circular dependency: `pattern_store → compiler → patch_ir`.
+
+**Plan node integration**:
+- Keywords are extracted before the template-hint block (not inside it) so the same
+  keyword list is reused for both template matching and pattern search.
+- Pattern search only runs on iteration 0 of CREATE flows (`chatflow_id` absent)
+  to avoid incorrectly seeding an UPDATE iteration with stale base nodes.
+- Failure of the pattern search is non-fatal (logged as warning, no interrupt).
+- Result stored as `artifacts["flowise"]["base_graph_ir"]` using the existing
+  `_merge_domain_dict` reducer — preserves other artifact keys.
+
+**Patch v2 Phase A integration**:
+- Pattern-seeded base graph is used only when `chatflow_id` is absent (the `else`
+  branch of the existing `if chatflow_id` check — no existing logic changed).
+- When seed is applied, Phase B context includes an explicit note telling the LLM
+  NOT to re-add the seeded nodes, only to emit ops for missing nodes/params.
+
+**Converge enrichment**:
+- `_make_converge_node` now accepts `capabilities` (default `None`) — backward compat.
+- `node_types` derived from `flow_data` nodes' `data.name` fields.
+- `category` parsed from `6. PATTERN` section of the approved plan text.
+- `schema_fingerprint` read from `FlowiseCapability.knowledge.node_schemas.meta_fingerprint`
+  (the new `NodeSchemaStore.meta_fingerprint` property added in this milestone).
+
+**`NodeSchemaStore.meta_fingerprint` property**:
+Added to `provider.py`.  Reads `fingerprint` (or falls back to `sha256`) from the
+`.meta.json` file without triggering a full snapshot `_load()`.  Returns `None` when
+the file is absent or malformed.  Used exclusively for pattern enrichment metadata.
+
+**Rejected alternatives**:
+- SQLite `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`: only available in SQLite 3.37.0+
+  (2021-11-27); PRAGMA table_info approach works on all SQLite versions ≥ 3.0.
+- Python-side JSON overlap for `node_types` in SQL (JSON_EACH): would require
+  enabling the JSON1 extension, which is not guaranteed on all deployment targets.
+- Storing `base_graph_ir` as a new top-level `AgentState` field: `artifacts["flowise"]`
+  is already the right layer for domain-scoped produced references (DD-050).
+
+---
+
+## DD-069 — Drift Management + Telemetry Hardening (Roadmap 7, M7.4)
+
+**Context**: No per-phase timing or drift management existed.  Only cumulative
+`total_input_tokens`/`total_output_tokens` were tracked.  Schema snapshots could be
+refreshed between iterations with no detection or guard.
+
+**`PhaseMetrics` dataclass** (`agent/metrics.py`):
+Immutable snapshot of one graph-node phase.  Fields:
+- `phase` — name: "discover" | "patch_b" | "patch_d" | "test" | "converge"
+- `start_ts` / `end_ts` / `duration_ms` — wall-clock timing
+- `input_tokens` / `output_tokens` — LLM token counts for phases with an LLM call
+- `tool_call_count` — number of domain tool dispatches (discover phase)
+- `cache_hits` — schema/credential lookups served from snapshot (Phase D)
+- `repair_events` — API fallback count (Phase D: cache miss → targeted repair call)
+
+All fields are `int` or `float` primitives — JSON-serialisable via `dataclasses.asdict()`.
+
+**`MetricsCollector`** (`agent/metrics.py`):
+Async context manager.  Caller sets counter attributes inside the `async with` block;
+`__aexit__` finalizes into a `PhaseMetrics`.  Accessor: `m.to_dict()` returns the dict
+for state merging.  The collector is *stateless with respect to LangGraph* — nodes
+collect dicts and append them to `debug["flowise"]["phase_metrics"]` in their return.
+
+**Instrumented nodes / sub-phases**:
+
+| Phase | Counters recorded |
+|-------|-------------------|
+| `discover_capability` | `tool_call_count` (successful cap calls) |
+| `patch_b` (LLM ops generation) | `input_tokens`, `output_tokens` |
+| `patch_d` (schema resolution) | `cache_hits`, `repair_events` |
+| `test` (LLM evaluation) | `input_tokens`, `output_tokens` |
+| `converge` (LLM verdict) | `input_tokens`, `output_tokens` |
+
+**State storage**: `debug["flowise"]["phase_metrics"]` — a list of `PhaseMetrics`
+dicts, appended per-node using the existing `_merge_domain_dict` reducer.
+
+**`FLOWISE_SCHEMA_DRIFT_POLICY`** env var:
+Read once at module import time into `_SCHEMA_DRIFT_POLICY` (graph.py).  Values:
+- `"warn"` (default) — logs a warning, continues normally.
+- `"fail"` — appends a `tool_result` error message and returns early from Phase D;
+  the LLM sees the error and ITERATE is forced on the next converge.
+- `"refresh"` — logs and continues (refresh scheduling is future work).
+
+Drift is detected in Phase D by comparing the current `NodeSchemaStore.meta_fingerprint`
+against `facts["flowise"]["schema_fingerprint"]` (written by the prior iteration).
+No drift check occurs on the first iteration (prior fingerprint is absent).
+
+**Fingerprint persistence**: After each Phase D, the current `meta_fingerprint` is
+written to `facts["flowise"]["schema_fingerprint"]`.  This uses the existing
+`_phase_c_facts` dict that already carries `resolved_credentials`; merging is done
+with a dict spread so no existing fact keys are overwritten.
+
+**`SessionSummary` additions** (`api.py`):
+- `total_repair_events: int` — sum of `repair_events` across all phase_metrics dicts.
+- `total_phases_timed: int` — count of phase_metrics entries.
+Both are extracted in `list_sessions()` from `debug["flowise"]["phase_metrics"]`.
+
+**Rejected alternatives**:
+- Writing phase_metrics directly to a top-level `AgentState` field: would require a
+  new reducer and a new field in the TypedDict — unnecessary complexity when
+  `debug["flowise"]` is already the right layer for domain-scoped telemetry (DD-050).
+- Auto-flushing from `MetricsCollector.__aexit__` into state: requires passing
+  mutable state into the context manager, which conflicts with LangGraph's
+  immutable-state-update pattern (nodes return dicts, not mutate state in place).
+- Calculating `cache_hits` as `len(schema_cache)`: schema_cache only contains
+  hits, so the formula `len(new_node_names) - len(_phase_d_repair_events)` is used
+  instead, which correctly counts snapshot-served hits vs. API-repaired ones.
+
+---
+
+## DD-070 — Workday Custom MCP Blueprint Approach (Roadmap 7, Milestone 7.5)
+
+**Decision**: Workday integration uses Flowise's built-in `customMCP` selected_tool
+configuration inside a standard Tool node, driven by a local blueprint snapshot.
+No live Workday MCP endpoint discovery (`tools/list`) is performed at compile time.
+
+**Key wiring parameters**:
+- `selectedTool = "customMCP"` — Flowise's generic MCP adapter
+- `selectedToolConfig.mcpServerConfig` = **STRINGIFIED JSON** with `url` and
+  `headers.Authorization` — must be a string, not a nested object
+- `selectedToolConfig.mcpActions` = `["getMyInfo", "searchForWorker", "getWorkers"]`
+- `credential_type = "workdayOAuth"` — resolved to real UUID by Phase C at patch time
+- `chatflow_only = true` — agentflow wiring is not supported
+
+**Blueprint snapshot**: `schemas/workday_mcp.snapshot.json` — a JSON array of
+blueprint dicts keyed by `blueprint_id`.  Refreshed via:
+`python -m flowise_dev_agent.knowledge.refresh --workday-mcp`
+
+**`compile_ops()` produces deterministic Patch IR** (no LLM call):
+1. `AddNode(node_name="tool", node_id="workdayMcpTool_0", params={...})`
+2. `BindCredential(node_id="workdayMcpTool_0", credential_id="workday-oauth-auto", ...)`
+
+The `credential_id` placeholder is overwritten by Phase C of `_make_patch_node_v2`
+when the real Workday OAuth credential is resolved from `CredentialStore`.
+
+**`discover()` is blueprint-driven** (no live MCP calls):
+- Loads `workday_default` blueprint from `WorkdayMcpStore`
+- Returns structured facts: `mcp_mode`, `mcp_actions`, `mcp_server_url`, `auth_var`,
+  `credential_type`, `oauth_credential_id`
+- Falls back to module-level constants when the snapshot is empty
+
+**Rejected alternatives**:
+- Live `tools/list` MCP discovery: requires a running Workday MCP server at compile
+  time, adding a hard runtime dependency with no obvious benefit given the fixed
+  action set.
+- Dedicated `workdayMCP` Flowise node: does not exist in the node registry; using
+  `customMCP` inside the standard Tool node is the correct Flowise pattern.
+- Agentflow wiring: the Workday MCP actions are read-only lookup operations that
+  fit naturally into a chatflow Tool node, not an agentic workflow.
+
+**Files**:
+- `schemas/workday_mcp.snapshot.json` — blueprint data
+- `flowise_dev_agent/knowledge/workday_provider.py` — `WorkdayMcpStore` (real)
+- `flowise_dev_agent/agent/domains/workday.py` — `WorkdayCapability.discover()` + `.compile_ops()`
+- `flowise_dev_agent/knowledge/refresh.py` — `refresh_workday_mcp()` (real)
+- `tests/test_workday_mcp_integration.py` — 46 smoke tests

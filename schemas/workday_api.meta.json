@@ -1,0 +1,9 @@
+{
+  "snapshot_file": "schemas/workday_api.snapshot.json",
+  "generated_at": "2026-02-24T01:30:27.490747Z",
+  "source": "stub",
+  "item_count": 0,
+  "fingerprint": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+  "status": "stub",
+  "note": "Milestone 4 placeholder — WorkdayApiStore is not yet implemented. Run: python -m flowise_dev_agent.knowledge.refresh --workday-api when available."
+}

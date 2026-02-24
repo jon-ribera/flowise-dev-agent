@@ -3,6 +3,7 @@
 Usage:
     python -m flowise_dev_agent.knowledge.refresh --nodes
     python -m flowise_dev_agent.knowledge.refresh --nodes --dry-run
+    python -m flowise_dev_agent.knowledge.refresh --nodes --validate
     python -m flowise_dev_agent.knowledge.refresh --templates
     python -m flowise_dev_agent.knowledge.refresh --templates --dry-run
     python -m flowise_dev_agent.knowledge.refresh --credentials
@@ -445,11 +446,87 @@ def _diff_nodes(
 
 
 # ---------------------------------------------------------------------------
+# Snapshot integrity validation
+# ---------------------------------------------------------------------------
+
+
+def validate_nodes_snapshot(schemas: list[dict]) -> list[str]:
+    """Validate a list of node schema dicts for structural integrity.
+
+    Checks performed (all are CI-blocking):
+    1. outputAnchors — every node must have at least one output anchor.
+    2. version — must be parseable as float (stored as string in markdown but
+       the compiler converts it; the string itself must be numeric).
+    3. Anchor ID format — all inputAnchor, inputParam, and outputAnchor IDs must
+       contain the '{nodeId}' placeholder so the compiler can substitute the
+       actual instance ID (e.g. 'chatOpenAI_0').
+    4. No duplicate node_type values — each node name must be unique.
+    5. Anchor ID prefix — inputAnchor/inputParam IDs must start with
+       '{nodeId}-input-' and outputAnchor IDs with '{nodeId}-output-'.
+
+    Returns a list of error strings (empty = passed).
+    """
+    errors: list[str] = []
+    seen_types: dict[str, int] = {}
+
+    for i, node in enumerate(schemas):
+        name = node.get("node_type") or node.get("name") or f"<index {i}>"
+
+        # 1. outputAnchors required
+        oa = node.get("outputAnchors") or []
+        if not oa:
+            errors.append(f"[{name}] outputAnchors is empty — compiler cannot build source handles")
+
+        # 2. version must be parseable as float
+        v = node.get("version")
+        if v is not None:
+            try:
+                float(v)
+            except (TypeError, ValueError):
+                errors.append(f"[{name}] version={v!r} is not parseable as float")
+
+        # 3 + 5. Anchor ID format checks
+        for group_key, direction in (
+            ("inputAnchors", "input"),
+            ("inputParams", "input"),
+            ("outputAnchors", "output"),
+        ):
+            for anchor in node.get(group_key) or []:
+                aid = anchor.get("id", "")
+                aname = anchor.get("name", "?")
+                if not aid:
+                    errors.append(f"[{name}] {group_key}/{aname}: id is empty")
+                    continue
+                if "{nodeId}" not in aid:
+                    errors.append(
+                        f"[{name}] {group_key}/{aname}: id={aid!r} missing {{nodeId}} placeholder"
+                    )
+                expected_prefix = f"{{nodeId}}-{direction}-"
+                if not aid.startswith(expected_prefix):
+                    errors.append(
+                        f"[{name}] {group_key}/{aname}: id={aid!r} "
+                        f"does not start with '{expected_prefix}'"
+                    )
+
+        # 4. Duplicate node_type
+        key = node.get("node_type") or node.get("name")
+        if key:
+            if key in seen_types:
+                errors.append(
+                    f"[{name}] duplicate node_type — also at index {seen_types[key]}"
+                )
+            else:
+                seen_types[key] = i
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # Main refresh command
 # ---------------------------------------------------------------------------
 
 
-def refresh_nodes(dry_run: bool = False) -> int:
+def refresh_nodes(dry_run: bool = False, validate: bool = False) -> int:
     """Parse FLOWISE_NODE_REFERENCE.md and write the node snapshot.
 
     Returns exit code (0 = success, 1 = error).
@@ -510,6 +587,21 @@ def refresh_nodes(dry_run: bool = False) -> int:
     logger.info("Written: %s", _NODES_SNAPSHOT)
     logger.info("Written: %s", _NODES_META)
     logger.info("Fingerprint: %s", meta["fingerprint"][:16] + "…")
+
+    if validate:
+        validation_errors = validate_nodes_snapshot(schemas)
+        if validation_errors:
+            print(f"\n[nodes] VALIDATION FAILED — {len(validation_errors)} error(s):")
+            for err in validation_errors:
+                print(f"  \u2717 {err}")
+            logger.error(
+                "Node snapshot validation FAILED — %d error(s). "
+                "Fix FLOWISE_NODE_REFERENCE.md and re-run refresh --nodes.",
+                len(validation_errors),
+            )
+            return 1
+        print(f"\n[nodes] Validation PASS — {len(schemas)} nodes, all checks OK")
+
     return 0
 
 
@@ -971,6 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
 Examples:
   python -m flowise_dev_agent.knowledge.refresh --nodes
   python -m flowise_dev_agent.knowledge.refresh --nodes --dry-run
+  python -m flowise_dev_agent.knowledge.refresh --nodes --validate
   python -m flowise_dev_agent.knowledge.refresh --templates
   python -m flowise_dev_agent.knowledge.refresh --credentials
   python -m flowise_dev_agent.knowledge.refresh --credentials --dry-run
@@ -1007,8 +1100,11 @@ Examples:
         "--validate",
         action="store_true",
         help=(
-            "CI lint mode: check the existing credential snapshot for banned keys. "
-            "No API call, no write. Use with --credentials. Exits 1 on any violation."
+            "CI lint mode. With --nodes: run structural integrity checks on the freshly "
+            "written node snapshot (outputAnchors present, versions numeric, anchor ID "
+            "format, no duplicates) — exits 1 on any failure. "
+            "With --credentials: check the existing credential snapshot for banned keys "
+            "(no API call, no write) — exits 1 on any violation."
         ),
     )
     parser.add_argument(
@@ -1052,7 +1148,7 @@ Examples:
 
     exit_code = 0
     if args.nodes:
-        exit_code = max(exit_code, refresh_nodes(dry_run=args.dry_run))
+        exit_code = max(exit_code, refresh_nodes(dry_run=args.dry_run, validate=args.validate))
     if args.templates:
         exit_code = max(exit_code, refresh_templates(dry_run=args.dry_run))
     if args.credentials:

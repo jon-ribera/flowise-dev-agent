@@ -195,6 +195,8 @@ class NodeSchemaStore:
         self._index: dict[str, dict] = {}
         self._repair_events: list[dict[str, Any]] = []
         self._loaded = False
+        # M8.2: total get_or_repair calls this session (cache hits + misses)
+        self._call_count: int = 0
 
     # ------------------------------------------------------------------
     # Loading
@@ -300,6 +302,7 @@ class NodeSchemaStore:
         or None if both local lookup and API repair fail.
         """
         self._load()
+        self._call_count += 1  # M8.2: count every call (hits + misses)
 
         # --- Fast path: local snapshot hit ---
         local = self._index.get(node_type)

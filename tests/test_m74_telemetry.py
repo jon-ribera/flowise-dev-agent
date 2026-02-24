@@ -344,3 +344,69 @@ class TestPhaseMetricsDebugAccumulation:
 
         assert m_d.result.repair_events == 0
         assert m_d.result.cache_hits == 3
+
+
+# ---------------------------------------------------------------------------
+# Test group 6 — M8.2: SessionSummary telemetry fields
+# ---------------------------------------------------------------------------
+
+
+class TestSessionSummaryM82Telemetry:
+    """SessionSummary must include knowledge_repair_count, get_node_calls_total,
+    and phase_durations_ms (M8.2)."""
+
+    def test_session_summary_has_m82_fields(self):
+        """All three M8.2 fields must be present on SessionSummary."""
+        from flowise_dev_agent.api import SessionSummary
+
+        s = SessionSummary(thread_id="t1", status="completed")
+        assert hasattr(s, "knowledge_repair_count"), "Missing knowledge_repair_count"
+        assert hasattr(s, "get_node_calls_total"), "Missing get_node_calls_total"
+        assert hasattr(s, "phase_durations_ms"), "Missing phase_durations_ms"
+
+    def test_session_summary_m82_defaults(self):
+        """M8.2 fields default to 0 / empty dict."""
+        from flowise_dev_agent.api import SessionSummary
+
+        s = SessionSummary(thread_id="t1", status="completed")
+        assert s.knowledge_repair_count == 0
+        assert s.get_node_calls_total == 0
+        assert s.phase_durations_ms == {}
+
+    def test_session_summary_m82_populated(self):
+        """M8.2 fields accept non-default values."""
+        from flowise_dev_agent.api import SessionSummary
+
+        s = SessionSummary(
+            thread_id="t1",
+            status="completed",
+            knowledge_repair_count=3,
+            get_node_calls_total=12,
+            phase_durations_ms={"patch_d": 420.5, "discover": 1100.0},
+        )
+        assert s.knowledge_repair_count == 3
+        assert s.get_node_calls_total == 12
+        assert s.phase_durations_ms["patch_d"] == 420.5
+        assert s.phase_durations_ms["discover"] == 1100.0
+
+    def test_node_schema_store_call_count(self):
+        """NodeSchemaStore._call_count increments on every get_or_repair call."""
+        from flowise_dev_agent.knowledge.provider import NodeSchemaStore
+
+        store = NodeSchemaStore.__new__(NodeSchemaStore)
+        store._index = {"chatOpenAI": {"name": "chatOpenAI"}}
+        store._meta = {}
+        store._repair_events = []
+        store._loaded = True
+        store._call_count = 0
+
+        import asyncio
+
+        async def _run():
+            # Two cache-hit calls
+            await store.get_or_repair("chatOpenAI", api_fetcher=None)
+            await store.get_or_repair("chatOpenAI", api_fetcher=None)
+            return store._call_count
+
+        count = asyncio.get_event_loop().run_until_complete(_run())
+        assert count == 2, f"Expected 2 calls, got {count}"

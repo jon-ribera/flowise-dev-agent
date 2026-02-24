@@ -286,6 +286,9 @@ class SessionSummary(BaseModel):
     runtime_mode: str | None = Field(None, description="'capability_first' or 'compat_legacy' — routing mode used for this session (M7.1).")
     total_repair_events: int = Field(0, description="Total schema/credential repair events this session (M7.4).")
     total_phases_timed: int = Field(0, description="Number of phases with captured timing data (M7.4).")
+    knowledge_repair_count: int = Field(0, description="Node schema repairs triggered this session (M8.2).")
+    get_node_calls_total: int = Field(0, description="Total get_node calls served from local cache this session (M8.2).")
+    phase_durations_ms: dict[str, float] = Field(default_factory=dict, description="Per-phase wall-clock durations in ms (M8.2).")
 
 
 class RenameSessionRequest(BaseModel):
@@ -781,15 +784,25 @@ async def list_sessions(request: Request) -> list[SessionSummary]:
             else:
                 status = "in_progress"
 
-            # M7.4: extract phase_metrics telemetry from debug state
-            _phase_metrics: list = (
-                (sv.get("debug") or {}).get("flowise", {}).get("phase_metrics") or []
-            )
+            # M7.4 / M8.2: extract phase_metrics telemetry from debug state
+            _flowise_debug: dict = (sv.get("debug") or {}).get("flowise", {}) or {}
+            _phase_metrics: list = _flowise_debug.get("phase_metrics") or []
             _repair_events = sum(
                 m.get("repair_events", 0)
                 for m in _phase_metrics
                 if isinstance(m, dict)
             )
+            # M8.2: knowledge_repair_count from explicit repair events list length
+            _kr_events: list = _flowise_debug.get("knowledge_repair_events") or []
+            _knowledge_repair_count = len(_kr_events)
+            # M8.2: get_node_calls_total accumulated across all patch iterations
+            _get_node_calls: int = _flowise_debug.get("get_node_calls_total", 0) or 0
+            # M8.2: phase_durations_ms — map phase name to duration for each timed phase
+            _phase_durations: dict[str, float] = {
+                m["phase"]: m.get("duration_ms", 0.0)
+                for m in _phase_metrics
+                if isinstance(m, dict) and "phase" in m
+            }
             summaries.append(SessionSummary(
                 thread_id=tid,
                 status=status,
@@ -801,6 +814,9 @@ async def list_sessions(request: Request) -> list[SessionSummary]:
                 runtime_mode=sv.get("runtime_mode"),
                 total_repair_events=_repair_events,
                 total_phases_timed=len(_phase_metrics),
+                knowledge_repair_count=_knowledge_repair_count,
+                get_node_calls_total=_get_node_calls,
+                phase_durations_ms=_phase_durations,
             ))
         except Exception as e:
             logger.warning("Could not read state for thread %s: %s", tid, e)

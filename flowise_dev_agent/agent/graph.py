@@ -1480,6 +1480,17 @@ def _make_patch_node_v2(
                 m_d.cache_hits = len(new_node_names) - len(_phase_d_repair_events)
                 m_d.repair_events = len(_phase_d_repair_events)
 
+                # M8.2: record total get_node calls in debug for session telemetry
+                if node_store is not None and node_store._call_count > 0:
+                    _gn_flowise = _phase_d_debug.get("flowise") or (
+                        (state.get("debug") or {}).get("flowise") or {}
+                    )
+                    _prior_calls = _gn_flowise.get("get_node_calls_total", 0)
+                    _phase_d_debug["flowise"] = {
+                        **_gn_flowise,
+                        "get_node_calls_total": _prior_calls + node_store._call_count,
+                    }
+
         _v2_phase_metrics.append(m_d.to_dict())
 
         # M7.4 (DD-069): Drift detection — compare schema fingerprint against prior iteration.

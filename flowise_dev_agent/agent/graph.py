@@ -521,6 +521,13 @@ _CHATFLOW_UUID_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches a bare UUID (used to detect whether a credential_id is a real Flowise
+# UUID or a placeholder/type name written by the LLM, e.g. "openAIApi").
+_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE,
+)
+
 # Matches the ToolResult summary format produced by _wrap_result() for chatflow results:
 # "Chatflow 'Support Bot' (id=abc12345-1234-1234-1234-abcdef012345)."
 _CHATFLOW_SUMMARY_UUID_RE = re.compile(
@@ -1204,6 +1211,22 @@ def _make_patch_node_v2(
         out_tok = 0
         _v2_phase_metrics: list[dict] = []   # M7.4: phase timing collected by phases B + D
 
+        # If the plan explicitly requests a CREATE (new chatflow) but a chatflow_id
+        # already exists from a prior iteration, honour the plan's intent by treating
+        # this patch as a fresh creation.  Detection: "**CREATE**" in the ACTION
+        # section of the plan text without a matching "**UPDATE**".
+        if (
+            chatflow_id is not None
+            and "**CREATE**" in plan
+            and "**UPDATE**" not in plan
+        ):
+            logger.info(
+                "[PATCH v2] Plan requests CREATE; ignoring existing chatflow_id=%s "
+                "— will create a new chatflow this iteration.",
+                chatflow_id,
+            )
+            chatflow_id = None
+
         # ---- Phase A: Read base graph ----------------------------------------
         base_graph = GraphIR()
         _using_pattern_seed = False
@@ -1329,23 +1352,36 @@ def _make_patch_node_v2(
                     return []
 
                 for _op in ops:
-                    if isinstance(_op, BindCredential) and not _op.credential_id:
-                        _query = (_op.credential_type or "").strip()
-                        if not _query:
-                            continue
-                        _resolved = await _cred_store.resolve_or_repair(
+                    if not isinstance(_op, BindCredential):
+                        continue
+                    # Resolve when credential_id is empty OR when the LLM put a
+                    # type/name (e.g. "openAIApi") instead of a real UUID.
+                    # Real UUIDs are 36-char hex strings like xxxxxxxx-xxxx-…
+                    _cred_id_is_real_uuid = bool(
+                        _op.credential_id and _UUID_RE.match(_op.credential_id)
+                    )
+                    if _cred_id_is_real_uuid:
+                        continue
+                    # Use credential_type first; fall back to credential_id as
+                    # the type hint when credential_type was left blank.
+                    _query = (
+                        (_op.credential_type or _op.credential_id or "").strip()
+                    )
+                    if not _query:
+                        continue
+                    _resolved = await _cred_store.resolve_or_repair(
+                        _query,
+                        _cred_api_fetcher,
+                        repair_events_out=_phase_cred_repair_events,
+                    )
+                    if _resolved:
+                        _op.credential_id = _resolved
+                        _resolved_credentials[_query] = _resolved
+                        logger.info(
+                            "[PATCH v2] Credential auto-resolved: type=%r → id=%s…",
                             _query,
-                            _cred_api_fetcher,
-                            repair_events_out=_phase_cred_repair_events,
+                            _resolved[:8],
                         )
-                        if _resolved:
-                            _op.credential_id = _resolved
-                            _resolved_credentials[_query] = _resolved
-                            logger.info(
-                                "[PATCH v2] Credential auto-resolved: type=%r → id=%s…",
-                                _query,
-                                _resolved[:8],
-                            )
 
             # C.3: IR validation (after credential auto-fill)
             ir_errors = validate_patch_ops(ops, base_graph.node_ids())

@@ -263,18 +263,46 @@ def _resolve_anchor_id(
 
     Replaces the {nodeId} placeholder with the actual node_id.
     Returns None if the anchor is not found.
+
+    Resolution order:
+      1. Exact name match  (anchor["name"] == anchor_name)
+      2. Case-insensitive name match
+      3. Exact type-part match — the LLM often uses the base-class type (e.g.
+         "BaseChatModel") instead of the anchor name (e.g. "model").  A match
+         succeeds when anchor_name equals any pipe-separated segment of anchor["type"].
+      4. Type-part suffix match — handles semantic shorthand (e.g. "retriever"
+         is a suffix of "VectorStoreRetriever" and "BaseRetriever").
     """
     if direction == "output":
         anchors = schema.get("outputAnchors") or []
     else:
         anchors = schema.get("inputAnchors") or []
 
+    # Pass 1 + 2: name match (exact then case-insensitive)
     for anchor in anchors:
         anchor_anchor_name = anchor.get("name", "")
         if (
             anchor_anchor_name == anchor_name
             or anchor_anchor_name.lower() == anchor_name.lower()
         ):
+            anchor_id = anchor.get("id", "")
+            return anchor_id.replace("{nodeId}", node_id)
+
+    # Pass 3: exact type-part match — handles LLM using class names as anchor names
+    anchor_name_lower = anchor_name.lower()
+    for anchor in anchors:
+        anchor_type = anchor.get("type", "")
+        type_parts = [t.strip().lower() for t in anchor_type.split("|")]
+        if anchor_name_lower in type_parts:
+            anchor_id = anchor.get("id", "")
+            return anchor_id.replace("{nodeId}", node_id)
+
+    # Pass 4: type-part suffix match — handles semantic shorthand like "retriever"
+    # matching "VectorStoreRetriever" or "BaseRetriever"
+    for anchor in anchors:
+        anchor_type = anchor.get("type", "")
+        type_parts = [t.strip().lower() for t in anchor_type.split("|")]
+        if any(part.endswith(anchor_name_lower) for part in type_parts):
             anchor_id = anchor.get("id", "")
             return anchor_id.replace("{nodeId}", node_id)
 
@@ -309,7 +337,14 @@ def _build_node_data(
 
     # Build the inputs dict (configurable values)
     inputs: dict[str, Any] = {}
-    # Seed with schema defaults
+    # Seed inputAnchors with "" (unconnected anchors default to empty string,
+    # matching what the Flowise UI writes when a new node is placed on the canvas).
+    # Connect ops will override these with "{{nodeId.data.instance}}" for wired anchors.
+    for anchor in input_anchors:
+        anchor_name = anchor.get("name", "")
+        if anchor_name:
+            inputs[anchor_name] = ""
+    # Seed inputParams with their schema defaults
     for param in input_params:
         param_name = param.get("name", "")
         if param_name:
@@ -317,13 +352,30 @@ def _build_node_data(
     # Apply caller-provided params (override defaults)
     inputs.update(params)
 
+    # Flowise stores version as a JSON number, not a string.  The snapshot may
+    # store it as a string (e.g. "2" or "8.3") — convert here so the compiled
+    # flowData matches what Flowise expects.
+    raw_version = schema.get("version", 1)
+    try:
+        node_version: float | int = float(raw_version)
+        # Use int if it's a whole number (e.g. 2.0 → 2), float otherwise (e.g. 8.3)
+        if node_version == int(node_version):
+            node_version = int(node_version)
+    except (TypeError, ValueError):
+        node_version = 1
+
+    # Flowise "type" is the primary class name (baseClasses[0]), NOT the node
+    # name.  E.g. bufferMemory → "BufferMemory", chatOpenAI → "ChatOpenAI".
+    base_classes = list(schema.get("baseClasses") or [])
+    node_type = base_classes[0] if base_classes else node_name
+
     return {
         "id": node_id,
         "label": label or schema.get("label", node_name),
-        "version": schema.get("version", 1),
+        "version": node_version,
         "name": node_name,
-        "type": schema.get("type", node_name),
-        "baseClasses": list(schema.get("baseClasses") or []),
+        "type": node_type,
+        "baseClasses": base_classes,
         "category": schema.get("category", ""),
         "description": schema.get("description", ""),
         "inputAnchors": input_anchors,
@@ -516,6 +568,19 @@ def compile_patch_ops(
                 source_handle=src_handle,
                 target_handle=tgt_handle,
             ))
+
+            # Flowise resolves connected anchors at runtime via template expressions
+            # in the target node's "inputs" dict — NOT via edges alone.
+            # Without these, connected inputs are `undefined` at prediction time.
+            # Format: inputs["memory"] = "{{bufferMemory_0.data.instance}}"
+            # The anchor name is the 3rd segment of the handle (after splitting on "-").
+            tgt_handle_parts = tgt_handle.split("-", 3)
+            if len(tgt_handle_parts) >= 3:
+                tgt_input_key = tgt_handle_parts[2]  # anchor name (e.g. "memory")
+                tgt_node.data.setdefault("inputs", {})[tgt_input_key] = (
+                    "{{" + op.source_node_id + ".data.instance}}"
+                )
+
             diff_lines.append(
                 f"EDGES ADDED: {op.source_node_id}\u2192{op.target_node_id}"
                 f"({op.source_anchor}\u2192{op.target_anchor})"

@@ -1068,3 +1068,7 @@ def serve(host: str = "0.0.0.0", port: int = 8000, reload: bool = False) -> None
         reload=reload,
         log_level="info",
     )
+
+
+if __name__ == "__main__":
+    serve()

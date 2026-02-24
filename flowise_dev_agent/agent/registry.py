@@ -1,16 +1,16 @@
 """ToolRegistry v2 — namespaced, phase-gated, ToolResult-producing tool registry.
 
-Naming convention: "<domain>.<tool_name>"
-  flowise.get_node
-  flowise.list_chatflows
-  workday.get_worker    (stub — no real Workday API yet)
-  patterns.search_patterns
+Naming convention: "<domain>__<tool_name>"  (double-underscore — dots are rejected by Claude API)
+  flowise__get_node
+  flowise__list_chatflows
+  workday__get_worker    (stub — no real Workday API yet)
+  patterns__search_patterns
 
 Phase permissions: each tool declares which phases it is available in.
   Phases: "discover" | "patch" | "test"
 
 Backwards compatibility: executor() returns BOTH the namespaced key
-("flowise.get_node") AND the simple key ("get_node") so existing code using
+("flowise__get_node") AND the simple key ("get_node") so existing code using
 bare tool names continues to work without modification.
 
 See DESIGN_DECISIONS.md — DD-046, DD-049.
@@ -34,7 +34,7 @@ class RegistryEntry:
     """A single registered tool in the ToolRegistry.
 
     Fields:
-        tool_def:    ToolDef with the namespaced name ("flowise.get_node").
+        tool_def:    ToolDef with the namespaced name ("flowise__get_node").
                      This is what is sent to the LLM.
         phases:      Frozenset of phases this tool is available in.
                      e.g. frozenset({"discover"}) or frozenset({"patch", "test"})
@@ -70,18 +70,18 @@ class ToolRegistry:
 
     Getting tools for the LLM (namespaced names):
         tool_defs = registry.tool_defs(phase="discover")
-        # → [ToolDef(name="flowise.get_node", ...), ToolDef(name="patterns.search_patterns", ...)]
+        # → [ToolDef(name="flowise__get_node", ...), ToolDef(name="patterns__search_patterns", ...)]
 
     Getting executor for graph.py (dual-keyed for backwards compat):
         executor = registry.executor(phase="discover")
-        # → {"flowise.get_node": fn, "get_node": fn, "patterns.search_patterns": fn, ...}
+        # → {"flowise__get_node": fn, "get_node": fn, "patterns__search_patterns": fn, ...}
 
     Getting merged system prompt additions:
         context = registry.context(phase="discover")
         # → "--- FLOWISE CONTEXT ---\\n...\\n\\n--- PATTERNS CONTEXT ---\\n..."
 
     Direct tool execution (returns ToolResult):
-        result = await registry.call("flowise.get_node", {"name": "chatOpenAI"})
+        result = await registry.call("flowise__get_node", {"name": "chatOpenAI"})
     """
 
     def __init__(self) -> None:
@@ -98,7 +98,7 @@ class ToolRegistry:
         """Register a single tool under a namespace.
 
         tool_def.name should be the simple (un-namespaced) name.
-        The registry creates the namespaced name as "<namespace>.<tool_def.name>"
+        The registry creates the namespaced name as "<namespace>__<tool_def.name>"
         and replaces the name in the stored ToolDef so the LLM sees namespaced names.
 
         If a tool with the same namespaced name already exists (e.g. from a prior call
@@ -106,7 +106,7 @@ class ToolRegistry:
         a tool with an expanded phase set.
         """
         simple_name = tool_def.name
-        namespaced_name = f"{namespace}.{simple_name}"
+        namespaced_name = f"{namespace}__{simple_name}"
 
         # Replace existing entry for the same namespaced name (idempotent re-registration)
         self._entries = [
@@ -181,7 +181,7 @@ class ToolRegistry:
     def tool_defs(self, phase: str) -> list[ToolDef]:
         """Return all ToolDefs available for the given phase.
 
-        Names are namespaced (e.g. "flowise.get_node") for unambiguous LLM tool calling.
+        Names are namespaced (e.g. "flowise__get_node") for unambiguous LLM tool calling.
         """
         return [e.tool_def for e in self._entries if phase in e.phases]
 
@@ -189,8 +189,8 @@ class ToolRegistry:
         """Return an executor dict for the given phase.
 
         Dual-keyed for backwards compatibility (DD-049):
-          "flowise.get_node" → fn  (namespaced, used by LLM in v2 sessions)
-          "get_node"         → fn  (simple, used by legacy code)
+          "flowise__get_node" → fn  (namespaced, used by LLM in v2 sessions)
+          "get_node"          → fn  (simple, used by legacy code)
 
         When two domains have a tool with the same simple name (e.g. both "get_node"),
         the last registered domain's callable wins for the simple key. The namespaced

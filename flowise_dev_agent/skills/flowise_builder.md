@@ -137,7 +137,13 @@ these handles by guessing — they must match exactly.
 - Simple Conversation: ChatModel + BufferMemory + ConversationChain
 - Tool Agent: ChatModel + BufferMemory + CustomTool(s) + ToolAgent
   (requires function-calling model)
-- RAG: ChatModel + VectorStore + Embeddings + Retriever + ConversationalRetrievalQAChain
+- RAG: ChatModel + VectorStore + Embeddings + **DocumentLoader** + Retriever + ConversationalRetrievalQAChain
+
+**RAG RUNTIME CONSTRAINT**: Every VectorStore node (`memoryVectorStore`, `pinecone`, `faiss`,
+etc.) MUST have a DocumentLoader node (e.g. `plainText`, `textFile`, `pdfFile`, `cheerioWebScraper`)
+wired to its `document` input anchor. Without a document source the VectorStore cannot initialize
+and Flowise returns "Expected a Runnable" (HTTP 500) on every prediction. Always include a
+DocumentLoader when planning any RAG flow.
 
 ### Rule 8: Node Data Structure — CRITICAL (missing fields cause HTTP 500)
 

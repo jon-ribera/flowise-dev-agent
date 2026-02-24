@@ -433,3 +433,62 @@ def test_all_nodes_compile_no_error(schema_cache):
         )
 
     assert not report, "\n".join(report)
+
+
+# ---------------------------------------------------------------------------
+# Test 10: RAG flow with document source (M8.1 guardrail coverage)
+# ---------------------------------------------------------------------------
+
+
+def test_rag_with_document_source(schema_cache):
+    """Full RAG pipeline: plainText → memoryVectorStore + openAIEmbeddings → QA chain.
+
+    Validates the M8.1 document-source guardrail: memoryVectorStore MUST have a
+    document loader wired to its 'document' anchor or Flowise returns HTTP 500.
+
+    Graph:
+      plainText_0.document     → memoryVectorStore_0.document
+      openAIEmbeddings_0       → memoryVectorStore_0.embeddings
+      memoryVectorStore_0.retriever → conversationalRetrievalQAChain_0.vectorStoreRetriever
+      chatOpenAI_0             → conversationalRetrievalQAChain_0.model
+    """
+    ops = [
+        AddNode(node_name="plainText", node_id="plainText_0", label="Plain Text"),
+        AddNode(node_name="openAIEmbeddings", node_id="openAIEmbeddings_0", label="OpenAI Embeddings"),
+        AddNode(node_name="memoryVectorStore", node_id="memoryVectorStore_0", label="In-Memory Store"),
+        AddNode(node_name="chatOpenAI", node_id="chatOpenAI_0", label="ChatOpenAI"),
+        AddNode(node_name="conversationalRetrievalQAChain", node_id="qaChain_0", label="QA Chain"),
+        SetParam(node_id="plainText_0", param_name="text", value="This is the knowledge base content."),
+        SetParam(node_id="chatOpenAI_0", param_name="modelName", value="gpt-4o-mini"),
+        BindCredential(node_id="chatOpenAI_0", credential_id="openai-cred", credential_type="openAIApi"),
+        BindCredential(node_id="openAIEmbeddings_0", credential_id="openai-cred", credential_type="openAIApi"),
+        # Wire document source to vector store (the critical guardrail connection)
+        Connect(source_node_id="plainText_0", source_anchor="document", target_node_id="memoryVectorStore_0", target_anchor="document"),
+        Connect(source_node_id="openAIEmbeddings_0", source_anchor="openAIEmbeddings", target_node_id="memoryVectorStore_0", target_anchor="embeddings"),
+        # Wire retriever output to QA chain
+        Connect(source_node_id="memoryVectorStore_0", source_anchor="retriever", target_node_id="qaChain_0", target_anchor="vectorStoreRetriever"),
+        Connect(source_node_id="chatOpenAI_0", source_anchor="chatOpenAI", target_node_id="qaChain_0", target_anchor="model"),
+    ]
+    result = compile_patch_ops(GraphIR(), ops, schema_cache)
+    fd = _assert_valid(result, expected_nodes=5, expected_edges=4)
+
+    _assert_version_is_number(fd)
+    _assert_type_is_pascal(fd)
+
+    # plainText -> memoryVectorStore.document
+    _assert_template_expr(fd, "memoryVectorStore_0", "document", "plainText_0")
+    # openAIEmbeddings -> memoryVectorStore.embeddings
+    _assert_template_expr(fd, "memoryVectorStore_0", "embeddings", "openAIEmbeddings_0")
+    # memoryVectorStore.retriever -> qaChain.vectorStoreRetriever
+    _assert_template_expr(fd, "qaChain_0", "vectorStoreRetriever", "memoryVectorStore_0")
+    # chatOpenAI -> qaChain.model
+    _assert_template_expr(fd, "qaChain_0", "model", "chatOpenAI_0")
+
+    # memoryVectorStore must have outputs["output"] = "retriever" (multi-output selection)
+    mvs_data = _node_data(fd, "memoryVectorStore_0")
+    assert mvs_data.get("outputs", {}).get("output") == "retriever", (
+        "memoryVectorStore outputs['output'] must be 'retriever' when wired to vectorStoreRetriever"
+    )
+
+    _assert_anchors_seeded(fd, "qaChain_0")
+    _assert_anchors_seeded(fd, "memoryVectorStore_0")

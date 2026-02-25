@@ -1,5 +1,5 @@
 "use client";
-import { use, useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback } from "react";
 import { useSessionStore } from "@/store/session-store";
 import { api } from "@/lib/api";
 import { openNodeStream, openResumeStream } from "@/lib/sse";
@@ -9,8 +9,8 @@ import { ActivePanel } from "@/components/hitl/ActivePanel";
 import { ArtifactsPanel } from "@/components/artifacts/ArtifactsPanel";
 import type { SSEEvent } from "@/lib/types";
 
-export default function SessionDetailPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
+export default function SessionDetailPage({ params }: { params: { id: string } }) {
+  const { id } = params;
   const { initActive, applySSEEvent, applyNodeEvent, active } = useSessionStore((s) => ({
     initActive: s.initActive,
     applySSEEvent: s.applySSEEvent,

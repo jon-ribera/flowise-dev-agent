@@ -839,9 +839,12 @@ def _make_human_plan_approval_node():
             asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
         developer_response: str = interrupt(interrupt_payload)
 
-        approved = developer_response.strip().lower() in (
-            "approved", "approve", "yes", "y", "ok", "looks good", "lgtm", "proceed"
-        )
+        _APPROVED_WORDS = ("approved", "approve", "yes", "y", "ok", "looks good", "lgtm", "proceed")
+        _norm = developer_response.strip().lower()
+        _parts = _norm.split()
+        # Match exact keyword OR "approved - approach: ..." / "approved: ..." style
+        # responses sent by the UI when a user selects a plan option.
+        approved = _norm in _APPROVED_WORDS or bool(_parts and _parts[0].rstrip("-:") in _APPROVED_WORDS)
 
         logger.info("[HUMAN PLAN APPROVAL] approved=%s", approved)
 

@@ -60,8 +60,8 @@ def _make_mock_cursor(rows: list, description=None):
 
 @pytest.mark.asyncio
 async def test_list_thread_ids_returns_ids():
-    """_list_thread_ids executes the correct SELECT and returns thread IDs."""
-    rows = [("thread-a",), ("thread-b",)]
+    """_list_thread_ids handles dict_row format (AsyncPostgresSaver uses row_factory=dict_row)."""
+    rows = [{"thread_id": "thread-a"}, {"thread_id": "thread-b"}]
     ctx_mock, cur_mock = _make_mock_cursor(rows)
 
     cp = MagicMock()

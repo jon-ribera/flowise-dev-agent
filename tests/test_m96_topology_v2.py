@@ -491,3 +491,37 @@ def test_initial_state_has_m96_fields():
     assert state["operation_mode"] is None
     assert state["target_chatflow_id"] is None
     assert state["intent_confidence"] is None
+
+
+# ---------------------------------------------------------------------------
+# Plan approval keyword matching — regression for "approved - approach: ..." loop
+# ---------------------------------------------------------------------------
+
+
+def _check_approved(response: str) -> bool:
+    """Mirror the approval logic from _make_human_plan_approval_node."""
+    _APPROVED_WORDS = ("approved", "approve", "yes", "y", "ok", "looks good", "lgtm", "proceed")
+    _norm = response.strip().lower()
+    _parts = _norm.split()
+    return _norm in _APPROVED_WORDS or bool(_parts and _parts[0].rstrip("-:") in _APPROVED_WORDS)
+
+
+def test_plan_approval_exact_keywords():
+    """Exact approval keywords must be detected."""
+    for kw in ("approved", "Approved", "APPROVED", "yes", "Yes", "ok", "lgtm", "proceed", "looks good"):
+        assert _check_approved(kw), f"{kw!r} should be approved"
+
+
+def test_plan_approval_approach_suffix():
+    """'approved - approach: ...' format (sent by UI option selection) must be approved."""
+    assert _check_approved("approved - approach: **Cheerio Web Scraper:** Use the built-in Cheerio")
+    assert _check_approved("approved - approach: **Multi-URL Cheerio + Custom Tool (Selected):** Two Cheerio")
+    assert _check_approved("Approved - approach: Some other approach")
+
+
+def test_plan_approval_rejects_feedback():
+    """Plain feedback strings must NOT be treated as approved."""
+    assert not _check_approved("please add memory")
+    assert not _check_approved("use gpt-4o instead")
+    assert not _check_approved("the plan is missing error handling")
+    assert not _check_approved("")

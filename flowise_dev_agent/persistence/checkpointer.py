@@ -33,13 +33,17 @@ logger = logging.getLogger("flowise_dev_agent.persistence.checkpointer")
 
 
 async def _list_thread_ids(cp: object) -> list[str]:
-    """Return all distinct thread IDs from the checkpoints table."""
+    """Return all distinct thread IDs from the checkpoints table.
+
+    AsyncPostgresSaver opens its connection with row_factory=dict_row, so
+    fetchall() returns list[dict].  Use row["thread_id"] not row[0].
+    """
     async with cp.conn.cursor() as cur:  # type: ignore[union-attr]
         await cur.execute(
             "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
         )
         rows = await cur.fetchall()
-    return [row[0] for row in rows]
+    return [row["thread_id"] for row in rows]
 
 
 async def _thread_exists(cp: object, thread_id: str) -> bool:

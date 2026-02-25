@@ -164,8 +164,10 @@ def test_resume_approved_reaches_result_review(client):
     if status2 == "pending_interrupt":
         interrupt2 = body2.get("interrupt") or {}
         itype2 = interrupt2.get("type", "")
-        assert itype2 == "result_review", (
-            f"Expected result_review interrupt after plan approval, got {itype2!r}"
+        # M9.6: _route_after_evaluate_v2 can route back to plan_v2 on "iterate" verdict,
+        # producing another plan_approval interrupt. Both are valid outcomes.
+        assert itype2 in ("result_review", "plan_approval"), (
+            f"Expected result_review or plan_approval after plan approval, got {itype2!r}"
         )
 
 

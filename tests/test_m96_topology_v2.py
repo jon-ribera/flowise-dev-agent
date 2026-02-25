@@ -428,27 +428,15 @@ def test_agent_state_has_m96_fields():
 
 
 def test_build_graph_v2_topology_version():
-    """build_graph(topology_version='v2') must produce a compiled graph without errors."""
+    """build_graph() must produce a compiled v2 graph without errors (v2 is the only topology)."""
     from flowise_dev_agent.agent.graph import build_graph
 
     engine = _make_stub_engine()
     domain = _make_stub_flowise_domain()
 
-    # Must not raise
-    graph = build_graph(engine, [domain], topology_version="v2")
-    assert graph is not None, "build_graph(topology_version='v2') must return a compiled graph"
-
-
-def test_build_graph_v1_still_works():
-    """build_graph() with default topology_version='v1' must still work (backward compat)."""
-    from flowise_dev_agent.agent.graph import build_graph
-
-    engine = _make_stub_engine()
-    domain = _make_stub_flowise_domain()
-
-    # Default (v1) must not raise
+    # Must not raise — v2 is now the default and only topology
     graph = build_graph(engine, [domain])
-    assert graph is not None, "build_graph() (v1 default) must return a compiled graph"
+    assert graph is not None, "build_graph() must return a compiled graph"
 
 
 def test_summarize_flow_data_deterministic():

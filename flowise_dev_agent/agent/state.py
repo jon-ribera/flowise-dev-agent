@@ -275,6 +275,17 @@ class AgentState(TypedDict):
     intent_confidence: float | None
 
     # -----------------------------------------------------------------------
+    # Pattern library (M9.9 — DD-068 extension)
+    # -----------------------------------------------------------------------
+
+    # True when a pattern was used as the base GraphIR for the current plan iteration.
+    # Set by the plan node; False when no pattern was seeded.
+    pattern_used: bool
+
+    # Integer ID of the PatternStore row applied as base graph, or None.
+    pattern_id: int | None
+
+    # -----------------------------------------------------------------------
     # Token usage (accumulated across all LLM calls in this session)
     # -----------------------------------------------------------------------
 

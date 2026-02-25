@@ -30,15 +30,30 @@ from langchain_core.runnables import RunnableConfig
 #: Maps every registered graph node name to a logical phase label used in
 #: the session_events table.  Unknown nodes fall back to their own name.
 _NODE_PHASES: dict[str, str] = {
-    "clarify":              "clarify",
-    "discover":             "discover",
-    "check_credentials":    "credentials",
-    "plan":                 "plan",
-    "human_plan_approval":  "plan",
-    "patch":                "patch",
-    "test":                 "test",
-    "converge":             "evaluate",
-    "human_result_review":  "evaluate",
+    # Phase A
+    "classify_intent":          "classify",
+    "hydrate_context":          "hydrate",
+    # Phase B (UPDATE)
+    "resolve_target":           "resolve",
+    "hitl_select_target":       "resolve",
+    # Phase C (UPDATE)
+    "load_current_flow":        "load",
+    "summarize_current_flow":   "summarize",
+    # Phase D
+    "plan_v2":                  "plan",
+    "hitl_plan_v2":             "plan",
+    "define_patch_scope":       "patch",
+    "compile_patch_ir":         "patch",
+    "compile_flow_data":        "patch",
+    # Phase E
+    "validate":                 "patch",
+    "repair_schema":            "patch",
+    # Phase F
+    "preflight_validate_patch": "patch",
+    "apply_patch":              "patch",
+    "test_v2":                  "test",
+    "evaluate":                 "evaluate",
+    "hitl_review_v2":           "evaluate",
 }
 
 #: Exception class names that indicate a LangGraph HITL interrupt rather than
@@ -64,52 +79,127 @@ def _node_summary(node_name: str, result: dict[str, Any]) -> str | None:
         return None
 
     match node_name:
-        case "clarify":
-            c = result.get("clarification")
-            return "Clarification requested" if c else "No clarification needed"
+        case "classify_intent":
+            mode = result.get("operation_mode")
+            conf = result.get("intent_confidence")
+            if mode:
+                conf_str = f" (confidence={conf:.2f})" if conf is not None else ""
+                return f"Intent: {mode}{conf_str}"
+            return None
 
-        case "discover":
-            ds = result.get("discovery_summary") or ""
-            return f"Discovery complete ({len(ds)} chars)" if ds else None
+        case "hydrate_context":
+            facts = result.get("facts") or {}
+            flowise = facts.get("flowise") or {}
+            nc = flowise.get("node_count", 0)
+            return f"Schema loaded: {nc} node types" if nc else "Schema hydrated (empty)"
 
-        case "check_credentials":
-            missing = result.get("credentials_missing") or []
-            if missing:
-                return f"{len(missing)} credential(s) missing"
-            return "All credentials present"
+        case "resolve_target":
+            facts = result.get("facts") or {}
+            matches = (facts.get("flowise") or {}).get("top_matches") or []
+            return f"Resolved {len(matches)} candidate chatflow(s)"
 
-        case "plan":
+        case "hitl_select_target":
+            mode = result.get("operation_mode")
+            tid = result.get("target_chatflow_id")
+            if mode == "create":
+                return "Target: create new chatflow"
+            return f"Target selected: {tid}" if tid else "Target selection pending"
+
+        case "load_current_flow":
+            facts = result.get("facts") or {}
+            h = (facts.get("flowise") or {}).get("current_flow_hash")
+            return f"Flow loaded (hash={h[:8]}…)" if h else "Flow load attempted"
+
+        case "summarize_current_flow":
+            facts = result.get("facts") or {}
+            summary = (facts.get("flowise") or {}).get("flow_summary") or {}
+            nc = summary.get("node_count", 0)
+            ec = summary.get("edge_count", 0)
+            return f"Flow summarized: {nc} nodes, {ec} edges"
+
+        case "plan_v2":
             plan = result.get("plan") or ""
             return f"Plan generated ({len(plan)} chars)" if plan else None
 
-        case "human_plan_approval":
+        case "hitl_plan_v2":
             fb = result.get("developer_feedback")
             return "Plan approved" if fb is None else "Plan revision requested"
 
-        case "patch":
-            ops = result.get("patch_ir")
-            if isinstance(ops, list):
-                return f"{len(ops)} IR ops compiled"
-            # Legacy path: no patch_ir key
-            cid = result.get("chatflow_id")
-            return f"Patch written (chatflow_id={cid})" if cid else "Patch complete"
+        case "define_patch_scope":
+            facts = result.get("facts") or {}
+            patch = facts.get("patch") or {}
+            max_ops = patch.get("max_ops")
+            focus = patch.get("focus_area")
+            parts = []
+            if max_ops is not None:
+                parts.append(f"max_ops={max_ops}")
+            if focus:
+                parts.append(f"focus={focus[:40]}")
+            return "Scope: " + ", ".join(parts) if parts else "Scope defined"
 
-        case "test":
+        case "compile_patch_ir":
+            ops = result.get("patch_ir") or []
+            return f"{len(ops)} IR op(s) compiled"
+
+        case "compile_flow_data":
+            facts = result.get("facts") or {}
+            h = (facts.get("flowise") or {}).get("proposed_flow_hash")
+            return f"Flow compiled (hash={h[:8]}…)" if h else "Flow compilation attempted"
+
+        case "validate":
+            facts = result.get("facts") or {}
+            v = facts.get("validation") or {}
+            ok = v.get("ok")
+            ftype = v.get("failure_type")
+            if ok:
+                return "Validation passed"
+            return f"Validation failed: {ftype}" if ftype else "Validation failed"
+
+        case "repair_schema":
+            facts = result.get("facts") or {}
+            repair = facts.get("repair") or {}
+            count = repair.get("count", 0)
+            repaired = repair.get("repaired_node_types") or []
+            return f"Schema repair #{count}: {len(repaired)} type(s) recovered"
+
+        case "preflight_validate_patch":
+            facts = result.get("facts") or {}
+            pf = facts.get("preflight") or {}
+            ok = pf.get("ok")
+            reason = pf.get("reason")
+            if ok:
+                return "Preflight passed"
+            return f"Preflight failed: {reason}" if reason else "Preflight failed"
+
+        case "apply_patch":
+            cid = result.get("chatflow_id")
+            facts = result.get("facts") or {}
+            apply = facts.get("apply") or {}
+            ok = apply.get("ok")
+            if ok and cid:
+                return f"Patch applied (chatflow_id={cid})"
+            return "Patch apply failed" if not ok else "Patch applied"
+
+        case "test_v2":
             tr = result.get("test_results") or ""
             return f"Tests complete ({len(tr)} chars)" if tr else "Tests complete"
 
-        case "converge":
-            vd = result.get("converge_verdict") or {}
-            v = vd.get("verdict", "")
+        case "evaluate":
+            facts = result.get("facts") or {}
+            vd = facts.get("verdict") or {}
+            verdict = vd.get("verdict", "")
             reason = vd.get("reason", "")
-            parts = [f"Verdict: {v}"] if v else []
+            parts = [f"Verdict: {verdict}"] if verdict else []
             if reason:
                 parts.append(reason[:80])
             return " — ".join(parts) or None
 
-        case "human_result_review":
+        case "hitl_review_v2":
             fb = result.get("developer_feedback")
-            return "Result accepted" if fb is None else "Iteration requested"
+            done = result.get("done")
+            if done:
+                return "Result accepted"
+            return "Iteration requested" if fb else "Review pending"
 
     return None
 

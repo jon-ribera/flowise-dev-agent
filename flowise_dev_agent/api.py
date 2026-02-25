@@ -511,6 +511,9 @@ def _initial_state(
         "operation_mode": None,
         "target_chatflow_id": None,
         "intent_confidence": None,
+        # M9.9 — Pattern library fields
+        "pattern_used": False,
+        "pattern_id": None,
     }
 
 
@@ -520,14 +523,6 @@ def _initial_state(
 
 
 _NODE_PROGRESS: dict[str, str] = {
-    # v1 topology nodes
-    "clarify":             "\n--- Clarifying requirement ---\n",
-    "discover":            "\n--- Discovering Flowise environment ---\n",
-    "check_credentials":   "\n--- Checking credentials ---\n",
-    "plan":                "\n--- Planning chatflow architecture ---\n",
-    "patch":               "\n--- Patching chatflow ---\n",
-    "test":                "\n--- Running test cases ---\n",
-    "converge":            "\n--- Evaluating test results ---\n",
     # M9.6 v2 topology nodes
     "classify_intent":          "\n--- Classifying intent (create vs update) ---\n",
     "hydrate_context":          "\n--- Loading local schema metadata ---\n",

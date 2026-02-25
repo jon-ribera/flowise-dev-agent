@@ -251,12 +251,12 @@ async def test_wrap_node_emits_completed_with_duration():
     async def my_fn(state):
         return {"plan": "x" * 50}
 
-    wrapped = wrap_node("plan", my_fn, emit_event)
+    wrapped = wrap_node("plan_v2", my_fn, emit_event)
     await wrapped({})
 
     completed = next(e for e in emitted if e["status"] == "completed")
     assert completed["duration_ms"] >= 0
-    assert completed["node_name"] == "plan"
+    assert completed["node_name"] == "plan_v2"
     assert "50 chars" in (completed.get("summary") or "")
 
 
@@ -360,32 +360,38 @@ async def test_wrap_node_handles_missing_config():
 
 
 def test_summary_plan():
-    result = _node_summary("plan", {"plan": "a" * 100})
+    # v2 node is plan_v2; state key "plan" is unchanged
+    result = _node_summary("plan_v2", {"plan": "a" * 100})
     assert result is not None
     assert "100" in result
 
 
 def test_summary_patch_ir_ops():
-    result = _node_summary("patch", {"patch_ir": [{}, {}, {}]})
+    # v2 node is compile_patch_ir; state key "patch_ir" is unchanged
+    result = _node_summary("compile_patch_ir", {"patch_ir": [{}, {}, {}]})
     assert result is not None
     assert "3" in result
 
 
 def test_summary_discover():
-    result = _node_summary("discover", {"discovery_summary": "x" * 200})
+    # v2 replaces discover with hydrate_context (deterministic schema load)
+    result = _node_summary("hydrate_context", {"facts": {"flowise": {"node_count": 200}}})
     assert result is not None
     assert "200" in result
 
 
 def test_summary_converge():
-    result = _node_summary("converge", {"converge_verdict": {"verdict": "DONE", "reason": "All tests pass"}})
+    # v2 node is evaluate; verdict stored in facts["verdict"]
+    result = _node_summary("evaluate", {"facts": {"verdict": {"verdict": "DONE", "reason": "All tests pass"}}})
     assert result is not None
     assert "DONE" in result
 
 
 def test_summary_clarify_with_clarification():
-    result = _node_summary("clarify", {"clarification": "Please confirm the model."})
-    assert result == "Clarification requested"
+    # v2 replaces clarify with classify_intent; uses operation_mode + confidence
+    result = _node_summary("classify_intent", {"operation_mode": "create", "intent_confidence": 0.95})
+    assert result is not None
+    assert "create" in result
 
 
 def test_summary_unknown_node_returns_none():

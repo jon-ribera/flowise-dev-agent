@@ -1,19 +1,20 @@
 """M9.1 — Postgres persistence: checkpointer factory + event log tests.
 
 Verifies:
-  1. CheckpointerAdapter delegates attribute access to the underlying checkpointer.
-  2. CheckpointerAdapter.list_thread_ids() issues correct SQL.
-  3. CheckpointerAdapter.thread_exists() issues correct SQL and returns bool.
-  4. make_checkpointer() yields a CheckpointerAdapter wrapping AsyncPostgresSaver.
-  5. make_checkpointer() raises when langgraph-checkpoint-postgres is unavailable.
-  6. EventLog.setup() creates session_events table via correct DDL.
-  7. EventLog.insert_event() builds correct INSERT with all params.
-  8. EventLog.insert_event() is silent (no raise) when connection is None.
-  9. EventLog.insert_event() truncates summary > 300 chars.
- 10. EventLog.get_events() returns empty list when connection is None.
- 11. EventLog.get_events() returns correct rows.
- 12. _redact_dsn() replaces password with ***.
- 13. POSTGRES_DSN missing → RuntimeError at api lifespan startup.
+  1. _list_thread_ids() issues correct SQL and returns thread IDs.
+  2. _list_thread_ids() returns [] when no checkpoints exist.
+  3. _thread_exists() returns True when a row is found.
+  4. _thread_exists() returns False when no row is found.
+  5. make_checkpointer() yields the raw AsyncPostgresSaver with helpers patched on.
+  6. make_checkpointer() raises when langgraph-checkpoint-postgres is unavailable.
+  7. EventLog.setup() creates session_events table via correct DDL.
+  8. EventLog.insert_event() builds correct INSERT with all params.
+  9. EventLog.insert_event() is silent (no raise) when connection is None.
+ 10. EventLog.insert_event() truncates summary > 300 chars.
+ 11. EventLog.get_events() returns empty list when connection is None.
+ 12. EventLog.get_events() returns correct rows.
+ 13. _redact_dsn() replaces password with ***.
+ 14. POSTGRES_DSN missing → RuntimeError at api lifespan startup.
 
 See roadmap9_production_graph_runtime_hardening.md — Milestone 9.1.
 """
@@ -26,7 +27,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from flowise_dev_agent.persistence.checkpointer import (
-    CheckpointerAdapter,
+    _list_thread_ids,
+    _thread_exists,
     _redact_dsn,
 )
 from flowise_dev_agent.persistence.event_log import EventLog
@@ -35,13 +37,6 @@ from flowise_dev_agent.persistence.event_log import EventLog
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _make_mock_pg_checkpointer():
-    """Return a mock that resembles AsyncPostgresSaver enough for adapter tests."""
-    cp = MagicMock()
-    cp.some_langgraph_attr = "value"
-    return cp
 
 
 def _make_mock_cursor(rows: list, description=None):
@@ -59,41 +54,20 @@ def _make_mock_cursor(rows: list, description=None):
 
 
 # ---------------------------------------------------------------------------
-# 1. CheckpointerAdapter — attribute delegation
-# ---------------------------------------------------------------------------
-
-
-def test_adapter_delegates_attributes():
-    """__getattr__ on adapter forwards to underlying checkpointer."""
-    cp = _make_mock_pg_checkpointer()
-    adapter = CheckpointerAdapter(cp)
-    assert adapter.some_langgraph_attr == "value"
-
-
-def test_adapter_delegates_method_call():
-    """Calling a method on adapter that exists on the underlying checkpointer works."""
-    cp = MagicMock()
-    cp.aput = AsyncMock(return_value=None)
-    adapter = CheckpointerAdapter(cp)
-    assert adapter.aput is cp.aput
-
-
-# ---------------------------------------------------------------------------
-# 2. CheckpointerAdapter.list_thread_ids
+# 1. _list_thread_ids — correct SQL and results
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_adapter_list_thread_ids():
-    """list_thread_ids executes the correct SELECT and returns thread IDs."""
+async def test_list_thread_ids_returns_ids():
+    """_list_thread_ids executes the correct SELECT and returns thread IDs."""
     rows = [("thread-a",), ("thread-b",)]
     ctx_mock, cur_mock = _make_mock_cursor(rows)
 
     cp = MagicMock()
     cp.conn.cursor = MagicMock(return_value=ctx_mock)
 
-    adapter = CheckpointerAdapter(cp)
-    result = await adapter.list_thread_ids()
+    result = await _list_thread_ids(cp)
 
     assert result == ["thread-a", "thread-b"]
     executed_sql = cur_mock.execute.call_args[0][0]
@@ -101,55 +75,61 @@ async def test_adapter_list_thread_ids():
     assert "checkpoints" in executed_sql
 
 
+# ---------------------------------------------------------------------------
+# 2. _list_thread_ids — empty result
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_adapter_list_thread_ids_empty():
-    """list_thread_ids returns [] when no checkpoints exist."""
+async def test_list_thread_ids_empty():
+    """_list_thread_ids returns [] when no checkpoints exist."""
     ctx_mock, _ = _make_mock_cursor([])
     cp = MagicMock()
     cp.conn.cursor = MagicMock(return_value=ctx_mock)
-    adapter = CheckpointerAdapter(cp)
-    assert await adapter.list_thread_ids() == []
+    assert await _list_thread_ids(cp) == []
 
 
 # ---------------------------------------------------------------------------
-# 3. CheckpointerAdapter.thread_exists
+# 3. _thread_exists — returns True
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_adapter_thread_exists_true():
-    """thread_exists returns True when a row is found."""
+async def test_thread_exists_true():
+    """_thread_exists returns True when a row is found."""
     ctx_mock, cur_mock = _make_mock_cursor([(1,)])
     cp = MagicMock()
     cp.conn.cursor = MagicMock(return_value=ctx_mock)
-    adapter = CheckpointerAdapter(cp)
-    assert await adapter.thread_exists("thread-abc") is True
+    assert await _thread_exists(cp, "thread-abc") is True
 
     sql = cur_mock.execute.call_args[0][0]
     assert "checkpoints" in sql
     assert "thread_id" in sql
-    # Postgres placeholder
     assert "%s" in sql
 
 
+# ---------------------------------------------------------------------------
+# 4. _thread_exists — returns False
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_adapter_thread_exists_false():
-    """thread_exists returns False when no row is found."""
+async def test_thread_exists_false():
+    """_thread_exists returns False when no row is found."""
     ctx_mock, _ = _make_mock_cursor([])
     cp = MagicMock()
     cp.conn.cursor = MagicMock(return_value=ctx_mock)
-    adapter = CheckpointerAdapter(cp)
-    assert await adapter.thread_exists("missing") is False
+    assert await _thread_exists(cp, "missing") is False
 
 
 # ---------------------------------------------------------------------------
-# 4. make_checkpointer yields CheckpointerAdapter wrapping AsyncPostgresSaver
+# 5. make_checkpointer yields raw AsyncPostgresSaver with helpers patched on
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_make_checkpointer_yields_adapter():
-    """make_checkpointer yields a CheckpointerAdapter when import succeeds."""
+async def test_make_checkpointer_yields_saver_with_helpers():
+    """make_checkpointer yields raw AsyncPostgresSaver with list/exist helpers attached."""
     mock_cp = MagicMock()
     mock_cp.setup = AsyncMock()
 
@@ -166,9 +146,13 @@ async def test_make_checkpointer_yields_adapter():
         from flowise_dev_agent.persistence.checkpointer import make_checkpointer
 
         async with make_checkpointer("postgresql://test:test@localhost/db") as cp:
-            assert isinstance(cp, CheckpointerAdapter)
+            # Must be the raw AsyncPostgresSaver (passes LangGraph isinstance guard)
+            assert cp is mock_cp
             # setup() must be called to create LangGraph tables
             mock_cp.setup.assert_called_once()
+            # Helper methods must be patched on
+            assert callable(getattr(cp, "list_thread_ids", None))
+            assert callable(getattr(cp, "thread_exists", None))
 
 
 # ---------------------------------------------------------------------------

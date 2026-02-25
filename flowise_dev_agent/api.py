@@ -1362,7 +1362,12 @@ async def serve_ui() -> FileResponse:
 
 def serve(host: str = "0.0.0.0", port: int = 8000, reload: bool = False) -> None:
     """Launch the FastAPI server via uvicorn."""
+    import sys
     import uvicorn
+    # Windows: psycopg async requires SelectorEventLoop (not the default ProactorEventLoop)
+    if sys.platform == "win32":
+        import asyncio
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(
         "flowise_dev_agent.api:app",

@@ -28,12 +28,66 @@ See DESIGN_DECISIONS.md — DD-031, DD-068.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import time
 from typing import Any
 
 logger = logging.getLogger("flowise_dev_agent.agent.pattern_store")
+
+
+# ---------------------------------------------------------------------------
+# M9.9 helpers — schema compatibility + category inference
+# ---------------------------------------------------------------------------
+
+
+def _is_pattern_schema_compatible(
+    pattern: dict, current_fingerprint: str | None
+) -> bool:
+    """True if pattern was trained on the same schema or has no fingerprint.
+
+    Compatibility rules:
+      - stored fingerprint is None/empty → treat as compatible (old pattern).
+      - current_fingerprint is None/empty → cannot check, assume compatible.
+      - both present → compatible only when they are equal.
+
+    M9.9 (DD-068 extension).
+    """
+    stored = pattern.get("schema_fingerprint") or None
+    if stored is None:
+        return True
+    if not current_fingerprint:
+        return True
+    return stored == current_fingerprint
+
+
+def _infer_category_from_node_types(node_types: list[str]) -> str:
+    """Infer a chatflow category label from the list of node type names.
+
+    Priority order (first match wins):
+      1. "rag"            — any node containing "vectorStore" or "retriev"
+      2. "tool_agent"     — any node containing "toolAgent"
+      3. "conversational" — chatOpenAI + conversationChain both present
+      4. "custom"         — catch-all
+
+    M9.9 (DD-068 extension).
+    """
+    lower_names = [n.lower() for n in node_types]
+
+    if any("vectorstore" in n or "retriev" in n for n in lower_names):
+        return "rag"
+    if any("toolagent" in n for n in lower_names):
+        return "tool_agent"
+    has_chat_model = any(
+        "chatopenai" in n or "chatanthropic" in n or "chatollamalocal" in n
+        for n in lower_names
+    )
+    has_conv_chain = any("conversationchain" in n for n in lower_names)
+    if has_chat_model and has_conv_chain:
+        return "conversational"
+    return "custom"
+
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS patterns (
@@ -327,7 +381,7 @@ class PatternStore:
 
         query = f"""
             SELECT id, name, requirement_text, flow_data, chatflow_id, success_count,
-                   domain, node_types, category, schema_fingerprint,
+                   domain, node_types, category, schema_fingerprint, last_used_at,
                    {score_expr}
             FROM patterns
             {where_sql}
@@ -341,6 +395,17 @@ class PatternStore:
 
         results: list[dict[str, Any]] = []
         for row in rows:
+            # last_used_at stored as Unix float; convert to ISO-8601 for callers
+            _last_used_raw = row[10]
+            _last_used_iso: str | None = None
+            if _last_used_raw is not None:
+                try:
+                    _last_used_iso = datetime.datetime.fromtimestamp(
+                        float(_last_used_raw), tz=datetime.timezone.utc
+                    ).isoformat()
+                except (TypeError, ValueError, OSError):
+                    pass
+
             results.append({
                 "id": row[0],
                 "name": row[1],
@@ -352,6 +417,7 @@ class PatternStore:
                 "node_types": row[7],
                 "category": row[8],
                 "schema_fingerprint": row[9],
+                "last_used_at": _last_used_iso,
             })
 
         # Python-side node_types overlap filter

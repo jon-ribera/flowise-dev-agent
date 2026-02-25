@@ -494,19 +494,19 @@ Make patterns a default accelerator (when confidence is high), not a nice-to-hav
 ## 10) Sequencing and recommended implementation order
 
 P0 (unblocks performance and correctness):
-1) 9.3 Knowledge-first contract alignment
-2) 9.5 Repair gating correctness + tests
-3) 9.4 Refresh reproducibility
+1) ~~9.3 Knowledge-first contract alignment~~ **COMPLETE (DD-075)**
+2) ~~9.5 Repair gating correctness + tests~~ **COMPLETE (DD-076)**
+3) ~~9.4 Refresh reproducibility~~ **COMPLETE (DD-077)**
 
 P1 (production experience):
-4) 9.1 Postgres persistence
-5) 9.2 Node-level streaming (SSE) backed by event log
+4) ~~9.1 Postgres persistence~~ **COMPLETE (DD-078)**
+5) ~~9.2 Node-level streaming (SSE) backed by event log~~ **COMPLETE (DD-079)**
 
 P2 (hardening and scale):
-6) 9.6 Production-grade graph topology (budgets + retries)
-7) 9.7 Telemetry/drift polish
-8) 9.8 Compact-context audit
-9) 9.9 PatternCapability tuning
+6) ~~9.6 Production-grade graph topology (budgets + retries)~~ **COMPLETE (DD-080)**
+7) 9.7 Telemetry/drift polish — **PENDING**
+8) 9.8 Compact-context audit — **PENDING**
+9) ~~9.9 PatternCapability tuning~~ **COMPLETE (DD-081)**
 
 ---
 

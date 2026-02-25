@@ -5,7 +5,7 @@ All items in this file have a corresponding Design Decision (DD) entry in
 **DD present = shipped and live.** Source-code inline docstrings reference the
 original roadmap filenames below; those filenames are preserved as-is.
 
-Next available DD number: **DD-076**
+Next available DD number: **DD-082**
 
 ---
 
@@ -206,7 +206,9 @@ See DESIGN_DECISIONS.md §DD-071 through §DD-074.
 ## roadmap9_production_graph_runtime_hardening.md — Production Graph + Runtime Hardening
 
 > Original file: `roadmap9_production_graph_runtime_hardening.md`
-> Design Decisions: **DD-075** (M9.3 complete; remaining milestones pending)
+> Design Decisions: **DD-075 – DD-081**
+> **P0 (M9.3, M9.4, M9.5), P1 (M9.1, M9.2), and P2 partial (M9.6, M9.9) complete.**
+> M9.7 (telemetry polish) and M9.8 (compact-context audit) remain pending.
 
 ### M9.3 — Knowledge-First Runtime Contract Alignment (DD-075)
 
@@ -218,7 +220,62 @@ See DESIGN_DECISIONS.md §DD-071 through §DD-074.
 - Phase D of `_make_patch_node_v2`: delegates to `_repair_schema_for_ops()`; M8.2 telemetry retained
 - `tests/test_m93_knowledge_first.py`: 11 unit tests (prompt contract + repair function behaviour)
 
-See DESIGN_DECISIONS.md §DD-075.
+### M9.5 — NodeSchemaStore Repair Gating Correctness (DD-076)
+
+- `_compute_action()` in `knowledge/provider.py`: skip_same_version / update_changed_version_or_hash / update_no_version_info / skip_same_hash — four-case gating matrix
+- Repair only overwrites when justified by version change or hash mismatch
+- `tests/test_m95_repair_gating.py`: 5 unit tests covering all action branches
+
+### M9.4 — Refresh Reproducibility (DD-077)
+
+- `_patch_output_anchors_from_api()` in `knowledge/refresh.py`: post-parse enrichment of output anchor names from live Flowise API (called from `refresh_nodes()`)
+- `load_dotenv()` called at top of `refresh.py` so `FLOWISE_API_KEY` resolves from `.env`
+- `tests/test_m94_refresh_reproducibility.py`: refresh round-trip tests
+
+### M9.1 — Postgres-Only Persistence (DD-078)
+
+- `flowise_dev_agent/persistence/__init__.py`: exports `CheckpointerAdapter`, `make_checkpointer`, `EventLog`, `wrap_node`
+- `flowise_dev_agent/persistence/checkpointer.py`: `CheckpointerAdapter` + `make_checkpointer` (Postgres-only, no fallback)
+- `flowise_dev_agent/persistence/event_log.py`: `EventLog` (`session_events` table, fire-and-forget inserts)
+- `docker-compose.postgres.yml`: Postgres 16 local service
+- `pyproject.toml`: added `langgraph-checkpoint-postgres>=2.0`, `psycopg[binary]>=3.1`
+- `api.py`: `POSTGRES_DSN` env var; lifespan uses `make_checkpointer` + `EventLog`
+- `tests/test_m91_postgres_persistence.py`: 17 tests
+
+### M9.2 — Node-Level SSE Streaming (DD-079)
+
+- `flowise_dev_agent/persistence/hooks.py`: `wrap_node`, `_node_summary`, `_NODE_PHASES`, `_INTERRUPT_CLASS_NAMES`
+- `flowise_dev_agent/agent/graph.py`: `build_graph` gains `emit_event=None` + `_w()` helper wrapping all nodes
+- `flowise_dev_agent/api.py`: `GET /sessions/{id}/stream` SSE endpoint; `_format_event_as_sse`; `_session_is_done`
+- SSE event types: `node_start`, `node_end`, `node_error`, `interrupt`, `done`
+- `tests/test_m92_sse_streaming.py`: 27 tests
+
+### M9.6 — Production-Grade LangGraph Topology v2 (DD-080)
+
+- 18-node v2 topology replacing 9-node v1; v1 code fully removed
+- CREATE mode: Phases A + D–F; UPDATE mode: all 6 phases
+- `_build_graph_v2()` private function with `_w2()` wrapper for SSE integration
+- `_summarize_flow_data()`: deterministic compact summary (no LLM, no blob leakage)
+- `_repair_schema_local_sync()`: sync local-only schema repair for v2 repair_schema node
+- `facts["budgets"]`: graph-level budget enforcement at `preflight_validate_patch`
+- Schema-repair bounded retry: one retry then HITL (no runaway loops)
+- New state fields: `operation_mode`, `target_chatflow_id`, `intent_confidence`
+- `_NODE_PHASES` and `_node_summary` in `hooks.py` fully rewritten for 18 v2 node names
+- `api.py`: `_NODE_PROGRESS` updated to v2 nodes only; `_initial_state` includes M9.6 fields
+- `tests/test_m96_topology_v2.py`: 13 tests
+
+### M9.9 — PatternCapability Maturity (DD-081)
+
+- `_is_pattern_schema_compatible(pattern, fingerprint)`: schema-compat guard in `pattern_store.py`
+- `_infer_category_from_node_types(node_types)`: rag/tool_agent/conversational/custom inference
+- `last_used_at` ISO-8601 timestamps returned from `search_patterns_filtered()`
+- UPDATE mode guard in plan node: patterns NOT seeded when `operation_mode == "update"`
+- `debug["flowise"]["pattern_metrics"]`: `{pattern_used, pattern_id, ops_in_base}` per session
+- New state fields: `pattern_used: bool`, `pattern_id: int | None`
+- `api.py`: `_initial_state` includes `pattern_used: False`, `pattern_id: None`
+- `tests/test_m99_pattern_tuning.py`: 5 tests
+
+See DESIGN_DECISIONS.md §DD-075 through §DD-081.
 
 ---
 
@@ -235,4 +292,4 @@ See DESIGN_DECISIONS.md §DD-075.
 | DD-062 – DD-065 | `ROADMAP6_Platform Knowledge.md` |
 | DD-066 – DD-070 | `roadmap7_multi_domain_runtime_hardening.md` |
 | DD-071 – DD-074 | `roadmap8_runtime_hardening.md` |
-| DD-075 | `roadmap9_production_graph_runtime_hardening.md` |
+| DD-075 – DD-081 | `roadmap9_production_graph_runtime_hardening.md` |

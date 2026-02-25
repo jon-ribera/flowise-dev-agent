@@ -507,6 +507,13 @@ def _initial_state(
         "validated_payload_hash": None,
         "total_input_tokens": 0,
         "total_output_tokens": 0,
+        # M9.6 — Topology v2 fields
+        "operation_mode": None,
+        "target_chatflow_id": None,
+        "intent_confidence": None,
+        # M9.9 — Pattern library fields
+        "pattern_used": False,
+        "pattern_id": None,
     }
 
 
@@ -516,13 +523,25 @@ def _initial_state(
 
 
 _NODE_PROGRESS: dict[str, str] = {
-    "clarify":             "\n--- Clarifying requirement ---\n",
-    "discover":            "\n--- Discovering Flowise environment ---\n",
-    "check_credentials":   "\n--- Checking credentials ---\n",
-    "plan":                "\n--- Planning chatflow architecture ---\n",
-    "patch":               "\n--- Patching chatflow ---\n",
-    "test":                "\n--- Running test cases ---\n",
-    "converge":            "\n--- Evaluating test results ---\n",
+    # M9.6 v2 topology nodes
+    "classify_intent":          "\n--- Classifying intent (create vs update) ---\n",
+    "hydrate_context":          "\n--- Loading local schema metadata ---\n",
+    "resolve_target":           "\n--- Resolving update target chatflow ---\n",
+    "hitl_select_target":       "\n--- [INTERRUPT] Select target chatflow ---\n",
+    "load_current_flow":        "\n--- Loading current chatflow data ---\n",
+    "summarize_current_flow":   "\n--- Summarizing current flow structure ---\n",
+    "plan_v2":                  "\n--- Planning chatflow architecture ---\n",
+    "hitl_plan_v2":             "\n--- [INTERRUPT] Plan approval ---\n",
+    "define_patch_scope":       "\n--- Defining patch scope and budgets ---\n",
+    "compile_patch_ir":         "\n--- Generating Patch IR operations ---\n",
+    "compile_flow_data":        "\n--- Compiling flow data (deterministic) ---\n",
+    "validate":                 "\n--- Validating compiled flow ---\n",
+    "repair_schema":            "\n--- Repairing missing node schemas ---\n",
+    "preflight_validate_patch": "\n--- Pre-flight budget check ---\n",
+    "apply_patch":              "\n--- Applying patch to Flowise ---\n",
+    "test_v2":                  "\n--- Running test cases ---\n",
+    "evaluate":                 "\n--- Evaluating patch result ---\n",
+    "hitl_review_v2":           "\n--- [INTERRUPT] Review changes ---\n",
 }
 
 

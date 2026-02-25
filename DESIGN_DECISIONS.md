@@ -2295,3 +2295,128 @@ from `flowise_dev_agent/persistence/hooks.py`.
 - `flowise_dev_agent/agent/graph.py` — emit_event param + _w() wrapper helper
 - `flowise_dev_agent/api.py` — SSE endpoint + helpers + lifespan wiring
 - `tests/test_m92_sse_streaming.py` — 27 tests
+
+
+---
+
+## DD-080 — Production-Grade LangGraph Topology v2 (CREATE + UPDATE, Budgets, Bounded Retries)
+
+**Roadmap**: ROADMAP9 — Milestone 9.6
+
+**Decision**: Replace the original 9-node topology with an 18-node v2 topology that
+supports both CREATE and UPDATE modes, enforces graph-level budgets and bounded
+schema-repair retries, keeps full flow JSON out of LLM prompts (compact context
+via summaries), and integrates with the M9.2 SSE streaming layer.
+
+**Why this approach**:
+- **CREATE vs UPDATE split**: production usage requires modifying existing chatflows
+  by name rather than always building from scratch. A single canonical graph handles
+  both modes with Phase B and Phase C skipped entirely for CREATE.
+- **Full-flow isolation**: `load_current_flow` stores `artifacts["flowise"]["current_flow_data"]`
+  (full JSON) and `summarize_current_flow` produces `facts["flowise"]["flow_summary"]`
+  (compact dict). Only the summary ever reaches LLM prompts — no blob leakage.
+- **Graph-level budgets via `facts["budgets"]`**: `max_patch_ops_per_iter`,
+  `max_schema_repairs_per_iter`, `max_total_retries_per_iter`. Enforced by
+  `preflight_validate_patch` — budget overage routes to HITL rather than silently failing.
+- **Bounded schema-repair loop**: schema mismatch → `repair_schema` → retry
+  `compile_patch_ir` exactly once. A second mismatch routes to HITL immediately.
+- **v1 code fully removed**: `_make_clarify_node`, `_make_discover_node`,
+  `_make_check_credentials_node`, `_make_patch_node`, `_make_patch_node_v2`,
+  `_make_converge_node` and related routing functions removed.  `build_graph()`
+  calls `_build_graph_v2()` directly — no `topology_version` parameter.
+- **SSE integration**: `_w2()` helper inside `_build_graph_v2()` wraps all 18 nodes
+  with `wrap_node` when `emit_event` is provided, matching the M9.2 pattern.
+
+**18 node set (v2)**:
+
+| Phase | Nodes |
+|-------|-------|
+| A: Intent + context | `classify_intent`, `hydrate_context` |
+| B: Target resolution (UPDATE only) | `resolve_target`, `hitl_select_target` |
+| C: Flow baseline load (UPDATE only) | `load_current_flow`, `summarize_current_flow` |
+| D: Plan + patch generation | `plan_v2`, `hitl_plan_v2`, `define_patch_scope`, `compile_patch_ir`, `compile_flow_data` |
+| E: Validation + repair | `validate`, `repair_schema` |
+| F: Apply + test + review | `preflight_validate_patch`, `apply_patch`, `test_v2`, `evaluate`, `hitl_review_v2` |
+
+**New state fields** (added to `AgentState`):
+- `operation_mode: str | None` — `"create"` | `"update"` | `None` (set by `classify_intent`)
+- `target_chatflow_id: str | None` — chosen chatflow for UPDATE (set by `hitl_select_target`)
+- `intent_confidence: float | None` — informational only; not used for routing
+
+**Rejected alternatives**:
+- Keeping a `topology_version` toggle: adds dead code, complicates tests, and
+  confuses contributors. v2 is the only topology; the toggle was removed.
+- Streaming full flow JSON to the LLM for UPDATE mode: prohibitive token cost
+  (typical chatflows 5–50 KB) and unnecessary given that the plan only needs
+  a structural summary for most edits.
+- Automatic schema repair without HITL: unbounded repair loops previously caused
+  runaway LLM calls; the single-retry + HITL fallback gives correctness guarantees.
+
+**Files**:
+- `flowise_dev_agent/agent/graph.py` — 18 node factory functions, `_build_graph_v2()`,
+  `_summarize_flow_data()`, `_repair_schema_local_sync()`, `_w2()` wrapper helper
+- `flowise_dev_agent/agent/state.py` — `operation_mode`, `target_chatflow_id`, `intent_confidence`
+- `flowise_dev_agent/api.py` — `_initial_state()` includes M9.6 fields; `_NODE_PROGRESS`
+  updated to v2 node names only
+- `flowise_dev_agent/persistence/hooks.py` — `_NODE_PHASES` and `_node_summary` rewritten
+  for all 18 v2 node names
+- `tests/test_m96_topology_v2.py` — 13 tests
+
+
+---
+
+## DD-081 — PatternCapability Maturity (Schema Compat + Category Inference + Metrics)
+
+**Roadmap**: ROADMAP9 — Milestone 9.9
+
+**Decision**: Harden the pattern library with schema-compatibility gating, automatic
+category inference from node types, `last_used_at` tracking, and per-session
+pattern usage metrics — without introducing a separate `PatternCapability` class
+(inline plan node handling is sufficient at this scale).
+
+**Why this approach**:
+- **Schema-compatibility guard (`_is_pattern_schema_compatible`)**: patterns saved
+  under a different node schema snapshot are silently skipped rather than applied
+  and later failing during compile. Fingerprint match = compatible; no fingerprint
+  = treat as compatible (backwards compat with older patterns).
+- **Category inference (`_infer_category_from_node_types`)**: automatically assigns
+  `"rag"` / `"tool_agent"` / `"conversational"` / `"custom"` from the node type
+  list rather than relying on the LLM to supply the correct category string.
+  Priority order (first match wins): vectorStore/retriev → toolAgent → chatOpenAI
+  + conversationChain → custom.
+- **UPDATE mode guard**: patterns are NOT applied as base graph when
+  `operation_mode == "update"`. Applying a pre-built pattern as the baseline for
+  an UPDATE would overwrite the existing flow. The guard ensures pattern seeding
+  only accelerates CREATE sessions.
+- **`last_used_at` tracking**: `search_patterns_filtered()` returns ISO-8601
+  timestamps for `last_used_at`, enabling future least-recently-used eviction
+  and usage analytics.
+- **`pattern_metrics` in debug**: every plan node execution emits
+  `debug["flowise"]["pattern_metrics"]` = `{pattern_used, pattern_id, ops_in_base}`.
+  Visible in session debug output without adding API surface area.
+
+**New state fields** (added to `AgentState`):
+- `pattern_used: bool` — `True` when a pattern was used as base GraphIR for the
+  current plan iteration; `False` otherwise.
+- `pattern_id: int | None` — `PatternStore` row ID of the applied pattern, or
+  `None` if no pattern was seeded.
+
+**Rejected alternatives**:
+- A separate `PatternCapability(DomainCapability)` class: the pattern logic is
+  tightly coupled to the plan node (it seeds the base GraphIR that compile_patch_ir
+  uses). Extracting it would require passing the GraphIR through the domain
+  capability interface, adding complexity without benefit at current scale.
+- Hard-fail on schema mismatch: skipping incompatible patterns is safer — the plan
+  node falls back to an empty baseline and the LLM generates ops from scratch.
+
+**Files**:
+- `flowise_dev_agent/agent/pattern_store.py` — `_is_pattern_schema_compatible()`,
+  `_infer_category_from_node_types()`, `last_used_at` in `search_patterns_filtered()`
+  result dicts
+- `flowise_dev_agent/agent/graph.py` — UPDATE mode guard in plan node;
+  `pattern_metrics` emitted to `debug["flowise"]`; `pattern_used` + `pattern_id`
+  written to state
+- `flowise_dev_agent/agent/state.py` — `pattern_used`, `pattern_id` fields
+- `flowise_dev_agent/api.py` — `_initial_state()` includes `pattern_used: False`,
+  `pattern_id: None`
+- `tests/test_m99_pattern_tuning.py` — 5 tests

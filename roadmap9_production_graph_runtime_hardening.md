@@ -504,8 +504,8 @@ P1 (production experience):
 
 P2 (hardening and scale):
 6) ~~9.6 Production-grade graph topology (budgets + retries)~~ **COMPLETE (DD-080)**
-7) 9.7 Telemetry/drift polish — **PENDING**
-8) 9.8 Compact-context audit — **PENDING**
+7) ~~9.7 Telemetry/drift polish~~ **COMPLETE (DD-082)**
+8) ~~9.8 Compact-context audit~~ **COMPLETE (DD-083)**
 9) ~~9.9 PatternCapability tuning~~ **COMPLETE (DD-081)**
 
 ---

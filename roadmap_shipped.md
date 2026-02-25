@@ -5,7 +5,7 @@ All items in this file have a corresponding Design Decision (DD) entry in
 **DD present = shipped and live.** Source-code inline docstrings reference the
 original roadmap filenames below; those filenames are preserved as-is.
 
-Next available DD number: **DD-082**
+Next available DD number: **DD-084**
 
 ---
 
@@ -206,9 +206,8 @@ See DESIGN_DECISIONS.md §DD-071 through §DD-074.
 ## roadmap9_production_graph_runtime_hardening.md — Production Graph + Runtime Hardening
 
 > Original file: `roadmap9_production_graph_runtime_hardening.md`
-> Design Decisions: **DD-075 – DD-081**
-> **P0 (M9.3, M9.4, M9.5), P1 (M9.1, M9.2), and P2 partial (M9.6, M9.9) complete.**
-> M9.7 (telemetry polish) and M9.8 (compact-context audit) remain pending.
+> Design Decisions: **DD-075 – DD-083**
+> **ROADMAP9 fully complete: all 9 milestones shipped.**
 
 ### M9.3 — Knowledge-First Runtime Contract Alignment (DD-075)
 
@@ -275,7 +274,20 @@ See DESIGN_DECISIONS.md §DD-071 through §DD-074.
 - `api.py`: `_initial_state` includes `pattern_used: False`, `pattern_id: None`
 - `tests/test_m99_pattern_tuning.py`: 5 tests
 
-See DESIGN_DECISIONS.md §DD-075 through §DD-081.
+### M9.7 — Telemetry and Drift Polish (DD-082)
+
+- `hydrate_context` (graph.py): captures `prior_schema_fingerprint` before overwriting `schema_fingerprint` — enables cross-iteration drift detection
+- `SessionSummary` gains `schema_fingerprint: str | None`, `drift_detected: bool`, `pattern_metrics: dict | None`
+- `list_sessions()` populates all three: fingerprint from `facts["flowise"]`, drift = fingerprint mismatch guard, pattern_metrics from `debug["flowise"]["pattern_metrics"]`
+- `tests/test_m97_telemetry_drift.py`: 22 tests across 5 test classes
+
+### M9.8 — Compact-Context Enforcement Audit (DD-083)
+
+- Full audit of all LLM prompt assembly points in v2 topology: **no violations found**
+- Key confirmed invariants: `artifacts["flowise"]["current_flow_data"]` never in prompts; only `facts["flowise"]["flow_summary"]` reaches LLM context for UPDATE mode; `ToolResult.data` never in message history; `hydrate_context` emits scalar metadata only
+- `tests/test_m98_compact_context.py`: 7 regression tests covering all 5 compact-context invariants
+
+See DESIGN_DECISIONS.md §DD-075 through §DD-083.
 
 ---
 
@@ -292,4 +304,4 @@ See DESIGN_DECISIONS.md §DD-075 through §DD-081.
 | DD-062 – DD-065 | `ROADMAP6_Platform Knowledge.md` |
 | DD-066 – DD-070 | `roadmap7_multi_domain_runtime_hardening.md` |
 | DD-071 – DD-074 | `roadmap8_runtime_hardening.md` |
-| DD-075 – DD-081 | `roadmap9_production_graph_runtime_hardening.md` |
+| DD-075 – DD-083 | `roadmap9_production_graph_runtime_hardening.md` |

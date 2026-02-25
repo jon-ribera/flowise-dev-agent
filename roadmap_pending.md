@@ -7,7 +7,7 @@ Items in this file have **no corresponding Design Decision (DD)** in
 When an item is shipped, add a DD entry to DESIGN_DECISIONS.md and move the
 item to [roadmap_shipped.md](roadmap_shipped.md).
 
-Next available DD number: **DD-082**
+Next available DD number: **DD-084**
 
 ---
 

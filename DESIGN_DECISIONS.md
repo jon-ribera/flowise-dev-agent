@@ -2420,3 +2420,96 @@ pattern usage metrics — without introducing a separate `PatternCapability` cla
 - `flowise_dev_agent/api.py` — `_initial_state()` includes `pattern_used: False`,
   `pattern_id: None`
 - `tests/test_m99_pattern_tuning.py` — 5 tests
+
+
+---
+
+## DD-082 — Telemetry and Drift Polish (SessionSummary enrichment)
+
+**Roadmap**: ROADMAP9 — Milestone 9.7
+
+**Decision**: Expose schema drift detection and pattern usage metrics in the
+`SessionSummary` response model so callers can audit session health and pattern
+effectiveness without reading raw `facts` or `debug` state.
+
+**Why this approach**:
+- **`prior_schema_fingerprint` in `hydrate_context`**: the `hydrate_context` node
+  runs once per session before any LLM work and already writes `schema_fingerprint`
+  to `facts["flowise"]`. Capturing the prior value at the same point makes the
+  drift comparison available in `list_sessions()` with no extra graph edges and
+  no new state fields — it's stored inside the existing `facts["flowise"]` dict.
+- **`drift_detected` as a derived bool**: computed in `list_sessions()` from
+  `schema_fingerprint != prior_schema_fingerprint`. Three-way guard ensures it
+  stays `False` on the first session run (no prior fingerprint), when either
+  value is `None`, or when both are empty — preventing false positives on cold
+  starts.
+- **`pattern_metrics` forwarded from debug**: `debug["flowise"]["pattern_metrics"]`
+  is already written by the M9.9 plan node. Surfacing it in `SessionSummary` avoids
+  duplicating data; callers can see `{pattern_used, pattern_id, ops_in_base}` without
+  querying `debug` directly.
+- **No new `AgentState` fields**: drift detection is a read-only derived metric;
+  adding state fields would require checkpointer migrations.
+
+**What was added**:
+- `flowise_dev_agent/agent/graph.py`: `hydrate_context` node captures
+  `prior_schema_fingerprint` (existing `facts["flowise"]["schema_fingerprint"]`
+  from prior run) before overwriting it.
+- `flowise_dev_agent/api.py`:
+  - `SessionSummary` gains `schema_fingerprint: str | None`, `drift_detected: bool`,
+    `pattern_metrics: dict | None`.
+  - `list_sessions()` populates all three from `facts["flowise"]` and
+    `debug["flowise"]["pattern_metrics"]`.
+- `tests/test_m97_telemetry_drift.py` — 22 tests across 5 test classes.
+
+**Files**:
+- `flowise_dev_agent/agent/graph.py` — `hydrate_context` captures `prior_schema_fingerprint`
+- `flowise_dev_agent/api.py` — 3 new `SessionSummary` fields + `list_sessions` population
+- `tests/test_m97_telemetry_drift.py` — 22 tests
+
+
+---
+
+## DD-083 — Compact-Context Enforcement Audit (No Blob Leakage)
+
+**Roadmap**: ROADMAP9 — Milestone 9.8
+
+**Decision**: Formally audit all LLM prompt assembly points in the v2 topology
+and add regression tests that fail if any raw flow JSON or snapshot blob reaches
+the message transcript. The audit found **no violations** — add tests as a
+forward-looking regression gate.
+
+**Audit findings**:
+- `_build_system_prompt()`: concatenates hardcoded phase context strings only.
+- `_make_clarify_node()` / `_make_classify_intent_node()`: sends `requirement` only.
+- `_make_hydrate_context_node()`: emits only scalar metadata (`node_count`,
+  `schema_fingerprint`) — never raw schema snapshots.
+- `_make_plan_node()` / `_make_plan_v2_node()`: builds prompts from `requirement`
+  + `discovery_summary` / `facts["flowise"]["flow_summary"]` only. Template hints
+  capped at 3 entries × 120 chars. Does NOT read `artifacts` or `debug`.
+- `_make_load_current_flow_node()` + `_make_summarize_current_flow_node()`: correctly
+  routes full flowData to `artifacts["flowise"]["current_flow_data"]` (machine use)
+  and compact summary to `facts["flowise"]["flow_summary"]` (LLM use).
+- `_make_compile_patch_ir_node()`: has explicit comment "NEVER include full flowData;
+  only use flow_summary". Node uses `facts["flowise"]["flow_summary"]` for UPDATE mode.
+- `_make_test_node()`: uses `result_to_str(result.data)` for prediction results
+  (intentional — the evaluator LLM needs the actual chatbot response) but caps at
+  500 chars via `_format_trials()`.
+
+**Why add tests when there are no violations**:
+- Prompt assembly logic is easy to accidentally extend during future feature work.
+- The 7 regression tests act as a machine-readable specification of the compact-context
+  contract, failing immediately if any future change injects a blob.
+- Complements the 11 existing `test_context_safety.py` tests.
+
+**What was added**:
+- `tests/test_m98_compact_context.py` — 7 regression tests:
+  1. `current_flow_data` (artifacts) not in plan prompt
+  2. `flow_summary` (facts) IS in plan prompt for UPDATE mode
+  3. `ToolResult.data` never reaches message history
+  4. `hydrate_context` only emits scalar metadata, not schema snapshots
+  5. `debug["flowise"]` large strings never appear in `state["messages"]`
+  6. `current_flow_data` stored in `artifacts`, only hash in `facts`
+  7. `summarize_current_flow` output dramatically smaller than raw flowData
+
+**Files**:
+- `tests/test_m98_compact_context.py` — 7 regression tests (no production code changes)

@@ -312,6 +312,9 @@ class SessionSummary(BaseModel):
     knowledge_repair_count: int = Field(0, description="Node schema repairs triggered this session (M8.2).")
     get_node_calls_total: int = Field(0, description="Total get_node calls served from local cache this session (M8.2).")
     phase_durations_ms: dict[str, float] = Field(default_factory=dict, description="Per-phase wall-clock durations in ms (M8.2).")
+    schema_fingerprint: str | None = Field(None, description="Current NodeSchemaStore snapshot fingerprint (M9.7).")
+    drift_detected: bool = Field(False, description="True when schema fingerprint changed vs prior iteration (M9.7).")
+    pattern_metrics: dict | None = Field(None, description="Pattern usage metrics from last patch iteration (M9.7).")
 
 
 class RenameSessionRequest(BaseModel):
@@ -836,12 +839,23 @@ async def list_sessions(request: Request) -> list[SessionSummary]:
             _knowledge_repair_count = len(_kr_events)
             # M8.2: get_node_calls_total accumulated across all patch iterations
             _get_node_calls: int = _flowise_debug.get("get_node_calls_total", 0) or 0
-            # M8.2: phase_durations_ms — map phase name to duration for each timed phase
+            # M8.2: phase_durations_ms — map phase name to duration for each timed phase.
+            # When the same phase name appears in multiple iterations the last one wins,
+            # consistent with the single-dict shape.
             _phase_durations: dict[str, float] = {
                 m["phase"]: m.get("duration_ms", 0.0)
                 for m in _phase_metrics
                 if isinstance(m, dict) and "phase" in m
             }
+            # M9.7: schema_fingerprint + drift_detected
+            _flowise_facts: dict = (sv.get("facts") or {}).get("flowise", {}) or {}
+            _schema_fp: str | None = _flowise_facts.get("schema_fingerprint")
+            _prior_fp: str | None = _flowise_facts.get("prior_schema_fingerprint")
+            _drift_detected: bool = bool(
+                _schema_fp and _prior_fp and _schema_fp != _prior_fp
+            )
+            # M9.7: pattern_metrics from debug["flowise"]["pattern_metrics"]
+            _pattern_metrics: dict | None = _flowise_debug.get("pattern_metrics") or None
             summaries.append(SessionSummary(
                 thread_id=tid,
                 status=status,
@@ -856,6 +870,9 @@ async def list_sessions(request: Request) -> list[SessionSummary]:
                 knowledge_repair_count=_knowledge_repair_count,
                 get_node_calls_total=_get_node_calls,
                 phase_durations_ms=_phase_durations,
+                schema_fingerprint=_schema_fp,
+                drift_detected=_drift_detected,
+                pattern_metrics=_pattern_metrics,
             ))
         except Exception as e:
             logger.warning("Could not read state for thread %s: %s", tid, e)

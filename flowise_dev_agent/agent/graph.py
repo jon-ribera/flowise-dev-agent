@@ -1602,9 +1602,14 @@ def _make_hydrate_context_node(capabilities: "list[DomainCapability] | None" = N
         existing_facts = state.get("facts") or {}
         existing_flowise = existing_facts.get("flowise") or {}
 
+        # M9.7: capture prior fingerprint before overwriting so SessionSummary
+        # can compute drift_detected across iterations.
+        prior_schema_fingerprint: str | None = existing_flowise.get("schema_fingerprint")
+
         updated_flowise = {
             **existing_flowise,
             "schema_fingerprint": schema_fingerprint,
+            "prior_schema_fingerprint": prior_schema_fingerprint,
             "node_count": node_count,
         }
 

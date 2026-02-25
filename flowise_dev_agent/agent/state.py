@@ -256,6 +256,25 @@ class AgentState(TypedDict):
     validated_payload_hash: str | None
 
     # -----------------------------------------------------------------------
+    # M9.6 — Topology v2: operation mode and update target resolution
+    # -----------------------------------------------------------------------
+
+    # Operation mode determined by classify_intent, optionally overridden by
+    # HITL_select_target when the developer chooses "create new".
+    # "create" — build a brand-new chatflow
+    # "update" — modify an existing chatflow identified by target_chatflow_id
+    # None     — not yet determined (prior to classify_intent)
+    operation_mode: str | None
+
+    # The chatflow ID chosen by the developer in HITL_select_target (UPDATE mode).
+    # None until selected. Consumed by load_current_flow and apply_patch.
+    target_chatflow_id: str | None
+
+    # Confidence score (0.0–1.0) reported by classify_intent.
+    # Informational only — not used for routing decisions.
+    intent_confidence: float | None
+
+    # -----------------------------------------------------------------------
     # Token usage (accumulated across all LLM calls in this session)
     # -----------------------------------------------------------------------
 

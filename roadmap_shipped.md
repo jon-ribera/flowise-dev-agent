@@ -5,7 +5,7 @@ All items in this file have a corresponding Design Decision (DD) entry in
 **DD present = shipped and live.** Source-code inline docstrings reference the
 original roadmap filenames below; those filenames are preserved as-is.
 
-Next available DD number: **DD-071**
+Next available DD number: **DD-075**
 
 ---
 
@@ -163,6 +163,46 @@ See DESIGN_DECISIONS.md §DD-066 through §DD-070.
 
 ---
 
+## roadmap8_runtime_hardening.md — Runtime Hardening
+
+> Original file: `roadmap8_runtime_hardening.md`
+> Design Decisions: **DD-071 – DD-074**
+> **All four milestones complete as of 2026-02-24.**
+
+### M8.0 — Session Fixes (DD-073)
+
+- Multi-output Flowise node format: `outputAnchors` with `type: "options"` wrapper + `outputs["output"]` selection field (`compiler.py`)
+- `_validate_flow_data` looks inside `options[]` arrays for edge anchor IDs (`tools.py`)
+- `_normalize_api_schema`: priority order `outputs` (live API) > `outputAnchors` (legacy) > synthesized (`provider.py`)
+- `_patch_output_anchors_from_api`: post-parse enrichment of 89 nodes with real output anchor names from live API (`refresh.py`)
+- `scripts/simulate_frontend.py`: three-step frontend simulation script (plan → approve → accept)
+
+### M8.1 — Discover-Prompt Alignment + RAG Guardrail (DD-071, DD-072)
+
+- `_DISCOVER_BASE` (graph.py): informs LLM that all `get_node` results are served from a local cache — 303 nodes, zero network calls; explicit RAG document-source constraint added
+- `_PATCH_IR_SYSTEM` (graph.py): rule 7 — anchor/param names must come from `get_node`, never invented
+- `FLOWISE_NODE_REFERENCE.md`: RUNTIME CONSTRAINT block on `memoryVectorStore` entry
+- `flowise_builder.md` Rule 7: RAG document-source constraint propagated to the skill file
+- `test_rag_with_document_source`: full `plainText → memoryVectorStore → conversationalRetrievalQAChain` integration test
+- `tests/test_schema_repair_gating.py`: 5 unit tests covering all `_compute_action` return values
+
+### M8.2 — Knowledge-Layer Telemetry (DD-071)
+
+- `NodeSchemaStore._call_count`: increments on every `get_or_repair` call (hits + misses)
+- `graph.py` patch node: writes `get_node_calls_total` to `debug["flowise"]` after Phase D
+- `SessionSummary` gains three new fields: `knowledge_repair_count`, `get_node_calls_total`, `phase_durations_ms`
+- `list_sessions()` populates all three from debug state
+
+### M8.3 — Context Safety Gate + E2E Integration Test (DD-074)
+
+- `tests/test_context_safety.py`: 11 tests — `result_to_str` contract; no raw JSON >500 chars in transcript; `ToolResult.data` never reaches message content
+- `tests/test_e2e_session.py`: 6 tests against live server; skips via `AGENT_E2E_SKIP=1`; `@pytest.mark.slow` registered in `pyproject.toml`
+- `simulate_frontend.py` moved from repo root to `scripts/`
+
+See DESIGN_DECISIONS.md §DD-071 through §DD-074.
+
+---
+
 ## Quick Reference: DD ↔ Roadmap Index
 
 | DD Range | Roadmap File |
@@ -175,3 +215,4 @@ See DESIGN_DECISIONS.md §DD-066 through §DD-070.
 | DD-059 – DD-061 | `roadmap6_ui_iteration_fixes.md` |
 | DD-062 – DD-065 | `ROADMAP6_Platform Knowledge.md` |
 | DD-066 – DD-070 | `roadmap7_multi_domain_runtime_hardening.md` |
+| DD-071 – DD-074 | `roadmap8_runtime_hardening.md` |

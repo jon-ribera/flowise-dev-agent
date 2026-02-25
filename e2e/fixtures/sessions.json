@@ -1,0 +1,82 @@
+{
+  "requirements": {
+    "simple_create": "Build a basic customer support chatbot using GPT-4o with conversation memory",
+    "rag_create": "Build a RAG chatbot that answers questions from uploaded PDF documents",
+    "update_existing": "Update the customer support chatbot to use Claude instead of GPT-4o"
+  },
+  "mock_sessions": [
+    {
+      "thread_id": "test-session-001",
+      "status": "completed",
+      "session_name": "Customer Support Chatbot",
+      "iteration": 2,
+      "chatflow_id": "cf-abc-123",
+      "total_input_tokens": 12500,
+      "total_output_tokens": 3200,
+      "runtime_mode": "capability_first",
+      "total_repair_events": 0,
+      "total_phases_timed": 7,
+      "knowledge_repair_count": 0,
+      "get_node_calls_total": 15,
+      "phase_durations_ms": { "Classify": 120, "Hydrate": 85, "Plan": 4200, "Patch": 8100, "Apply": 2300 },
+      "schema_fingerprint": "abc123def456",
+      "drift_detected": false,
+      "pattern_metrics": null,
+      "updated_at": "2026-02-24T10:00:00Z"
+    },
+    {
+      "thread_id": "test-session-002",
+      "status": "pending_interrupt",
+      "session_name": "RAG PDF Chatbot",
+      "iteration": 1,
+      "chatflow_id": null,
+      "total_input_tokens": 8200,
+      "total_output_tokens": 1800,
+      "runtime_mode": "capability_first",
+      "total_repair_events": 1,
+      "total_phases_timed": 4,
+      "knowledge_repair_count": 1,
+      "get_node_calls_total": 8,
+      "phase_durations_ms": { "Classify": 95, "Hydrate": 72, "Plan": 3800 },
+      "schema_fingerprint": "abc123def456",
+      "drift_detected": false,
+      "pattern_metrics": { "pattern_used": true, "pattern_id": 3, "ops_in_base": 4 },
+      "updated_at": "2026-02-24T10:30:00Z"
+    }
+  ],
+  "mock_interrupt_plan_approval": {
+    "type": "plan_approval",
+    "prompt": "Review the plan below and approve or request changes.",
+    "plan": "## PLAN\n\n### Nodes\n- ChatOpenAI (gpt-4o)\n- BufferMemory\n- ConversationChain\n\n### Connections\n- Memory → ConversationChain.memory\n- ChatOpenAI → ConversationChain.model\n\n## APPROACHES\n- A: Simple chain (recommended)\n- B: Agent with tools",
+    "test_results": null,
+    "chatflow_id": null,
+    "iteration": 0,
+    "options": ["A: Simple chain (recommended)", "B: Agent with tools"],
+    "missing_credentials": null
+  },
+  "mock_interrupt_result_review": {
+    "type": "result_review",
+    "prompt": "Review the test results and accept or request changes.",
+    "plan": null,
+    "test_results": "HAPPY PATH [PASS]: Chatbot responded correctly to 'Hello'\nEDGE CASE [PASS]: Chatbot handled empty input gracefully",
+    "chatflow_id": "cf-abc-123",
+    "iteration": 1,
+    "options": null,
+    "missing_credentials": null
+  },
+  "mock_interrupt_select_target": {
+    "type": "select_target",
+    "prompt": "Select the chatflow you want to update.",
+    "plan": null,
+    "test_results": null,
+    "chatflow_id": null,
+    "iteration": 0,
+    "options": null,
+    "missing_credentials": null,
+    "top_matches": [
+      { "id": "cf-abc-001", "name": "Customer Support Bot v1", "updated_at": "2026-02-20T08:00:00Z" },
+      { "id": "cf-abc-002", "name": "Customer Support Bot v2", "updated_at": "2026-02-22T14:30:00Z" },
+      { "id": "cf-abc-003", "name": "Support Bot (Legacy)", "updated_at": "2026-01-15T10:00:00Z" }
+    ]
+  }
+}

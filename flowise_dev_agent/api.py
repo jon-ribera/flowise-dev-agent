@@ -193,6 +193,21 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+from fastapi.middleware.cors import CORSMiddleware
+
+_CORS_ORIGINS: list[str] = [
+    o.strip()
+    for o in os.environ.get("CORS_ORIGINS", "http://localhost:3001,http://localhost:3000").split(",")
+    if o.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -315,6 +330,7 @@ class SessionSummary(BaseModel):
     schema_fingerprint: str | None = Field(None, description="Current NodeSchemaStore snapshot fingerprint (M9.7).")
     drift_detected: bool = Field(False, description="True when schema fingerprint changed vs prior iteration (M9.7).")
     pattern_metrics: dict | None = Field(None, description="Pattern usage metrics from last patch iteration (M9.7).")
+    updated_at: str | None = Field(None, description="ISO 8601 timestamp of last checkpoint update.")
 
 
 class RenameSessionRequest(BaseModel):
@@ -794,7 +810,11 @@ async def get_session_summary(thread_id: str, request: Request) -> dict:
 
 
 @app.get("/sessions", response_model=list[SessionSummary], tags=["sessions"], dependencies=[Depends(_verify_api_key)])
-async def list_sessions(request: Request) -> list[SessionSummary]:
+async def list_sessions(
+    request: Request,
+    limit: int | None = None,
+    sort: str = "desc",
+) -> list[SessionSummary]:
     """List all sessions stored in the checkpoint database.
 
     Returns a lightweight summary per session. Token totals and chatflow_id
@@ -814,6 +834,12 @@ async def list_sessions(request: Request) -> list[SessionSummary]:
             cfg = {"configurable": {"thread_id": tid}}
             snap = await graph.aget_state(cfg)
             sv = snap.values
+
+            _updated_at: str | None = None
+            try:
+                _updated_at = snap.metadata.get("created_at") if snap.metadata else None
+            except Exception:
+                pass
 
             # Determine status
             has_interrupts = any(
@@ -873,11 +899,17 @@ async def list_sessions(request: Request) -> list[SessionSummary]:
                 schema_fingerprint=_schema_fp,
                 drift_detected=_drift_detected,
                 pattern_metrics=_pattern_metrics,
+                updated_at=_updated_at,
             ))
         except Exception as e:
             logger.warning("Could not read state for thread %s: %s", tid, e)
             summaries.append(SessionSummary(thread_id=tid, status="error"))
 
+    # Default: newest-first (reverse insertion order from checkpointer)
+    if sort != "asc":
+        summaries.reverse()
+    if limit is not None and limit > 0:
+        summaries = summaries[:limit]
     return summaries
 
 

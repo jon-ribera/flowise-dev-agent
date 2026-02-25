@@ -1,62 +1,88 @@
 # Flowise Dev Agent Skills
 
-Skills are markdown files that define domain-specific knowledge for the Flowise Builder co-pilot.
-Each domain the agent works with has its own skill file. The agent loads skill files at startup
-and injects the relevant sections into system prompts for each phase of the development loop.
+Skills are markdown files that provide domain-specific knowledge for the Flowise Builder co-pilot.
+Each domain has its own skill file. The agent loads skill files at startup and injects the relevant
+sections into system prompts for each phase of the development loop.
 
 ---
 
 ## How Skills Work
 
-Each skill file is parsed into named `## Sections`. The agent uses three sections per domain:
+Each skill file is parsed into named `## sections`. The agent uses three injection-point sections:
 
 | Section | Injected into | Purpose |
 |---|---|---|
-| `## Discover Context` | Discover phase system prompt | What to look for, what to read, domain-specific rules |
-| `## Patch Context` | Patch phase system prompt | Non-negotiable rules for making changes in this domain |
-| `## Test Context` | Test phase system prompt | How to validate changes in this domain |
+| `## Discover Context` | `plan_v2` node system prompt | Intent classification, schema lookup, credential resolution, PlanContract output |
+| `## Patch Context` | `compile_patch_ir` node system prompt | Patch IR op emission (AddNode/SetParam/Connect/BindCredential) |
+| `## Test Context` | `evaluate` node system prompt | Evaluation criteria; DONE vs ITERATE verdict rules |
 
-Additional sections (`## Overview`, `## Error Reference`, etc.) are documentation only —
-not injected into prompts, but useful for developers maintaining the skill.
+Additional sections (`## Overview`, `## Error Reference`, `## Changelog`, etc.) are documentation
+only — not injected into prompts.
+
+> **Note on YAML frontmatter**: The parser (`skills.py`) starts reading at the first `## ` heading.
+> YAML frontmatter (`---` block) before the first heading is silently ignored. Adding frontmatter
+> to skill files is safe and encouraged for documentation purposes.
 
 ---
 
 ## File Format
 
 ```markdown
-# [Domain] Builder Skill
+---
+name: domain-name
+description: |
+  One paragraph. Lead with what it does. Include trigger phrases. Be slightly pushy.
+version: 2.0.0
+---
 
-**Domain**: <name>
-**Version**: <semver>
+# Domain Builder Skill
 
 ## Overview
-Brief description of what this skill covers.
+Brief description (documentation only — not injected).
 
 ## Discover Context
-[Injected into Discover system prompt — what to gather, what to read]
+[Injected into plan_v2 system prompt — intent classification, schema lookup, PlanContract format]
 
 ## Patch Context
-[Injected into Patch system prompt — non-negotiable rules for making changes]
+[Injected into compile_patch_ir system prompt — Patch IR ops to emit, ordering constraints]
 
 ## Test Context
-[Injected into Test system prompt — how to validate]
+[Injected into evaluate system prompt — DONE vs ITERATE evaluation criteria]
 
 ## Error Reference
-[Common errors and how to fix them — documentation only, not injected]
+[Common errors and fixes — documentation only, not injected]
+
+## Changelog
+[Version history — documentation only]
 ```
 
 ---
 
 ## Current Skills
 
-| File | Domain | Status |
-|---|---|---|
-| `flowise_builder.md` | Flowise chatflow development | Active — loaded by `FloviseDomain` |
-| `workday_extend.md`  | Workday Build (Extend + Orchestrate) | Placeholder — ready for v2 |
+| File | Domain | Version | Status |
+|---|---|---|---|
+| `flowise_builder.md` | Flowise chatflow development | 2.0.0 | Active — loaded by `FloviseDomain` |
+| `workday_extend.md` | Workday-connected chatflow development | 0.2.0 | Partial — customMCP wiring pattern active; full Workday ops TBD |
 
 ---
 
-## Adding a New Skill (v2 and beyond)
+## How the Patch Phase Works (v2 graph)
+
+The LLM no longer writes raw `flowData` JSON. The v2 graph uses a deterministic compiler:
+
+```
+plan_v2 node        → LLM emits PlanContract (intent, nodes, credentials, success_criteria)
+compile_patch_ir    → LLM emits Patch IR ops (AddNode / SetParam / Connect / BindCredential)
+compiler            → deterministically builds flowData from the ops
+create/update call  → sends compiled flowData to Flowise REST API
+```
+
+Skill Patch Context sections must reflect this: the LLM emits ops, not JSON.
+
+---
+
+## Adding a New Skill
 
 1. Create `flowise_dev_agent/skills/<domain_name>.md` following the format above.
 2. Implement a `DomainTools` subclass in `flowise_dev_agent/agent/tools.py`:
@@ -78,10 +104,10 @@ Brief description of what this skill covers.
    ```
 3. Register the domain when building the graph:
    ```python
-   graph = build_graph(engine, domains=[FloviseDomain(flowise_client), WorkdayDomain(workday_client)])
+   graph = build_graph(capabilities=[FloviseDomain(flowise_client), WorkdayCapability(workday_client)])
    ```
 
-No changes to the graph or node logic are needed. The agent merges tools and context from all
+No changes to the graph or node logic are needed — the agent merges tools and context from all
 registered domains automatically.
 
 ---
@@ -89,11 +115,11 @@ registered domains automatically.
 ## Relationship to the Orchestrator Guide
 
 The `FLOWISE_BUILDER_ORCHESTRATOR_CHATFLOW_MCP.md` guide in the `cursorwise` repo is the
-**Cursor IDE behavioral guide** — a comprehensive reference for a human developer using the
+**Cursor IDE behavioral guide** — comprehensive reference for a human developer using the
 Cursorwise MCP directly in Cursor.
 
-The `flowise_builder.md` skill file in this directory is the **agent's knowledge base** —
-a structured, machine-injectable version of the same domain knowledge, organized by phase.
+The `flowise_builder.md` skill file is the **agent's knowledge base** — structured,
+machine-injectable domain knowledge organized by phase.
 
-Both documents cover the same domain. The skills file is leaner and phase-structured.
+Both cover the same Flowise domain. The skill file is leaner and phase-structured.
 The Cursor guide is comprehensive and human-focused. They are maintained independently.

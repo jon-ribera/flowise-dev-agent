@@ -1,439 +1,316 @@
+---
+name: flowise_builder
+description: |
+  Build and update Flowise chatflows using deterministic Patch IR ops compiled by the agent
+  graph. Use when the user wants to create a chatbot, add memory to a flow, build a RAG pipeline,
+  connect custom tools, fix a credential error, or modify any Flowise node composition — even if
+  they don't say "Flowise" or "chatflow" directly. Triggers on: build a chatbot, add GPT-4o,
+  update the flow, wire up memory, create a RAG pipeline, or fix API key errors.
+version: 2.0.0
+---
+
 # Flowise Builder Skill
 
 **Domain**: flowise
-**Version**: 1.0.0
-**MCP Source**: [jon-ribera/cursorwise](https://github.com/jon-ribera/cursorwise) — 50 tools, full Flowise REST API
+**MCP Source**: cursorwise — 50 tools, full Flowise REST API
 
----
-
-## Overview
-
-This skill provides domain-specific knowledge for the Flowise Builder co-pilot.
-It covers chatflow discovery, construction, testing, and the non-negotiable rules
-for building chatflows programmatically via the Cursorwise MCP.
-
-The agent uses this skill to inject phase-specific context into its system prompts.
+> v2.0.0: Patch Context fully rewritten for Patch IR ops. The LLM no longer writes raw flowData.
+> The deterministic compiler (`compile_patch_ir` node) builds flowData from the ops you emit.
 
 ---
 
 ## Discover Context
 
-FLOWISE DISCOVERY RULES:
+Your goal: gather enough state to produce a correct PlanContract. Missing information here causes
+failures in Patch. Work through these steps in order.
 
-Your goal is to gather everything needed to write a correct, working plan.
-Do not skip steps — missing information here causes failures in Patch.
+### Step 1 — Classify intent and mode
 
-### What to gather (in order)
+Determine `operation_mode` before anything else:
 
-1. EXISTING CHATFLOWS
-   Call `list_chatflows` to see all flows. For any flow relevant to the requirement,
-   call `get_chatflow(chatflow_id)` and parse its `flowData` (nodes, edges, prompts).
-   Note: `flowData` is a JSON string — parse it to inspect nodes and edges.
+- **CREATE**: user wants a new chatflow. No `target_chatflow_id` needed.
+- **UPDATE**: user wants to modify an existing flow. Identify `target_chatflow_id`.
 
-2. NODE SCHEMAS
-   For every node type you plan to use, call `get_node(name)`.
-   Do NOT assume input parameter names or baseClasses from the node label.
-   The schemas differ significantly between node types. Key fields to check:
-   - `inputAnchors`: what the node accepts as inputs (name + accepted baseClass)
-   - `outputAnchors`: what the node produces (name + baseClasses)
-   - `inputs`: configurable parameters (including credential requirements)
-   - `baseClasses`: what this node produces downstream
+If UPDATE: call `get_chatflow(chatflow_id)` immediately. Parse `flowData` as JSON to read
+current nodes and edges. You need the existing state to plan safe ops — you cannot plan
+updates without knowing what's already there.
 
-3. CREDENTIALS
-   Call `list_credentials`. For every credential-bearing node in your plan,
-   verify a matching credential exists. The `credentialName` field must match:
-   - `openAIApi` for ChatOpenAI, OpenAI Embeddings
-   - `anthropicApi` for ChatAnthropic
-   - `pineconeApi` for Pinecone Vector Store
-   - (use get_node to verify exact credential type required)
+### Step 2 — Search patterns first (CREATE mode only)
 
-4. MARKETPLACE TEMPLATES
-   Call `list_marketplace_templates`. If a template covers the requirement,
-   use its `flowData` as a starting point rather than building from scratch.
+Before listing nodes or calling get_node, call `search_patterns` with 3–5 key terms from
+the requirement. Pattern reuse skips the node-schema discovery cycle entirely and produces
+higher-confidence results.
 
-### Required: Credential Status Block
-At the very end of your discovery summary, always output EXACTLY one of these two blocks
-(the system reads this to decide whether to pause and ask the developer):
+- Match found with `success_count ≥ 2` → use as the base; note it in the plan; call `use_pattern(id)`.
+- No match → proceed with Steps 3–5.
 
-If all required credentials exist:
+Patterns are NOT seeded in UPDATE mode — they only apply to new flow creation.
+
+### Step 3 — Read node schemas
+
+For every node type you plan to add, call `get_node(name)`. Never guess anchor names or param keys.
+
+What to extract from `get_node`:
+- `inputAnchors`: connection points that accept other nodes — use for Connect ops.
+- `inputParams`: configurable parameters — use for SetParam ops; check `credentialNames` here.
+- `outputAnchors`: what the node produces downstream.
+- `baseClasses`: the types this node satisfies (used in anchor matching).
+- `version`: must match the version field in the compiled node.
+
+### Step 4 — Resolve credentials
+
+Call `list_credentials`. For every node with a `credentialNames` entry in its `inputParams`,
+verify a matching credential exists. Unresolved credentials cause runtime auth failures — the
+compile step succeeds but the flow fails silently at prediction time.
+
+Common credential types:
+- `openAIApi` — ChatOpenAI, OpenAI Embeddings
+- `anthropicApi` — ChatAnthropic
+- `pineconeApi` — Pinecone Vector Store
+
+At the end of discovery, output exactly one of these two blocks (the graph interrupt reads this):
+
 ```
 CREDENTIALS_STATUS: OK
 ```
 
-If any required credentials are missing:
+or:
+
 ```
 CREDENTIALS_STATUS: MISSING
-MISSING_TYPES: openAIApi, anthropicApi
+MISSING_TYPES: openAIApi, pineconeApi
 ```
 
-`MISSING_TYPES` must be a comma-separated list of the credential type names needed
-(e.g., `openAIApi`, `anthropicApi`, `pineconeApi`). Do NOT include credential names
-or IDs — only the type names from `get_node(name).inputs[].credentialNames`.
+`MISSING_TYPES` must be the credential type names from `get_node`, not credential display names or IDs.
 
-### Node category restrictions
-- Sequential Agents / Agent Flows / Multi Agents categories → AGENTFLOW ONLY.
-  Do not use these in Chatflows. Check `get_chatflow` to verify the flow type.
-- Tool-calling agents (toolAgent, conversationalAgent) require function-calling
-  models ONLY: ChatOpenAI, ChatAnthropic, ChatMistral.
+### Step 5 — Check node category restrictions
+
+- Sequential Agents / Multi Agents / Agent Flows categories → AGENTFLOW type only.
+  Do not mix these into CHATFLOW. Check `chatflow_type` on existing flows.
+- Tool-calling agents (`toolAgent`, `conversationalAgent`) require function-calling models:
+  ChatOpenAI, ChatAnthropic, ChatMistral only.
+
+<output_format>
+Return a plan summary (2–4 sentences) followed by a JSON PlanContract code block labeled "plan_v2".
+
+```plan_v2
+{
+  "intent": "<one sentence — what will be built or changed>",
+  "operation_mode": "create" | "update",
+  "target_chatflow_id": "<chatflow ID for UPDATE, null for CREATE>",
+  "pattern_id": <int or null>,
+  "nodes": [
+    {"type": "<node_name>", "role": "<what it does in this flow>"}
+  ],
+  "credentials": [
+    {"name": "<display name>", "type": "<credentialName>", "status": "resolved" | "needed"}
+  ],
+  "success_criteria": [
+    "<testable criterion 1>",
+    "<testable criterion 2>"
+  ]
+}
+```
+
+End with:
+CREDENTIALS_STATUS: OK
+(or CREDENTIALS_STATUS: MISSING block)
+</output_format>
 
 ---
 
 ## Patch Context
 
-FLOWISE PATCH RULES — ALL NON-NEGOTIABLE:
+The compiler (`compile_patch_ir`) builds `flowData` deterministically from the ops you emit.
+**You do not write flowData JSON.** You emit a list of Patch IR ops; the compiler handles
+all node data construction, anchor ID formatting, and edge wiring.
 
-### Rule 1: Read Before Write
-Always call `get_chatflow(chatflow_id)` and parse the `flowData` JSON
-before calling `update_chatflow`. Never overwrite blindly.
+<constraints>
+Always:
+- Read the PlanContract from Discover before emitting any ops — it specifies operation_mode,
+  target_chatflow_id, and which nodes and credentials are needed.
+- Emit ops in dependency order: AddNode before SetParam, SetParam before Connect,
+  Connect before BindCredential. The compiler executes ops sequentially — a Connect op
+  that references a node_id not yet created will fail with a dangling reference error.
+- Read `inputAnchors` and `outputAnchors` from `get_node` for every Connect op.
+  The `target_anchor` must match an `inputAnchor.name` exactly — do not guess it.
 
-### Rule 2: One Change Per Iteration
-Choose exactly ONE of:
-- Add one node (+ its connecting edges)
-- Edit one prompt field
-- Rewire one edge
-Do not combine changes. If the plan requires multiple changes, execute them
-in separate iterations.
+Never:
+- Emit raw flowData JSON. The compiler owns flowData construction — injecting partial or
+  full flowData alongside Patch IR ops produces undefined behavior.
+- Reuse node IDs across separate Patch phases — IDs are scoped to the current compilation.
+- Emit a Connect op whose source_id or target_id was not created by a preceding AddNode op
+  (or already exists in the flow for UPDATE mode).
+</constraints>
 
-### Rule 3: Credential Binding (most common failure)
-Every credential-bearing node MUST have the credential ID in TWO places:
+### Patch IR op reference
+
+<output_format>
+Emit a JSON array of Patch IR ops. The array is the entire output — no prose, no explanation.
+
+Op schemas:
+
 ```json
-{
-  "data": {
-    "inputs": { "credential": "<credential_id>" },
-    "credential": "<credential_id>"
-  }
-}
-```
-Setting ONLY `data.inputs.credential` causes "API key missing" at runtime.
-Setting ONLY `data.credential` also fails. BOTH are required.
-
-### Rule 4: Change Summary (required before every update_chatflow)
-Print this summary before calling update_chatflow:
-
-```
-NODES ADDED:    [nodeId] label="..." name="..."
-NODES REMOVED:  [nodeId] label="..." name="..."
-NODES MODIFIED: [nodeId] fields changed: [fieldName, ...]
-EDGES ADDED:    sourceNodeId → targetNodeId (inputName)
-EDGES REMOVED:  sourceNodeId → targetNodeId (inputName)
-PROMPTS:        [nodeId] field="fieldName"
-                BEFORE: "<first 200 chars>"
-                AFTER:  "<first 200 chars>"
+[
+  {"op_type": "AddNode",        "node_name": "<flowise node type>", "node_id": "<unique id>"},
+  {"op_type": "SetParam",       "node_id": "<id>", "param": "<inputParam.name>", "value": <any>},
+  {"op_type": "Connect",        "source_id": "<id>", "target_id": "<id>", "target_anchor": "<inputAnchor.name>"},
+  {"op_type": "BindCredential", "node_id": "<id>", "credential_id": "<resolved credential id>"}
+]
 ```
 
-### Rule 5: flow_data Minimums
-- Minimum valid flow_data: `{"nodes":[],"edges":[]}`  — never bare `{}`
-- All node IDs in edges must match node IDs in nodes array
-- Preserve existing node IDs across iterations
+Example — simple conversation flow (CREATE):
 
-### Rule 6: Edge Handle Format
-Source handle: `{nodeId}-output-{nodeName}-{baseClasses joined by |}`
-Target handle: `{nodeId}-input-{inputName}-{acceptedBaseClass}`
-
-Use `get_node` to get exact baseClasses and input names. Do not construct
-these handles by guessing — they must match exactly.
-
-### Rule 7: Chatflow Patterns (choose one)
-- Simple Conversation: ChatModel + BufferMemory + ConversationChain
-- Tool Agent: ChatModel + BufferMemory + CustomTool(s) + ToolAgent
-  (requires function-calling model)
-- RAG: ChatModel + VectorStore + Embeddings + **DocumentLoader** + Retriever + ConversationalRetrievalQAChain
-
-**RAG RUNTIME CONSTRAINT**: Every VectorStore node (`memoryVectorStore`, `pinecone`, `faiss`,
-etc.) MUST have a DocumentLoader node (e.g. `plainText`, `textFile`, `pdfFile`, `cheerioWebScraper`)
-wired to its `document` input anchor. Without a document source the VectorStore cannot initialize
-and Flowise returns "Expected a Runnable" (HTTP 500) on every prediction. Always include a
-DocumentLoader when planning any RAG flow.
-
-### Rule 8: Node Data Structure — CRITICAL (missing fields cause HTTP 500)
-
-Every node in `flowData.nodes[].data` MUST include ALL of these keys:
-
-| Key | What it is | How to populate |
-|---|---|---|
-| `inputAnchors` | Node-to-node connection points | Inputs from `get_node` where `type` is a class name (BaseChatModel, BaseMemory, BaseCache, Moderation, etc.) |
-| `inputParams` | Configurable parameters | Inputs from `get_node` where `type` is a primitive (string, number, boolean, credential, asyncOptions, options, json) |
-| `outputs` | Output routing (usually empty) | Always `{}` for single-output nodes |
-| `inputs` | Configured values | Dict with ALL param names as keys, connected anchors use `"{{nodeId.data.instance}}"`, unset optional fields use `""` |
-
-**Splitting rule**: An input is an `inputAnchor` if its `type` starts with uppercase (class name). It is an `inputParam` if its `type` is lowercase.
-
-**ID field**: Each entry in `inputAnchors` and `inputParams` must have:
-`"id": "{nodeId}-input-{name}-{type}"`
-
-**Missing `inputAnchors` causes**: `TypeError: Cannot read properties of undefined (reading 'find')` — HTTP 500 on every prediction call.
-
-**Node version**: Use the `version` returned by `get_node`. Use the `baseClasses` from `get_node` verbatim for `outputAnchors[i].id` (joined by `|`).
-
-**Before every write**: Call `validate_flow_data(flow_data_str)` with the complete flowData JSON string. Fix ALL reported errors before calling `create_chatflow` or `update_chatflow`. Never write invalid flowData to Flowise.
-
-Example correct node data (conversationChain_0):
 ```json
-{
-  "id": "conversationChain_0",
-  "name": "conversationChain",
-  "version": 3,
-  "inputAnchors": [
-    {"label": "Chat Model", "name": "model", "type": "BaseChatModel",
-     "id": "conversationChain_0-input-model-BaseChatModel"},
-    {"label": "Memory", "name": "memory", "type": "BaseMemory",
-     "id": "conversationChain_0-input-memory-BaseMemory"}
-  ],
-  "inputParams": [
-    {"label": "System Message", "name": "systemMessagePrompt", "type": "string",
-     "optional": true, "additionalParams": true,
-     "id": "conversationChain_0-input-systemMessagePrompt-string"}
-  ],
-  "inputs": {
-    "model": "{{chatOpenAI_0.data.instance}}",
-    "memory": "{{bufferMemory_0.data.instance}}",
-    "chatPromptTemplate": "",
-    "inputModeration": "",
-    "systemMessagePrompt": "You are a helpful assistant."
-  },
-  "outputAnchors": [
-    {"id": "conversationChain_0-output-conversationChain-ConversationChain|LLMChain|BaseChain|Runnable",
-     "name": "conversationChain", "label": "ConversationChain",
-     "type": "ConversationChain | LLMChain | BaseChain | Runnable"}
-  ],
-  "outputs": {}
-}
+[
+  {"op_type": "AddNode",        "node_name": "chatOpenAI",        "node_id": "chatOpenAI_0"},
+  {"op_type": "AddNode",        "node_name": "bufferMemory",      "node_id": "bufferMemory_0"},
+  {"op_type": "AddNode",        "node_name": "conversationChain", "node_id": "conversationChain_0"},
+  {"op_type": "SetParam",       "node_id": "chatOpenAI_0",        "param": "modelName",   "value": "gpt-4o"},
+  {"op_type": "SetParam",       "node_id": "bufferMemory_0",      "param": "sessionId",   "value": ""},
+  {"op_type": "Connect",        "source_id": "chatOpenAI_0",      "target_id": "conversationChain_0", "target_anchor": "model"},
+  {"op_type": "Connect",        "source_id": "bufferMemory_0",    "target_id": "conversationChain_0", "target_anchor": "memory"},
+  {"op_type": "BindCredential", "node_id": "chatOpenAI_0",        "credential_id": "<openai-cred-id>"}
+]
 ```
 
-### Rule 9: Text Splitters (RAG flows only)
+Why this order matters: `Connect` references `chatOpenAI_0` and `bufferMemory_0` — both must be
+created by prior `AddNode` ops. `BindCredential` is last because it depends on the node existing.
+</output_format>
 
-Text splitters are **only needed** in flows that load external documents (URLs, PDFs, files) into a vector store. **Never add a text splitter to a simple conversation chain.**
+### Flow patterns (ops summary)
 
-**When to use**: Any flow with a DocumentLoader (Cheerio, Spider, PDF Loader, etc.) that feeds a VectorStore.
-
-**Available types** — always call `get_node(name)` to verify the exact inputAnchors before connecting:
-
-| Node name | Best for |
-|---|---|
-| `recursiveCharacterTextSplitter` | Default choice — general text, HTML, plain text, code |
-| `htmlToMarkdownTextSplitter` | Web content from Cheerio or Spider web scrapers |
-| `characterTextSplitter` | Simple splits with a known separator |
-| `markdownTextSplitter` | Markdown documents |
-| `tokenTextSplitter` | Token-exact splits when context window size matters |
-
-**Connection pattern** — text splitters typically connect to the Document Loader, not directly to the vector store:
+**Simple conversation** (CREATE):
 ```
-[TextSplitter] → [DocumentLoader].textSplitter (inputAnchor)
-[DocumentLoader] → [VectorStore].document (inputAnchor)
-```
-Always verify with `get_node` which inputAnchors on the loader and vector store accept `TextSplitter`.
-
-**Key parameters**:
-- `chunkSize`: 1000–2000 for most content (default 1000)
-- `chunkOverlap`: 10–20% of chunkSize (default 200)
-- Web content (Cheerio/Spider): use `chunkSize: 2000`, `chunkOverlap: 200`
-- Code: use `codeTextSplitter` and set `language` to the source language
-
-### Rule 10: AGENTFLOW Pattern (Sequential / Multi-Agent)
-
-Use AGENTFLOW **only** when the requirement explicitly needs agent-to-agent orchestration
-(supervisor directing workers, sequential hand-offs between specialized agents, etc.).
-**Do not use for single-agent chatflows** — ConversationChain or ToolAgent is simpler and preferred.
-
-Key differences from CHATFLOW:
-- Set `chatflow_type: "AGENTFLOW"` in `create_chatflow`
-- Use nodes from **"Sequential Agents"** and **"Multi Agents"** categories ONLY
-- These node categories **cannot** be mixed into CHATFLOW flows
-- Call `list_nodes` and filter by `category` to see available AGENTFLOW nodes
-
-Common AGENTFLOW nodes:
-
-| Node | Category | Role |
-|---|---|---|
-| `seqStart` | Sequential Agents | Entry point — starts the agent chain |
-| `seqEnd` | Sequential Agents | Terminal node — ends the chain |
-| `supervisor` | Multi Agents | Orchestrates multiple worker agents |
-| `worker` | Multi Agents | Individual agent with its own tools |
-
-Typical pattern:
-```
-seqStart → supervisor → worker_1
-                      → worker_2
-                      → seqEnd
+AddNode(chatOpenAI_0) + AddNode(bufferMemory_0) + AddNode(conversationChain_0)
+→ SetParam(chatOpenAI_0, modelName, "gpt-4o")
+→ Connect(chatOpenAI_0 → conversationChain_0.model)
+→ Connect(bufferMemory_0 → conversationChain_0.memory)
+→ BindCredential(chatOpenAI_0, <cred_id>)
 ```
 
-Always call `get_node` on each AGENTFLOW node type before building — their inputAnchors
-and outputAnchors differ from standard Chatflow nodes.
-
-### Rule 11: RAG — Upsert Before Query
-
-For any RAG flow with a VectorStore, always upsert documents BEFORE testing predictions.
-A new VectorStore is empty — queries return empty results until data is loaded.
-
-**Upsert pattern**:
-1. After creating or modifying the chatflow, call `upsert_vector(chatflow_id)` to load documents
-2. Verify upsert succeeded (check response for document count or success status)
-3. Then run `create_prediction` to test retrieval
-
-**When to upsert**:
-- After creating a new RAG chatflow
-- After changing the DocumentLoader source URL/file
-- After changing chunk size or embeddings model
-- Any time you suspect the vector store is stale
-
-**Error patterns**:
-- `"No vector node found"` → the chatflow has no VectorStore node (wrong flow type, skip upsert)
-- Empty prediction response after upsert → check embeddings model credential binding
-
-### Rule 12: OpenAI Assistant Node
-
-The `openAIAssistant` node wraps the OpenAI Assistants API. It requires:
-
-- `details` field MUST be a JSON string, not a nested object:
-  ```json
-  {"details": "{\"assistantId\": \"asst_...\"}"}
-  ```
-  Sending `details` as a dict causes `"[object Object]" is not valid JSON`.
-- The assistant must already exist in your OpenAI account.
-  Use `get_node("openAIAssistant")` to verify the exact `inputs` schema before building.
-- Credential: `openAIApi` — bind at BOTH `data.credential` AND `data.inputs.credential`.
-
-**When to use**: The requirement explicitly asks for OpenAI Assistants (file search,
-code interpreter, or a pre-configured assistant personality). For general conversation,
-use `conversationChain` + `chatOpenAI` instead (simpler, cheaper).
-
-### Rule 13: Custom Tool Node
-
-Custom tools let agents call external APIs. Required fields:
-
-- `color`: MUST be a hex color string (e.g. `"#4CAF50"`).
-  Missing color causes `NOT NULL constraint failed: tool.color` (HTTP 500).
-- `schema`: JSON Schema string describing the tool's input parameters.
-- `func`: JavaScript function body that calls the external API.
-
-**Example node data**:
-```json
-{
-  "name": "getWeather",
-  "description": "Get current weather for a city",
-  "color": "#4CAF50",
-  "schema": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}",
-  "func": "const resp = await fetch(`https://api.weather.com/v1/${city}`); return resp.json();"
-}
+**RAG pipeline** (CREATE):
+```
+AddNode(chatOpenAI_0) + AddNode(openAIEmbeddings_0) + AddNode(memoryVectorStore_0)
+  + AddNode(plainText_0) + AddNode(conversationalRetrievalQAChain_0)
+→ SetParam(plainText_0, text, "<content>")
+→ Connect(openAIEmbeddings_0 → memoryVectorStore_0.embeddings)
+→ Connect(plainText_0 → memoryVectorStore_0.document)
+→ Connect(chatOpenAI_0 → conversationalRetrievalQAChain_0.model)
+→ Connect(memoryVectorStore_0 → conversationalRetrievalQAChain_0.vectorStoreRetriever)
+→ BindCredential(chatOpenAI_0, <cred_id>) + BindCredential(openAIEmbeddings_0, <cred_id>)
 ```
 
-Call `get_node("customTool")` to verify exact schema before building.
+RAG constraint: every VectorStore MUST have a DocumentLoader connected to its `document` anchor.
+Without a document source, Flowise returns "Expected a Runnable" (HTTP 500) on every prediction.
 
-### Rule 14: Pattern Library — Reuse Before Building
+**Tool agent** (CREATE):
+```
+AddNode(chatOpenAI_0) + AddNode(bufferMemory_0) + AddNode(toolAgent_0)
+  + AddNode(customTool_0)
+→ SetParam(chatOpenAI_0, modelName, "gpt-4o")
+→ Connect(chatOpenAI_0 → toolAgent_0.model)
+→ Connect(bufferMemory_0 → toolAgent_0.memory)
+→ Connect(customTool_0 → toolAgent_0.tools)
+→ BindCredential(chatOpenAI_0, <cred_id>)
+```
 
-At the start of every Discover phase, call `search_patterns(keywords)` with
-3–5 key terms from the requirement before doing any other discovery.
+Tool agents require function-calling models (ChatOpenAI, ChatAnthropic, ChatMistral).
 
-**Why**: Patterns are proven working flowData from past successful sessions.
-Reusing a pattern skips the list_nodes/get_node/validate cycle and produces
-a higher-confidence result on the first iteration.
+**UPDATE mode** — emit only the delta ops:
+```
+AddNode(bufferMemory_0)                         ← new node only
+→ Connect(bufferMemory_0 → conversationChain_0.memory)  ← wire to existing node
+```
+Do not re-emit AddNode for nodes already in the flow.
 
-**Decision tree**:
-1. `search_patterns("customer support GPT-4o memory")` → returns match
-2. If `success_count ≥ 2`: strongly prefer this pattern; note it in the plan
-3. Call `use_pattern(id)` to record reuse
-4. In Patch: use the pattern's `flow_data` as the base; modify only what differs
-5. If no match: proceed with normal discovery
-
-**When NOT to reuse**:
-- The requirement explicitly asks for a different model, memory type, or architecture
-- The pattern's requirement_text differs significantly (different domain/purpose)
-- The pattern has no `flow_data` (legacy record)
-
-**Pattern save**: After every DONE verdict the agent automatically saves the
-new pattern. You do not need to call any tool to save it.
-
-### After patching
-Confirm:
-- The chatflow_id of the created/updated flow
-- What specifically changed (1-2 sentences)
+**AGENTFLOW** — use when requirement needs agent-to-agent orchestration:
+- Set chatflow_type AGENTFLOW in the plan
+- Use Sequential Agents / Multi Agents category nodes only (seqStart, seqEnd, supervisor, worker)
+- Cannot mix AGENTFLOW and CHATFLOW node categories
 
 ---
 
 ## Test Context
 
-FLOWISE TEST RULES:
+The graph dispatches predictions before you receive this context. You will be given raw API
+responses for happy-path and edge-case trials. **Your role is evaluation only — do not call
+any tools.**
 
-### Run two tests for every patch
+### Evaluation criteria
 
-TEST 1 — Happy Path
-A normal, expected input that the chatflow is designed to handle.
-Use `create_prediction` with `override_config='{"sessionId": "test-happy-<timestamp>"}'`
-to isolate this session from production history.
-
-TEST 2 — Edge Case
-Choose one of:
-- Missing expected field or context
-- Ambiguous input that could be misinterpreted
-- Boundary condition (very short, very long, off-topic)
-Use a different sessionId: `override_config='{"sessionId": "test-edge-<timestamp>"}'`
-
-### Report format (required)
-For each test:
-- Input sent: `"<the question>"`
-- Response received: `"<full response text or summary>"`
-- Status: PASS or FAIL
-- If FAIL: which node likely failed and why
-
-Final line must be:
-`RESULT: HAPPY PATH [PASS/FAIL] | EDGE CASE [PASS/FAIL]`
-
-### Multi-turn conversation testing
-To simulate a real conversation, use the same sessionId across multiple
-`create_prediction` calls sequentially. Verify the chatflow remembers context.
-
-### Rule 15: Your Role in the Test Phase Is Evaluation Only (DD-040)
-
-The agent does **not** invoke `create_prediction` itself in the Test phase.
-Predictions are dispatched in parallel by the framework before you receive this context.
-You will be given the raw API responses for:
-
-- **Happy-path trial(s)**: requirement-driven input, sessionId `test-<id>-happy-t<N>`
-- **Edge-case trial(s)**: empty/boundary input, sessionId `test-<id>-edge-t<N>`
-
-Your job is to **evaluate** these responses, not to call any tools.
-
-Evaluation criteria:
+For each trial response, assess:
 1. Did the response address the input meaningfully? (not empty, not an error trace)
-2. Does the response satisfy the SUCCESS CRITERIA from the approved plan?
-3. If `test_trials > 1`, ALL trials must pass for the test to count as PASS.
+2. Does the response satisfy the SUCCESS_CRITERIA from the PlanContract?
+3. Is the response free of Flowise runtime error strings (HTTP 500, "Expected a Runnable",
+   "API key missing", etc.)?
 
-Do **not** call `create_prediction`, `get_chatflow`, or any other tool.
-Produce only your evaluation report ending with the required RESULT line.
+### Verdict rules
+
+- **DONE**: All trials PASS and all SUCCESS_CRITERIA are met → emit DONE verdict.
+- **ITERATE**: Any trial FAILS or a SUCCESS_CRITERION is not met → emit ITERATE verdict
+  with a 1–2 sentence diagnosis of the likely root cause.
+
+<output_format>
+Report format (one block per trial, then final verdict):
+
+Trial 1 (happy-path):
+  Input: "<the question>"
+  Response: "<full response or first 300 chars>"
+  Status: PASS | FAIL
+  Notes: "<optional — what specifically failed or succeeded>"
+
+Trial 2 (edge-case):
+  Input: "<the question>"
+  Response: "<full response or first 300 chars>"
+  Status: PASS | FAIL
+  Notes: "<optional>"
+
+RESULT: HAPPY PATH [PASS/FAIL] | EDGE CASE [PASS/FAIL]
+VERDICT: DONE | ITERATE
+DIAGNOSIS: <if ITERATE — one sentence on the most likely root cause>
+</output_format>
+
+### RAG post-patch reminder
+
+For RAG flows: the graph calls `upsert_vector` automatically after patching. If the happy-path
+trial returns empty results, the likely cause is a credential binding failure on the embeddings
+node (not an upsert issue).
 
 ---
 
 ## Error Reference
 
-Common errors encountered when building chatflows programmatically:
-
-| Error | Root Cause | Fix |
+| Error | Root Cause | Fix in Patch IR terms |
 |---|---|---|
-| `nodes is not iterable` (HTTP 500) | `flowData` sent as `{}` | Always use `{"nodes":[],"edges":[]}` as minimum |
-| `Cannot read properties of undefined (reading 'find')` (HTTP 500) | Node data missing `inputAnchors` key | Add `inputAnchors`, `inputParams`, and `outputs` to every node's data (see Rule 8) |
-| `NOT NULL constraint failed: tool.color` | Custom tool missing `color` field | Add `"color": "#4CAF50"` to tool node data |
-| `"[object Object]" is not valid JSON` | OpenAI assistant `details` sent as dict | `details` must be a JSON string, not a nested object |
-| `OPENAI_API_KEY environment variable is missing` | Credential set only at `data.inputs.credential` | Set at BOTH `data.inputs.credential` AND `data.credential` |
-| `Ending node must be either a Chain or Agent` | No terminal node in the flow | Ensure a Chain or Agent node is the last node with no outgoing edges |
-| `404 Not Found` on create_prediction | Wrong chatflow_id | Verify with `list_chatflows` |
-| `Message with ID ... not found` | Invalid messageId for feedback | Use real ID from `list_chat_messages` |
-| `No vector node found` | `upsert_vector` called on non-vector chatflow | Chatflow must have a vector store node |
-| Empty/short response | Structured output still active on a node | Remove structured output schema from any writer/output node |
+| `nodes is not iterable` (HTTP 500) | Compiler received empty flowData | Internal compiler error — check AddNode ops have valid `node_name` |
+| `Cannot read properties of undefined (reading 'find')` | Missing `inputAnchors` in compiled node | `node_name` in AddNode does not match a valid Flowise node type — verify with `get_node` |
+| `NOT NULL constraint failed: tool.color` | customTool missing color | Add `SetParam(customTool_0, color, "#4CAF50")` |
+| `"[object Object]" is not valid JSON` | openAIAssistant `details` as dict | SetParam value must be a JSON string: `"{\"assistantId\": \"asst_...\"}"` |
+| `OPENAI_API_KEY environment variable is missing` | Credential not bound | Emit `BindCredential` op — the compiler sets both required credential fields |
+| `Ending node must be either a Chain or Agent` | No terminal node in flow | Ensure ConversationChain, ToolAgent, or equivalent is the last node |
+| `Expected a Runnable` (RAG, HTTP 500) | VectorStore has no DocumentLoader | Add `AddNode(plainText_0)` + `Connect(plainText_0 → vectorStore.document)` |
+| Empty prediction response | Embeddings credential unbound | Add `BindCredential` op for the embeddings node |
+| `No vector node found` on upsert | Flow has no VectorStore | Only call upsert on flows with a VectorStore node |
+| Dangling reference in Connect | node_id in Connect not in AddNode | Check op ordering — AddNode must precede all Connect ops referencing that node |
 
 ---
 
-## Node Quick Reference
+## Changelog
 
-Key nodes and their connection patterns:
+### 2.0.0 (2026-02-24)
+- Complete rewrite of Patch Context for Patch IR ops (AddNode/SetParam/Connect/BindCredential)
+- Added PlanContract `<output_format>` spec to Discover Context
+- Added CREATE vs UPDATE mode guidance throughout
+- Removed raw flowData construction rules (Rules 1–8) — compiler handles this now
+- Removed Change Summary requirement (Rule 4) — compiler owns the patch transaction
+- Added pattern search step (Step 2) with UPDATE mode guard (M9.9)
+- Added op ordering explanation with WHY reasoning
+- Applied WHY-based rewrites throughout; removed ALL-CAPS mandates
+- Extracted Node Quick Reference into Error Reference section
+- Added YAML frontmatter with triggering description
+- Rewrote Test Context RESULT/VERDICT format to include DONE/ITERATE
 
-| Pattern | Nodes | Connection |
-|---|---|---|
-| Simple chat | ChatOpenAI → ConversationChain ← BufferMemory | ChatOpenAI.BaseChatModel → model; BufferMemory.BaseMemory → memory |
-| Tool agent | ChatOpenAI + CustomTool → ToolAgent ← BufferMemory | ChatOpenAI → model; CustomTool → tools; BufferMemory → memory |
-| RAG | ChatOpenAI + PineconeVS + Embeddings → ConversationalRetrievalQAChain | PineconeVS → vectorStoreRetriever; Embeddings → embeddings; ChatOpenAI → model |
-
-Prompt field names by node type:
-- `conversationChain`: `systemMessagePrompt`
-- `toolAgent` / `conversationalAgent`: `systemMessage`
-- `llmChain`: via connected `chatPromptTemplate` node
-- General: `prompt`, `template`, `instructions`, `humanMessage`, `systemPrompt`
+### 1.0.0 (initial)
+- Original 15-rule LLM-driven patch rules (raw flowData construction)
+- Rules 1–15 covering read-before-write, credential binding, change summary

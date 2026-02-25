@@ -1,0 +1,16 @@
+{
+  "session": "current",
+  "agents": {
+    "frontend-engineer": "a82c2873f43c29bc6",
+    "qa-automation": "aefcf8d254c66550c"
+  },
+  "output_files": {
+    "frontend-engineer": "C:/Users/JON~1.RIB/AppData/Local/Temp/claude/c--Users-jon-ribera-Desktop-FloWiseDevAgent/tasks/a82c2873f43c29bc6.output",
+    "qa-automation": "C:/Users/JON~1.RIB/AppData/Local/Temp/claude/c--Users-jon-ribera-Desktop-FloWiseDevAgent/tasks/aefcf8d254c66550c.output"
+  },
+  "checkpoint_files": {
+    "backend": "docs/.ux1-backend-status.json",
+    "frontend": "docs/.ux1-frontend-status.json",
+    "qa": "docs/.ux1-qa-status.json"
+  }
+}

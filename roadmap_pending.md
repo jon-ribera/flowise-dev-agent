@@ -7,7 +7,7 @@ Items in this file have **no corresponding Design Decision (DD)** in
 When an item is shipped, add a DD entry to DESIGN_DECISIONS.md and move the
 item to [roadmap_shipped.md](roadmap_shipped.md).
 
-Next available DD number: **DD-075**
+Next available DD number: **DD-076**
 
 ---
 
@@ -206,7 +206,7 @@ When implementing any item above:
 1. Implement the feature.
 2. Write tests (regression: `pytest tests/ -q` must stay green).
 3. Add a DD entry in [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) using the
-   next available DD number (currently **DD-071**).
+   next available DD number (currently **DD-076**).
 4. Move the item from this file to [roadmap_shipped.md](roadmap_shipped.md)
    under the appropriate original roadmap section.
 5. Update the DD index table in `roadmap_shipped.md`.

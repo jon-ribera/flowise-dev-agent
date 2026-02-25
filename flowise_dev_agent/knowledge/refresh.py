@@ -55,7 +55,11 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
-_REFERENCE_MD = _REPO_ROOT / "FLOWISE_NODE_REFERENCE.md"
+
+# M9.4: canonical source filename — single constant used everywhere so it is
+# easy to verify in tests and impossible to drift between CLI help and logic.
+_CANONICAL_REFERENCE_NAME = "FLOWISE_NODE_REFERENCE.md"
+_REFERENCE_MD = _REPO_ROOT / _CANONICAL_REFERENCE_NAME
 _SCHEMAS_DIR = _REPO_ROOT / "schemas"
 _NODES_SNAPSHOT = _SCHEMAS_DIR / "flowise_nodes.snapshot.json"
 _NODES_META = _SCHEMAS_DIR / "flowise_nodes.meta.json"
@@ -601,7 +605,16 @@ def refresh_nodes(dry_run: bool = False, validate: bool = False) -> int:
     Returns exit code (0 = success, 1 = error).
     """
     if not _REFERENCE_MD.exists():
-        logger.error("FLOWISE_NODE_REFERENCE.md not found at %s", _REFERENCE_MD)
+        logger.error(
+            "Missing canonical node reference: %s\n"
+            "  Expected path : %s\n"
+            "  This file is the single source of truth for all Flowise node schemas.\n"
+            "  Without it the snapshot cannot be regenerated deterministically.\n"
+            "  To restore   : git checkout HEAD -- %s",
+            _CANONICAL_REFERENCE_NAME,
+            _REFERENCE_MD,
+            _CANONICAL_REFERENCE_NAME,
+        )
         return 1
 
     logger.info("Parsing %s …", _REFERENCE_MD)

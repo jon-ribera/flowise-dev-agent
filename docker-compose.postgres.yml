@@ -1,0 +1,34 @@
+version: "3.9"
+
+# Local Postgres for flowise-dev-agent development and testing.
+# Usage:
+#   docker compose -f docker-compose.postgres.yml up -d
+#
+# Then set env vars:
+#   CHECKPOINTER=postgres
+#   POSTGRES_DSN=postgresql://postgres:postgres@localhost:5432/flowise_dev_agent
+#
+# See roadmap9_production_graph_runtime_hardening.md — Milestone 9.1.
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: flowise_dev_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d flowise_dev_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  pgdata:
+    driver: local

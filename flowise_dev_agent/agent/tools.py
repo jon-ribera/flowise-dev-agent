@@ -194,9 +194,11 @@ _FLOWISE_DISCOVER_TOOLS: list[ToolDef] = [
         (
             "Get the full schema for a specific Flowise node type, pre-processed for flowData. "
             "Returns inputAnchors (node-connection points with {nodeId} placeholder IDs), "
-            "inputParams (configurable fields), outputAnchors, and outputs — all ready to embed "
-            "in flowData node data. Replace {nodeId} with your actual node ID (e.g. 'chatOpenAI_0'). "
-            "Always call this before adding a node — never guess the schema."
+            "inputParams (configurable fields), outputAnchors, and outputs. "
+            "DISCOVER PHASE: Do NOT call this — all 303 schemas are pre-loaded locally and the "
+            "patch phase resolves them automatically. Only call during discover to verify an "
+            "unusual parameter that cannot be inferred from context. "
+            "PATCH PHASE: Call freely for any node you are adding — never guess the schema."
         ),
         {"name": {"type": "string", "description": "Node type name, e.g. 'chatOpenAI', 'conversationChain'"}},
         ["name"],
@@ -365,11 +367,12 @@ _FLOWISE_TEST_TOOLS: list[ToolDef] = [
 # ---------------------------------------------------------------------------
 
 _FLOWISE_DISCOVER_CONTEXT = """
-FLOWISE-SPECIFIC DISCOVERY RULES:
+FLOWISE-SPECIFIC DISCOVERY RULES (M9.3 — knowledge-first):
 - Call list_chatflows first to find existing flows relevant to the requirement.
 - For any candidate chatflow, call get_chatflow to read its flowData (nodes, edges, prompts).
-- For each node type you plan to use, call get_node to verify its exact input schema and baseClasses.
-  Do not guess node schemas — they vary significantly between node types.
+- Do NOT call get_node during discover — all 303 node schemas are pre-loaded locally and the
+  patch phase resolves them automatically for every node in the approved plan. Calling get_node
+  here wastes tokens and provides no accuracy benefit over the local snapshot.
 - Call list_credentials to verify the credentials needed by your planned nodes already exist.
 - Call list_marketplace_templates and check if a pre-built template covers the requirement.
 - Pay special attention to:

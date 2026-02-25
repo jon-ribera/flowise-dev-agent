@@ -102,20 +102,21 @@ _SCHEMA_DRIFT_POLICY: str = os.environ.get(
 _DISCOVER_BASE = """\
 You are a Flowise co-pilot in the DISCOVER phase.
 
-Your job: use the available tools to gather EVERYTHING you need before planning.
-This is read-only — no creates or updates.
+Your job: gather the context needed to write a correct plan. This phase is READ-ONLY.
 
 WHAT TO GATHER:
 1. Existing chatflows relevant to the requirement (list_chatflows → get_chatflow for relevant ones)
-2. Node types for the planned flow pattern (get_node for every candidate node — never guess schemas)
+2. Which node types will be needed — identify them by name only; do NOT call get_node
+   (all 303 node schemas are pre-loaded locally; the patch phase resolves them automatically)
 3. Credentials already saved in Flowise (list_credentials)
 4. Marketplace templates that might apply (list_marketplace_templates)
 
-RULE: Call get_node for EVERY node you intend to include in the flow — do not call it for nodes
-you are merely exploring. All get_node results are served from a local schema cache; there are no
-network calls for any of the 303 known nodes. Call it freely — never guess or skip it. Input
-parameter names and baseClasses vary significantly between nodes and cannot be assumed from the
-node's label.
+NODE SCHEMA CONTRACT (M9.3): All 303 Flowise node schemas are pre-loaded in a local snapshot.
+The patch phase automatically resolves schemas for every node in the approved plan via the
+local cache — zero API calls for known nodes. Do NOT call get_node during discover. Calling it
+here is redundant and wastes tokens without improving accuracy.
+Only call get_node during discover if you need to verify a specific unusual parameter that
+cannot be inferred from context and is not covered by any documented constraint below.
 
 RAG CONSTRAINT: Vector stores (memoryVectorStore, pinecone, faiss, etc.) require a document
 loader node (plainText, textFile, pdfFile, etc.) wired to their "document" input anchor. Without
@@ -335,6 +336,112 @@ Use STRUCTURE when flowData is missing required keys or has invalid edges.
 Use LOGIC when the flow produces wrong or empty responses despite correct structure.
 Use INCOMPLETE when tests were not run or produced no results.
 """
+
+
+# ---------------------------------------------------------------------------
+# M9.3 — Knowledge-first schema repair constants and helpers
+# ---------------------------------------------------------------------------
+
+_MAX_SCHEMA_REPAIRS: int = 10
+"""Maximum targeted API repair calls per patch iteration (M9.3).
+
+When the local NodeSchemaStore snapshot is missing a node type, one API call is
+made (repair-only path). This budget caps the number of such calls per iteration
+so a malformed plan cannot drive unbounded network activity. Nodes beyond the
+budget are skipped with a warning; their AddNode ops will fail at compile time.
+"""
+
+
+async def _repair_schema_for_ops(
+    node_names: "set[str]",
+    node_store: "Any | None",
+    executor: dict,
+    prior_flowise_debug: dict,
+    max_repairs: int = _MAX_SCHEMA_REPAIRS,
+) -> "tuple[dict[str, dict], list[dict], dict]":
+    """Resolve node schemas for AddNode ops — local-first, repair-only API calls.
+
+    Knowledge-first contract (M9.3):
+      - Local snapshot HIT  → zero API calls (fast path)
+      - Local snapshot MISS → ONE targeted ``get_node`` API call per missing type
+      - Budget capped at ``max_repairs`` API calls per invocation; additional
+        misses are logged and skipped (AddNode for that type will fail to compile)
+
+    This is the canonical schema-resolution path.  It is called from Phase D of
+    ``_make_patch_node_v2`` and can be exercised in isolation by tests.
+
+    Args:
+        node_names:        Set of node type names extracted from AddNode ops.
+        node_store:        ``NodeSchemaStore`` instance (local snapshot).
+                           If ``None`` the legacy API-always path is used.
+        executor:          Tool executor dict that can dispatch ``get_node`` calls.
+        prior_flowise_debug: Current ``debug["flowise"]`` dict (for merging events).
+        max_repairs:       Budget — max API calls this invocation (default 10).
+
+    Returns:
+        (schema_cache, repair_events, debug_update)
+
+        schema_cache:    ``{node_type: schema_dict}`` for every resolved node.
+        repair_events:   List of repair event dicts (empty when all cache hits).
+        debug_update:    Partial ``{"flowise": {...}}`` dict to merge into
+                         ``state["debug"]``; empty dict when no repairs occurred.
+    """
+    schema_cache: dict[str, dict] = {}
+    repair_events: list[dict] = []
+
+    async def _api_fetcher(node_type: str) -> dict:
+        """Single targeted get_node API call — invoked ONLY on cache miss."""
+        _result = await execute_tool("get_node", {"name": node_type}, executor)
+        if isinstance(_result, ToolResult) and _result.ok and isinstance(_result.data, dict):
+            return _result.data
+        return {}
+
+    for node_type in node_names:
+        if node_store is not None:
+            # Enforce repair budget — count repairs so far
+            repairs_so_far = len(repair_events)
+            if repairs_so_far >= max_repairs:
+                logger.warning(
+                    "[repair_schema] Budget exhausted (%d/%d) — skipping '%s'; "
+                    "AddNode op for this type will fail at compile time",
+                    repairs_so_far, max_repairs, node_type,
+                )
+                continue
+
+            # Fast path: local snapshot hit → zero API calls
+            # Slow path: cache miss → ONE targeted get_node call (repair)
+            _schema = await node_store.get_or_repair(
+                node_type, _api_fetcher, repair_events_out=repair_events,
+            )
+        else:
+            # Legacy path (no local store) — always call API
+            _legacy = await execute_tool("get_node", {"name": node_type}, executor)
+            _schema = (
+                _legacy.data
+                if isinstance(_legacy, ToolResult) and _legacy.ok and isinstance(_legacy.data, dict)
+                else None
+            )
+
+        if _schema:
+            schema_cache[node_type] = _schema
+        else:
+            logger.warning(
+                "[repair_schema] Schema unavailable for '%s' — AddNode will fail", node_type
+            )
+
+    # Build debug update for repair events
+    debug_update: dict = {}
+    if repair_events:
+        logger.info("[repair_schema] %d repair event(s) recorded", len(repair_events))
+        existing_events = prior_flowise_debug.get("knowledge_repair_events", [])
+        debug_update = {
+            "flowise": {
+                **prior_flowise_debug,
+                "knowledge_repair_events": existing_events + repair_events,
+            }
+        }
+
+    return schema_cache, repair_events, debug_update
 
 
 async def _fire_webhook(url: str, payload: dict) -> None:
@@ -1413,13 +1520,13 @@ def _make_patch_node_v2(
             }
 
         # ---- Phase D: Resolve schemas for new node types (local-first) -------
-        # Roadmap 6 M1: check FlowiseKnowledgeProvider snapshot first.
-        # A targeted get_node API call is made ONLY for node types absent from
-        # the local snapshot (repair-only — never fetched when snapshot has the node).
-        # Repair events are accumulated and written to debug["flowise"]["knowledge_repair_events"].
+        # M9.3: All schema resolution goes through _repair_schema_for_ops().
+        # Fast path: local snapshot HIT  → zero API calls.
+        # Slow path: local snapshot MISS → ONE targeted get_node API call (repair).
+        # Budget capped at _MAX_SCHEMA_REPAIRS per iteration.
         schema_cache: dict[str, dict] = {}
-        _phase_d_repair_events: list[dict] = []   # populated only on cache miss
-        _phase_d_debug: dict = {}                  # merged into final return's "debug" key
+        _phase_d_repair_events: list[dict] = []
+        _phase_d_debug: dict = {}
 
         new_node_names = {
             op.node_name for op in ops
@@ -1431,60 +1538,23 @@ def _make_patch_node_v2(
             if new_node_names:
                 provider = flowise_cap.knowledge if flowise_cap else None
                 node_store = provider.node_schemas if provider else None
+                _prior_flowise_debug = (state.get("debug") or {}).get("flowise") or {}
 
-                async def _api_fetcher(node_type: str) -> dict:
-                    """Single targeted get_node API call — invoked ONLY on cache miss."""
-                    _result = await execute_tool(
-                        "get_node", {"name": node_type}, discover_executor
+                schema_cache, _phase_d_repair_events, _phase_d_debug = (
+                    await _repair_schema_for_ops(
+                        node_names=new_node_names,
+                        node_store=node_store,
+                        executor=discover_executor,
+                        prior_flowise_debug=_prior_flowise_debug,
                     )
-                    if isinstance(_result, ToolResult) and _result.ok and isinstance(_result.data, dict):
-                        return _result.data
-                    return {}
-
-                for _name in new_node_names:
-                    if node_store is not None:
-                        # Fast path: local snapshot hit → zero API calls
-                        # Slow path: cache miss → ONE targeted get_node call (repair)
-                        _schema = await node_store.get_or_repair(
-                            _name, _api_fetcher, repair_events_out=_phase_d_repair_events
-                        )
-                    else:
-                        # capabilities=None legacy path — always calls API (unchanged behaviour)
-                        _legacy = await execute_tool(
-                            "get_node", {"name": _name}, discover_executor
-                        )
-                        _schema = (
-                            _legacy.data
-                            if isinstance(_legacy, ToolResult) and _legacy.ok and isinstance(_legacy.data, dict)
-                            else None
-                        )
-
-                    if _schema:
-                        schema_cache[_name] = _schema
-                    else:
-                        logger.warning("[PATCH v2] Schema unavailable for '%s' — AddNode will fail", _name)
-
-                # Build debug update for repair events (written to state via return dict)
-                if _phase_d_repair_events:
-                    logger.info("[PATCH v2] Knowledge repair events: %d", len(_phase_d_repair_events))
-                    _existing_events = state.get("debug", {}).get("flowise", {}).get(
-                        "knowledge_repair_events", []
-                    )
-                    _phase_d_debug = {
-                        "flowise": {
-                            **state.get("debug", {}).get("flowise", {}),
-                            "knowledge_repair_events": _existing_events + _phase_d_repair_events,
-                        }
-                    }
+                )
 
                 m_d.cache_hits = len(new_node_names) - len(_phase_d_repair_events)
                 m_d.repair_events = len(_phase_d_repair_events)
 
                 # M8.2: record total get_node calls in debug for session telemetry
                 if node_store is not None and node_store._call_count > 0:
-                    _gn_flowise = _phase_d_debug.get("flowise") or (
-                        (state.get("debug") or {}).get("flowise") or {}
-                    )
+                    _gn_flowise = _phase_d_debug.get("flowise") or _prior_flowise_debug
                     _prior_calls = _gn_flowise.get("get_node_calls_total", 0)
                     _phase_d_debug["flowise"] = {
                         **_gn_flowise,
@@ -2413,6 +2483,7 @@ def build_graph(
     client: "FlowiseClient | None" = None,
     pattern_store=None,
     capabilities: "list[DomainCapability] | None" = None,
+    emit_event=None,
 ):
     """Construct and compile the Flowise Builder co-pilot LangGraph.
 
@@ -2439,6 +2510,13 @@ def build_graph(
                        When None (default), all behavior is identical to pre-refactor:
                          - discover uses legacy DomainTools merge path
                          - patch uses legacy LLM-driven full flowData generation
+        emit_event:    Optional async callable ``(session_id, node_name, phase,
+                       status, duration_ms=None, summary=None, payload=None)``.
+                       When provided, every node is wrapped to emit lifecycle
+                       events (started / completed / failed / interrupted) to the
+                       session_events table via EventLog.insert_event.
+                       Pass ``None`` (default) to disable event emission.
+                       See roadmap9_production_graph_runtime_hardening.md — M9.2.
 
     Returns:
         Compiled LangGraph graph ready for ainvoke() / invoke().
@@ -2473,15 +2551,22 @@ def build_graph(
                 _template_store = _cap.knowledge.template_store
                 break
 
-    builder.add_node("clarify",             _make_clarify_node(engine))
-    builder.add_node("discover",            _make_discover_node(engine, domains, capabilities))
-    builder.add_node("check_credentials",   _make_check_credentials_node())
-    builder.add_node("plan",                _make_plan_node(engine, domains, _template_store, pattern_store=pattern_store))
-    builder.add_node("human_plan_approval", _make_human_plan_approval_node())
-    builder.add_node("patch",               patch_node)
-    builder.add_node("test",                _make_test_node(engine, domains))
-    builder.add_node("converge",            _make_converge_node(engine, client=client, pattern_store=pattern_store, capabilities=capabilities))
-    builder.add_node("human_result_review", _make_human_result_review_node())
+    # M9.2: wrap every node with lifecycle event emission when emit_event is provided.
+    def _w(name: str, fn):
+        if emit_event is None:
+            return fn
+        from flowise_dev_agent.persistence.hooks import wrap_node
+        return wrap_node(name, fn, emit_event)
+
+    builder.add_node("clarify",             _w("clarify",             _make_clarify_node(engine)))
+    builder.add_node("discover",            _w("discover",            _make_discover_node(engine, domains, capabilities)))
+    builder.add_node("check_credentials",   _w("check_credentials",   _make_check_credentials_node()))
+    builder.add_node("plan",                _w("plan",                _make_plan_node(engine, domains, _template_store, pattern_store=pattern_store)))
+    builder.add_node("human_plan_approval", _w("human_plan_approval", _make_human_plan_approval_node()))
+    builder.add_node("patch",               _w("patch",               patch_node))
+    builder.add_node("test",                _w("test",                _make_test_node(engine, domains)))
+    builder.add_node("converge",            _w("converge",            _make_converge_node(engine, client=client, pattern_store=pattern_store, capabilities=capabilities)))
+    builder.add_node("human_result_review", _w("human_result_review", _make_human_result_review_node()))
 
     # Fixed edges (always taken)
     builder.add_edge(START, "clarify")

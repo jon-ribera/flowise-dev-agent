@@ -20,6 +20,7 @@ Human-in-the-loop flow:
 See DESIGN_DECISIONS.md — DD-011, DD-012.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -47,6 +48,13 @@ logger = logging.getLogger("flowise_dev_agent.api")
 _COMPAT_LEGACY: bool = os.environ.get("FLOWISE_COMPAT_LEGACY", "").lower() in (
     "1", "true", "yes"
 )
+
+# ---------------------------------------------------------------------------
+# Persistence config (M9.1, DD-078)
+# ---------------------------------------------------------------------------
+# POSTGRES_DSN must be set.  The agent will fail to start without it.
+# Example: postgresql://postgres:postgres@localhost:5432/flowise_dev_agent
+_POSTGRES_DSN: str | None = os.environ.get("POSTGRES_DSN")
 
 # ---------------------------------------------------------------------------
 # API key authentication (optional — enabled when AGENT_API_KEY is set)
@@ -88,12 +96,21 @@ async def lifespan(app: FastAPI):
     from flowise_dev_agent.agent.graph import build_graph, create_engine, make_default_capabilities
     from flowise_dev_agent.agent.tools import FloviseDomain
     from flowise_dev_agent.instance_pool import FlowiseClientPool
+    from flowise_dev_agent.persistence import EventLog, make_checkpointer
     from flowise_dev_agent.reasoning import ReasoningSettings
-    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
     reasoning_settings = ReasoningSettings.from_env()
 
-    db_path = os.getenv("SESSIONS_DB_PATH", "sessions.db")
+    # M9.1: Postgres DSN is required.  Fail fast with a clear message.
+    postgres_dsn = _POSTGRES_DSN or os.getenv("POSTGRES_DSN")
+    if not postgres_dsn:
+        raise RuntimeError(
+            "POSTGRES_DSN environment variable is not set. "
+            "Start a local Postgres instance with:\n"
+            "  docker compose -f docker-compose.postgres.yml up -d\n"
+            "Then set:\n"
+            "  POSTGRES_DSN=postgresql://postgres:postgres@localhost:5432/flowise_dev_agent"
+        )
 
     langsmith_key = os.getenv("LANGCHAIN_API_KEY")
     if langsmith_key:
@@ -102,20 +119,23 @@ async def lifespan(app: FastAPI):
         logger.info("LangSmith tracing enabled: project=%s", os.environ["LANGCHAIN_PROJECT"])
 
     logger.info(
-        "Starting Flowise Dev Agent | Flowise: %s | Engine: %s | DB: %s",
+        "Starting Flowise Dev Agent | Flowise: %s | Engine: %s | Persistence: postgres",
         os.getenv("FLOWISE_API_ENDPOINT", "(from env)"),
         reasoning_settings.provider,
-        db_path,
     )
 
     from flowise_dev_agent.agent.pattern_store import PatternStore
 
-    pattern_db_path = os.getenv("PATTERN_DB_PATH", db_path)
+    pattern_db_path = os.getenv("PATTERN_DB_PATH", "sessions.db")
 
     pool = FlowiseClientPool.from_env()
     default_client = pool.get(None)  # default instance for pattern save + graph wiring
 
-    async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
+    # M9.1: EventLog shares the same Postgres DSN; owns its own connection.
+    event_log = EventLog(dsn=postgres_dsn)
+    await event_log.setup()
+
+    async with make_checkpointer(postgres_dsn) as checkpointer:
         engine = create_engine(reasoning_settings)
         domains = [FloviseDomain(default_client)]
         pattern_store = await PatternStore.open(pattern_db_path)
@@ -132,6 +152,7 @@ async def lifespan(app: FastAPI):
             client=default_client,
             pattern_store=pattern_store,
             capabilities=_capabilities,
+            emit_event=event_log.insert_event,  # M9.2: node lifecycle → session_events
         )
         app.state.runtime_mode = _runtime_mode
 
@@ -139,11 +160,13 @@ async def lifespan(app: FastAPI):
         app.state.pool = pool
         app.state.pattern_store = pattern_store
         app.state.engine = engine
+        app.state.event_log = event_log  # M9.1: available to all endpoints
 
         yield
 
     await pattern_store.close()
     await pool.close_all()
+    await event_log.close()
 
     logger.info("Shutting down Flowise Dev Agent")
 
@@ -350,7 +373,7 @@ async def _build_response(graph, config: dict, thread_id: str) -> SessionRespons
     """Inspect the graph state and build a SessionResponse.
 
     Checks for pending interrupts first. If none, the graph is complete.
-    Uses aget_state (async) because the checkpointer is AsyncSqliteSaver.
+    Uses aget_state (async) because the checkpointer is Postgres-backed (M9.1).
     """
     try:
         snapshot = await graph.aget_state(config)
@@ -760,11 +783,8 @@ async def list_sessions(request: Request) -> list[SessionSummary]:
     graph = _get_graph(request)
     checkpointer = graph.checkpointer
 
-    # Fetch all distinct thread IDs directly from SQLite
-    async with checkpointer.conn.execute(
-        "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
-    ) as cur:
-        thread_ids: list[str] = [row[0] async for row in cur]
+    # M9.1: use adapter helper — works with Postgres (and any future backend).
+    thread_ids: list[str] = await checkpointer.list_thread_ids()
 
     summaries: list[SessionSummary] = []
     for tid in thread_ids:
@@ -837,12 +857,8 @@ async def delete_session(thread_id: str, request: Request) -> dict:
     graph = _get_graph(request)
     checkpointer = graph.checkpointer
 
-    # Verify the thread exists before deleting
-    async with checkpointer.conn.execute(
-        "SELECT 1 FROM checkpoints WHERE thread_id = ? LIMIT 1", (thread_id,)
-    ) as cur:
-        row = await cur.fetchone()
-    if not row:
+    # M9.1: use adapter helper — works with Postgres (and any future backend).
+    if not await checkpointer.thread_exists(thread_id):
         raise HTTPException(status_code=404, detail=f"Session '{thread_id}' not found.")
 
     await checkpointer.adelete_thread(thread_id)
@@ -1047,6 +1063,209 @@ async def stream_resume_session(
         except Exception as e:
             logger.exception("SSE stream failed for session %s", thread_id)
             yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# M9.2 — Node-level event SSE endpoint helpers
+# ---------------------------------------------------------------------------
+
+#: SSE event-type name for each status value stored in session_events.
+_STATUS_TO_SSE_EVENT: dict[str, str] = {
+    "started":     "node_start",
+    "completed":   "node_end",
+    "failed":      "node_error",
+    "interrupted": "interrupt",
+}
+
+#: How often (in seconds) to poll the event log for new events.
+_SSE_POLL_INTERVAL: float = float(os.environ.get("SSE_POLL_INTERVAL", "2"))
+
+#: How many consecutive empty polls before emitting a keepalive comment.
+_SSE_KEEPALIVE_AFTER: int = int(os.environ.get("SSE_KEEPALIVE_AFTER", "15"))
+
+
+def _format_event_as_sse(event: dict, session_id: str) -> str:
+    """Format one session_events row as an SSE message.
+
+    SSE format (RFC 8725):
+        event: <event_type>
+        data: <json_payload>
+        (blank line)
+
+    payload_json is intentionally excluded to keep events small (no blobs).
+    """
+    status = event.get("status", "")
+    event_type = _STATUS_TO_SSE_EVENT.get(status, "node_event")
+
+    payload: dict = {
+        "type":      event_type,
+        "session_id": session_id,
+        "node_name": event.get("node_name", ""),
+        "phase":     event.get("phase", ""),
+        "status":    status,
+        "seq":       event.get("seq"),
+    }
+    if event.get("duration_ms") is not None:
+        payload["duration_ms"] = event["duration_ms"]
+    if event.get("summary"):
+        payload["summary"] = event["summary"]
+    ts = event.get("ts")
+    if ts is not None:
+        payload["ts"] = str(ts)
+
+    return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+
+
+async def _session_is_done(graph, session_id: str) -> bool:
+    """Return True when the session has completed (done=True in state).
+
+    Returns False for interrupted (HITL-paused) sessions because they are
+    still active and may receive a resume call.  Returns False on error.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    try:
+        snapshot = await graph.aget_state(config)
+        if snapshot is None or not snapshot.values:
+            return False
+        return bool(snapshot.values.get("done", False))
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# M9.2 — GET /sessions/{session_id}/stream
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/sessions/{session_id}/stream",
+    tags=["sessions"],
+    dependencies=[Depends(_verify_api_key)],
+)
+async def stream_session_events(
+    session_id: str,
+    request: Request,
+    after_seq: int = 0,
+) -> StreamingResponse:
+    """Stream node lifecycle events for a session as Server-Sent Events.
+
+    Replays all persisted events first (``seq > after_seq``), then polls for
+    new events every ``SSE_POLL_INTERVAL`` seconds until:
+      - the session completes (``done=True`` in state) and no more events arrive,
+      - or the client disconnects.
+
+    Use ``?after_seq=N`` to resume streaming from a known position (avoids
+    replaying events the client already received).
+
+    SSE event types emitted:
+
+      event: node_start
+      data: {"type":"node_start","session_id":"...","node_name":"plan","phase":"plan",
+             "status":"started","seq":1234567890}
+
+      event: node_end
+      data: {"type":"node_end","session_id":"...","node_name":"plan","phase":"plan",
+             "status":"completed","duration_ms":412,"summary":"Plan generated (234 chars)",
+             "seq":1234567891}
+
+      event: node_error
+      data: {"type":"node_error","session_id":"...","node_name":"patch","phase":"patch",
+             "status":"failed","duration_ms":50,"summary":"HTTP 422","seq":...}
+
+      event: interrupt
+      data: {"type":"interrupt","session_id":"...","node_name":"human_plan_approval",
+             "phase":"plan","status":"interrupted","duration_ms":1,"seq":...}
+
+      event: done
+      data: {"type":"done","session_id":"..."}
+
+    No LLM tokens are streamed.  No raw tool payloads are included.
+
+    See roadmap9_production_graph_runtime_hardening.md — Milestone 9.2.
+    """
+    graph = _get_graph(request)
+    event_log = getattr(request.app.state, "event_log", None)
+
+    # Validate session exists before opening the stream.
+    config = {"configurable": {"thread_id": session_id}}
+    try:
+        snapshot = await graph.aget_state(config)
+    except Exception:
+        raise HTTPException(
+            status_code=404, detail=f"Session '{session_id}' not found."
+        )
+    if snapshot is None or not snapshot.values:
+        raise HTTPException(
+            status_code=404, detail=f"Session '{session_id}' not found."
+        )
+
+    async def event_stream():
+        yield ": connected\n\n"
+
+        cursor = after_seq
+        idle_polls = 0
+        # Check done status every N polls to avoid hammering Postgres.
+        _DONE_CHECK_EVERY = 5
+        poll_count = 0
+
+        while True:
+            # ── client disconnect ─────────────────────────────────────
+            if await request.is_disconnected():
+                break
+
+            # ── fetch new events from DB ──────────────────────────────
+            if event_log is not None:
+                try:
+                    events = await event_log.get_events(
+                        session_id, after_seq=cursor, limit=50
+                    )
+                except Exception as exc:
+                    logger.warning("SSE event fetch error for %s: %s", session_id, exc)
+                    events = []
+            else:
+                events = []
+
+            if events:
+                idle_polls = 0
+                for ev in events:
+                    cursor = max(cursor, ev["seq"])
+                    yield _format_event_as_sse(ev, session_id)
+            else:
+                idle_polls += 1
+
+            # ── keepalive comment (prevents proxy timeouts) ───────────
+            if idle_polls > 0 and idle_polls % _SSE_KEEPALIVE_AFTER == 0:
+                yield ": keepalive\n\n"
+
+            # ── done check ────────────────────────────────────────────
+            poll_count += 1
+            if poll_count % _DONE_CHECK_EVERY == 0:
+                if await _session_is_done(graph, session_id):
+                    # Drain any final events written between last poll and now
+                    if event_log is not None:
+                        try:
+                            final = await event_log.get_events(
+                                session_id, after_seq=cursor, limit=50
+                            )
+                            for ev in final:
+                                cursor = max(cursor, ev["seq"])
+                                yield _format_event_as_sse(ev, session_id)
+                        except Exception:
+                            pass
+                    yield (
+                        "event: done\n"
+                        f"data: {json.dumps({'type': 'done', 'session_id': session_id})}"
+                        "\n\n"
+                    )
+                    break
+
+            await asyncio.sleep(_SSE_POLL_INTERVAL)
 
     return StreamingResponse(
         event_stream(),

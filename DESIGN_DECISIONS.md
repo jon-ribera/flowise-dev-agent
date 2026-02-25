@@ -1849,3 +1849,449 @@ when the real Workday OAuth credential is resolved from `CredentialStore`.
 - `flowise_dev_agent/agent/domains/workday.py` — `WorkdayCapability.discover()` + `.compile_ops()`
 - `flowise_dev_agent/knowledge/refresh.py` — `refresh_workday_mcp()` (real)
 - `tests/test_workday_mcp_integration.py` — 46 smoke tests
+
+---
+
+## DD-071 — Knowledge-First Prompt Contract + Knowledge-Layer Telemetry (Roadmap 8, M8.1 + M8.2)
+
+**Decision**: The discover prompt and tool descriptions explicitly state that all 303
+node schemas are pre-loaded locally and that `get_node` calls during the discover phase
+are unnecessary. Per-session telemetry counters (`get_node_calls_total`,
+`knowledge_repair_count`, `phase_durations_ms`) are surfaced in `SessionSummary`.
+
+**Problem solved**: Prior wording ("Call `get_node` for EVERY node you intend to
+include") was technically correct (the tool is served from a local cache) but
+misleading — the LLM treated it as an expensive obligation and sometimes skipped it,
+or called it redundantly during discover for nodes it had no plan to use.
+
+**Changes**:
+- `_DISCOVER_BASE` (graph.py): replaced "RULE: Call get_node for EVERY node" with a
+  "NODE SCHEMA CONTRACT" block clarifying local-first resolution.
+- `_FLOWISE_DISCOVER_CONTEXT` (tools.py): removed per-node `get_node` instruction;
+  added explicit "do not call get_node during discover" guidance.
+- `get_node` tool description: split into DISCOVER PHASE (discourage) / PATCH PHASE
+  (call freely) sections.
+- `_PATCH_IR_SYSTEM` rule 7: anchor/param names must come from `get_node`; all 303
+  schemas available locally at zero cost.
+- `NodeSchemaStore._call_count` (provider.py): increments on every `get_or_repair`
+  call (hits + misses).
+- `graph.py` patch node: writes `get_node_calls_total` to `debug["flowise"]` after
+  Phase D.
+- `SessionSummary` (api.py): adds `knowledge_repair_count`, `get_node_calls_total`,
+  `phase_durations_ms` fields; `list_sessions()` populates them from debug state.
+
+**Rejected alternatives**:
+- Removing `get_node` from discover tool list entirely: would break the legacy
+  path (capabilities=None) where discover is the only schema-fetch opportunity.
+- Silent behaviour: without explicit contract language, LLM models trained on
+  tool-use patterns default to calling every tool "defensively".
+
+**Files**:
+- `flowise_dev_agent/agent/graph.py` — `_DISCOVER_BASE`, `_PATCH_IR_SYSTEM`, Phase D
+- `flowise_dev_agent/agent/tools.py` — `_FLOWISE_DISCOVER_CONTEXT`, `get_node` tool def
+- `flowise_dev_agent/knowledge/provider.py` — `_call_count`
+- `flowise_dev_agent/api.py` — `SessionSummary` telemetry fields
+- `tests/test_m74_telemetry.py` — M8.2 telemetry tests (4 new cases)
+
+---
+
+## DD-072 — RAG Document-Source Guardrail (Roadmap 8, M8.1)
+
+**Decision**: Vector store nodes (`memoryVectorStore`, `pinecone`, `faiss`, etc.)
+require a document loader wired to their `document` input anchor. This constraint is
+enforced at three layers: the discover system prompt, the skill file (`flowise_builder.md`),
+and the node reference doc (`FLOWISE_NODE_REFERENCE.md`).
+
+**Problem solved**: RAG chatflows built without a document loader node silently
+produce HTTP 500 ("Expected a Runnable") at Flowise runtime. The agent had no
+guardrail and would generate structurally valid but non-functional RAG flows.
+
+**Changes**:
+- `_DISCOVER_BASE` (graph.py): added "RAG CONSTRAINT" block.
+- `FLOWISE_NODE_REFERENCE.md`: added "RUNTIME CONSTRAINT" callout on the
+  `memoryVectorStore` entry.
+- `flowise_dev_agent/skills/flowise_builder.md`: Rule 7 updated with RAG constraint.
+- `tests/test_compiler_integration.py`: added `test_rag_with_document_source` (10th
+  integration test) — `plainText → memoryVectorStore → conversationalRetrievalQAChain`.
+
+**Files**:
+- `flowise_dev_agent/agent/graph.py` — `_DISCOVER_BASE`
+- `FLOWISE_NODE_REFERENCE.md` — `memoryVectorStore` entry
+- `flowise_dev_agent/skills/flowise_builder.md` — Rule 7
+- `tests/test_compiler_integration.py` — `test_rag_with_document_source`
+
+---
+
+## DD-073 — Multi-Output Flowise Node Format (Roadmap 8, M8.0)
+
+**Decision**: Flowise nodes with multiple output anchors use an `outputAnchors` entry
+with `type: "options"` containing an `options[]` array; the active output is selected
+via an `outputs["output"]` field on the node data. The compiler, validator, and schema
+normaliser were updated to produce and recognise this format.
+
+**Problem solved**: Three independent bugs converged on the same root cause — the
+agent generated and validated output anchors using the pre-options format, causing
+invalid flowData when used with nodes like `memoryVectorStore` that expose multiple
+outputs (`retriever`, `vectorStore`).
+
+**Changes**:
+- `compiler.py`: multi-output AddNode ops emit `options[]` wrapper; Connect op sets
+  `outputs["output"]` on the source node.
+- `tools.py` (`_validate_flow_data`): anchor ID lookup now descends into `options[]`
+  arrays.
+- `knowledge/provider.py` (`_normalize_api_schema`): priority order
+  `outputs` (live API) > `outputAnchors` (legacy) > synthesized.
+- `knowledge/refresh.py` (`_patch_output_anchors_from_api`): post-parse enrichment
+  of 89 nodes with real output anchor names from live API; called from
+  `refresh_nodes()`.
+- `scripts/simulate_frontend.py`: three-step frontend simulation (plan → approve →
+  accept); moved from repo root to `scripts/` in M8.3.
+
+**Files**:
+- `flowise_dev_agent/agent/compiler.py`
+- `flowise_dev_agent/agent/tools.py`
+- `flowise_dev_agent/knowledge/provider.py`
+- `flowise_dev_agent/knowledge/refresh.py`
+- `scripts/simulate_frontend.py`
+- `tests/test_compiler_integration.py` — `source_anchor` updated to `"retriever"`
+
+---
+
+## DD-074 — Context Safety Gate + E2E Integration Test (Roadmap 8, M8.3)
+
+**Decision**: A regression test suite (`test_context_safety.py`) asserts that raw
+snapshot blobs and large JSON tool payloads never enter the LLM message transcript.
+An end-to-end session test (`test_e2e_session.py`) covers the full API lifecycle
+against a live server, skipped automatically in CI via `AGENT_E2E_SKIP=1`.
+
+**Problem solved**: No automated gate prevented a future refactor from inadvertently
+injecting full snapshot blobs into `state["messages"]`, which would blow the context
+window and degrade LLM quality silently.
+
+**Changes**:
+- `tests/test_context_safety.py` (11 tests): `result_to_str` contract; no raw JSON
+  >500 chars in transcript; `ToolResult.data` never reaches message content.
+- `tests/test_e2e_session.py` (6 tests): full session lifecycle — POST /sessions →
+  `plan_approval` interrupt → resume → `result_review`; `@pytest.mark.slow`.
+- `pyproject.toml`: `[tool.pytest.ini_options]` with `asyncio_mode = "strict"` and
+  `slow` marker registration.
+- `scripts/simulate_frontend.py`: moved from repo root (tracked in `scripts/`).
+
+**Rejected alternatives**:
+- Runtime context-size assertion inside the graph: would add overhead to every
+  message and make the test behaviour implicit.
+- Blanket truncation of all tool results: loses information that belongs in debug;
+  the `result_to_str` / `ToolResult.summary` split is the correct boundary.
+
+**Files**:
+- `tests/test_context_safety.py`
+- `tests/test_e2e_session.py`
+- `pyproject.toml`
+- `scripts/simulate_frontend.py`
+
+---
+
+## DD-075 — Knowledge-First Runtime Contract Alignment (Roadmap 9, M9.3)
+
+**Decision**: The discover prompt, discover context, and `get_node` tool description
+are rewritten to reflect the local-first schema contract. `get_node` calls during the
+discover phase are explicitly discouraged. The Phase D repair loop is extracted into a
+standalone `_repair_schema_for_ops()` function with a hard repair budget
+(`_MAX_SCHEMA_REPAIRS = 10`).
+
+**Problem solved**: M8.1 improved the prompt language but still retained the
+instruction "Call get_node for EVERY node you intend to include." This contradicts
+the knowledge-first architecture: Phase D of `_make_patch_node_v2` already resolves
+all schemas automatically via `NodeSchemaStore.get_or_repair()` — the LLM does not
+need to fetch them during discover. The instruction caused token waste and inconsistent
+LLM behaviour (sometimes calling get_node redundantly, sometimes skipping it when
+the budget felt high).
+
+**Changes**:
+- `_DISCOVER_BASE` (graph.py): "RULE: Call get_node for EVERY node" replaced with
+  "NODE SCHEMA CONTRACT (M9.3)": schemas are pre-loaded; patch phase resolves them;
+  do NOT call get_node during discover except for unusual parameter verification.
+- `_FLOWISE_DISCOVER_CONTEXT` (tools.py): removed "For each node type you plan to
+  use, call get_node"; added explicit "Do NOT call get_node during discover" with
+  rationale.
+- `get_node` tool description in `_FLOWISE_DISCOVER_TOOLS`: split into
+  "DISCOVER PHASE: Do NOT call this" / "PATCH PHASE: Call freely" sections.
+- `_MAX_SCHEMA_REPAIRS: int = 10` (graph.py): module-level budget constant capping
+  targeted API repair calls per patch iteration.
+- `_repair_schema_for_ops()` (graph.py): extracted from Phase D of
+  `_make_patch_node_v2`; standalone async function; fast path (cache hit = zero API
+  calls); slow path (cache miss = one targeted `get_node` call); budget enforced.
+- Phase D of `_make_patch_node_v2` now delegates to `_repair_schema_for_ops()`;
+  M8.2 `get_node_calls_total` telemetry retained.
+
+**Contract**:
+- Local snapshot HIT  → zero API calls (fast path)
+- Local snapshot MISS → one targeted `get_node` API call per type (slow/repair path)
+- Budget exceeded     → node type skipped with WARNING; AddNode op fails at compile
+
+**Scope note**: A dedicated `repair_schema` LangGraph graph node with routing edges
+is deferred to M9.6 (production-grade graph topology). `_repair_schema_for_ops()`
+is the canonical repair function that M9.6 will wire as a proper node.
+
+**Rejected alternatives**:
+- Removing `get_node` from `_FLOWISE_DISCOVER_TOOLS` entirely: would break the
+  legacy path (capabilities=None) where the discover ReAct loop is the only place
+  schemas can be fetched before plan writing.
+- Adding a new graph node for M9.3: the graph topology redesign is scoped to M9.6;
+  adding a node without proper routing edges now would be incomplete.
+
+**Files**:
+- `flowise_dev_agent/agent/graph.py` — `_DISCOVER_BASE`, `_MAX_SCHEMA_REPAIRS`,
+  `_repair_schema_for_ops()`, Phase D refactor
+- `flowise_dev_agent/agent/tools.py` — `_FLOWISE_DISCOVER_CONTEXT`, `get_node` tool def
+- `tests/test_m93_knowledge_first.py` — 11 unit tests
+
+---
+
+## DD-076 — NodeSchemaStore Repair Gating Correctness (Roadmap 9, M9.5)
+
+**Decision**: `_compute_action` is refactored into `_compute_action_detail` which
+returns both the action string and a structured gating context dict
+(`comparison_method`, `decision_reason`, `local_version`, `api_version`, and when
+hash comparison is used: `local_hash`, `api_hash`). `_compute_action` becomes a
+thin backwards-compatible wrapper. The gating detail is written into every repair
+event via `_record_event`, making the decisioning fully observable in
+`debug["flowise"]["knowledge_repair_events"]`.
+
+**Decision tree (unchanged from M8.1, now documented and tested more thoroughly)**:
+1. Node absent from local index → `update_new_node`
+2. Both sides have a non-empty version string:
+   - versions equal → `skip_same_version`
+   - versions differ → `update_changed_version_or_hash`
+3. No complete version pair → hash comparison:
+   - hashes equal → `skip_same_version`
+   - hashes differ, no version on either side → `update_no_version_info`
+   - hashes differ, partial version → `update_changed_version_or_hash`
+
+**Edge cases covered**:
+- Integer version (e.g. `2`) normalised to string `"2"` before comparison
+- Zero version (`0`) treated as absent (falls to hash path)
+- Whitespace-only version treated as absent
+- Partial version presence (only one side has version) falls to hash path
+
+**Why detail dict (not just action string)**:
+The action alone is not sufficient for post-hoc debugging when a node is
+unexpectedly updated or skipped. Including `comparison_method` and
+`decision_reason` lets operators scan `knowledge_repair_events` in the session
+debug to understand exactly why each schema was or was not refreshed.
+
+**Backwards compatibility**: `_compute_action(node_type, api_raw) -> str` signature
+is preserved unchanged. All 5 existing tests in `test_schema_repair_gating.py`
+pass without modification.
+
+**Files**:
+- `flowise_dev_agent/knowledge/provider.py` — `_compute_action_detail()` (new),
+  `_compute_action()` (now delegates), `get_or_repair()` (uses detail)
+- `tests/test_m95_repair_gating.py` — 17 tests across three classes:
+  `TestActionCorrectness` (5 spec cases + wrapper), `TestGatingDetail` (7 detail
+  checks), `TestEdgeCases` (4 normalisation edge cases)
+
+---
+
+## DD-077 — Refresh Reproducibility (Roadmap 9, M9.4)
+
+**Decision**: `FLOWISE_NODE_REFERENCE.md` at the repository root is the single
+canonical source for all 303 Flowise node schemas. The refresh CLI is hardened to
+fail fast with an actionable error (including a `git checkout` recovery hint) when
+this file is absent. The filename is extracted to a named constant
+`_CANONICAL_REFERENCE_NAME` so tests can assert the resolved path without
+duplicating string literals.
+
+**What already existed before M9.4**:
+- `FLOWISE_NODE_REFERENCE.md` at repo root (7 975 lines, 303 nodes)
+- `_REFERENCE_MD` path constant pointing at it
+- `--dry-run` flag: parses + diffs without writing any files
+- Missing-file guard in `refresh_nodes()` returning exit 1
+
+**What M9.4 adds**:
+- `_CANONICAL_REFERENCE_NAME = "FLOWISE_NODE_REFERENCE.md"` — explicit named
+  constant; `_REFERENCE_MD` is now derived from it so the canonical name can
+  never drift from the resolved path.
+- Improved missing-file error — includes expected path, reason, and
+  `git checkout HEAD -- FLOWISE_NODE_REFERENCE.md` recovery command.
+- `tests/test_m94_refresh_reproducibility.py` (13 tests):
+  - Constant is a non-empty `.md` string
+  - `_REFERENCE_MD` resolves to `_REPO_ROOT / _CANONICAL_REFERENCE_NAME`
+  - File exists and is non-empty in a clean checkout
+  - Subprocess `--nodes --dry-run` exits 0 and reports node counts
+  - Missing file → exit 1 (mock-patched `_REFERENCE_MD`)
+  - Missing-file error contains canonical name and a recovery hint
+  - `refresh_nodes(dry_run=True)` exits 0 when file is present
+  - Dry-run does not create or modify `flowise_nodes.snapshot.json`
+
+**How to run (local / CI gate)**:
+```
+python -m flowise_dev_agent.knowledge.refresh --nodes --dry-run
+```
+Exits 0 and prints the diff without writing. Add `--validate` for structural
+checks (still no writes).
+
+**Files**:
+- `flowise_dev_agent/knowledge/refresh.py` — `_CANONICAL_REFERENCE_NAME`,
+  `_REFERENCE_MD` derivation, improved missing-file error
+- `tests/test_m94_refresh_reproducibility.py` — 13 tests
+
+---
+
+## DD-078 — Postgres-Only Persistence (Checkpointer + Event Log)
+
+**Roadmap**: ROADMAP9 — Milestone 9.1
+
+**Decision**: Replace the SQLite `AsyncSqliteSaver` checkpointer with a
+Postgres-backed `AsyncPostgresSaver` as the single, required persistence backend.
+SQLite is no longer a fallback option. The agent fails to start with a clear
+error message if `POSTGRES_DSN` is not set.
+
+**Reason**:
+- SQLite is a single-file, single-process backend unsuitable for multi-worker
+  deployments. Postgres enables resumable sessions under horizontal scaling.
+- A Postgres-only path eliminates dual-backend complexity (no toggle, no
+  fallback code paths, no conditional SQL dialects).
+- Durable audit trails (event replay, session history) require a proper
+  relational backend.
+- The `session_events` table (node lifecycle events) is the foundation for
+  M9.2 SSE streaming observability.
+- Local development is straightforward: `docker compose -f docker-compose.postgres.yml up -d`.
+
+**What was replaced**:
+- `from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver` in api.py
+- Direct `checkpointer.conn.execute(...)` SQLite-specific queries in
+  `list_sessions` and `delete_session` endpoints.
+- `SESSIONS_DB_PATH` env var (replaced by `POSTGRES_DSN`).
+
+**New components**:
+
+`flowise_dev_agent/persistence/checkpointer.py`:
+- `make_checkpointer(dsn)` — async context manager that wraps `AsyncPostgresSaver`
+  and calls `.setup()` to create LangGraph checkpoint tables on first use.
+- `CheckpointerAdapter` — wraps `AsyncPostgresSaver` with two helper methods:
+  - `list_thread_ids() -> list[str]` — replaces raw SQLite `.conn.execute()`
+  - `thread_exists(thread_id) -> bool` — replaces raw SQLite `.conn.execute()`
+  - All LangGraph methods delegated transparently via `__getattr__`.
+
+`flowise_dev_agent/persistence/event_log.py`:
+- `EventLog(dsn)` — owns a separate `psycopg.AsyncConnection`.
+- `setup()` creates `session_events` table if absent (DDL is idempotent).
+- `insert_event(session_id, node_name, phase, status, ...)` — fire-and-forget
+  insert; errors are logged and never raised.
+- `get_events(session_id, after_seq, limit)` — used by M9.2 SSE endpoint.
+- `seq` uses `time.time_ns()` — monotonically increasing BIGINT without a
+  DB round-trip for sequence generation.
+
+`docker-compose.postgres.yml`:
+- Postgres 16, `postgres/postgres`, database `flowise_dev_agent`, port 5432.
+- Health check via `pg_isready`.
+
+**Env vars**:
+- `POSTGRES_DSN` — required; e.g. `postgresql://postgres:postgres@localhost:5432/flowise_dev_agent`
+
+**Rejected alternatives**:
+- SQLite + Postgres toggle with env var: adds two code paths for every
+  query and makes tests environment-dependent. Not worth the complexity.
+- Async SQLAlchemy ORM: heavyweight for an event-log table; raw psycopg is
+  faster and simpler.
+- Using the LangGraph checkpointer connection for the event log: the
+  checkpointer's connection lifecycle is managed by LangGraph internals;
+  sharing it is fragile. A dedicated EventLog connection is safer.
+
+**Files**:
+- `docker-compose.postgres.yml` — Postgres 16 local service
+- `flowise_dev_agent/persistence/__init__.py` — package exports
+- `flowise_dev_agent/persistence/checkpointer.py` — factory + adapter
+- `flowise_dev_agent/persistence/event_log.py` — session_events helper
+- `flowise_dev_agent/api.py` — lifespan updated; SQLite-specific queries replaced
+- `pyproject.toml` — added `langgraph-checkpoint-postgres>=2.0`, `psycopg[binary]>=3.1`
+- `tests/test_m91_postgres_persistence.py` — 13 tests (all mocked; no live DB required)
+
+
+---
+
+## DD-079 — Node-Level SSE Streaming (Event Log → GET /sessions/{id}/stream)
+
+**Roadmap**: ROADMAP9 — Milestone 9.2
+
+**Decision**: Add a `GET /sessions/{session_id}/stream` SSE endpoint that replays
+persisted `session_events` rows and then tails for new ones via polling.  Node
+lifecycle events (started / completed / failed / interrupted) are emitted by
+wrapping every LangGraph node in `build_graph` with a thin `wrap_node` decorator
+from `flowise_dev_agent/persistence/hooks.py`.
+
+**Why this approach**:
+- **Replay-first**: because events are persisted before being streamed, a client
+  that reconnects receives all prior events from `after_seq=0` without any
+  server-side fan-out or in-memory buffer.
+- **No token streaming**: the endpoint only emits node lifecycle events, never
+  LLM tokens or raw tool payloads.  This keeps event payloads small and
+  independent of the existing `POST /sessions/stream` token-streaming endpoint.
+- **Decoupled from graph execution**: nodes emit events via `EventLog.insert_event`
+  (fire-and-forget); the SSE endpoint polls independently.  A slow SSE client
+  never blocks graph execution.
+- **wrap_node as a decorator**: wrapping at `build_graph` call-site means no
+  node internals are modified.  `emit_event=None` (default) is a zero-cost no-op
+  pass-through — all existing graph tests continue to use unwrapped nodes.
+
+**What was added**:
+
+`flowise_dev_agent/persistence/hooks.py` (new):
+- `_NODE_PHASES` — maps node name → logical phase label (e.g. `"plan"`, `"patch"`).
+- `_node_summary(node_name, result)` — extracts a compact (≤200 char) summary from
+  a node result dict without including raw blobs.
+- `wrap_node(node_name, fn, emit_event)` — wraps an async LangGraph node:
+  - accepts `(state, config: Optional[RunnableConfig] = None)` so LangGraph passes
+    the thread_id via config, giving us `session_id` without touching node internals.
+  - emits `started` before calling fn.
+  - emits `completed` / `failed` / `interrupted` after fn returns or raises.
+  - always re-raises exceptions so graph routing is unaffected.
+  - uses exception class name matching (`GraphInterrupt`, `NodeInterrupt`) to
+    distinguish HITL interrupts from real failures without a hard import on
+    LangGraph internals.
+
+`flowise_dev_agent/agent/graph.py`:
+- `build_graph` gains `emit_event=None` parameter.
+- A `_w(name, fn)` helper in `build_graph` wraps each node via `wrap_node` only
+  when `emit_event` is not None.  Zero overhead when omitted.
+
+`flowise_dev_agent/api.py`:
+- `_format_event_as_sse(event, session_id)` — formats a `session_events` row as
+  RFC 8725 SSE: `event: <type>\ndata: <json>\n\n`.  `payload_json` column is
+  intentionally excluded (no blob leakage).
+- `_session_is_done(graph, session_id)` — checks `snapshot.values["done"]`.
+- `GET /sessions/{session_id}/stream` — replay + poll SSE endpoint:
+  - validates session exists before opening stream.
+  - polls every `SSE_POLL_INTERVAL` seconds (default 2s, configurable via env var).
+  - emits keepalive comments every `SSE_KEEPALIVE_AFTER` empty polls (default 15).
+  - checks `done` flag every 5 polls (avoids Postgres round-trip on every tick).
+  - emits `event: done` and closes when session completes.
+  - respects `request.is_disconnected()` for early client exit.
+  - supports `?after_seq=N` query param for resumable streaming.
+- `build_graph` call in lifespan wired with `emit_event=event_log.insert_event`.
+
+**SSE event types**:
+
+| event:        | status emitted | when                          |
+|---------------|----------------|-------------------------------|
+| `node_start`  | `started`      | node function begins          |
+| `node_end`    | `completed`    | node function returns         |
+| `node_error`  | `failed`       | node function raises (non-interrupt) |
+| `interrupt`   | `interrupted`  | node raises GraphInterrupt    |
+| `done`        | —              | session `done=True`           |
+
+**Rejected alternatives**:
+- Postgres LISTEN/NOTIFY for push-based delivery: correct long-term approach but
+  adds connection management complexity.  Polling at 2s is sufficient for M9.2
+  and can be replaced later without changing the SSE contract.
+- WebSockets: more capable but higher client complexity; SSE is sufficient for
+  one-way server→client event streaming.
+- In-memory fan-out queue: breaks replay on reconnect; not resumable.
+
+**Files**:
+- `flowise_dev_agent/persistence/hooks.py` — new: wrap_node + _node_summary
+- `flowise_dev_agent/persistence/__init__.py` — wrap_node export added
+- `flowise_dev_agent/agent/graph.py` — emit_event param + _w() wrapper helper
+- `flowise_dev_agent/api.py` — SSE endpoint + helpers + lifespan wiring
+- `tests/test_m92_sse_streaming.py` — 27 tests

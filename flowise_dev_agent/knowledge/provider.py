@@ -335,14 +335,12 @@ class NodeSchemaStore:
             self._record_event(node_type, "api_no_schema", {}, repair_events_out)
             return None
 
-        # --- Version/hash gating ---
-        action = self._compute_action(node_type, api_raw)
-
-        event_extra: dict[str, Any] = {
-            "local_version": (self._index.get(node_type) or {}).get("version"),
-            "api_version": api_raw.get("version"),
-        }
-        self._record_event(node_type, action, event_extra, repair_events_out)
+        # --- Version/hash gating (M9.5) ---
+        # _compute_action_detail returns both the decision string and a full
+        # gating context dict that is written into the repair event for
+        # observability (comparison_method, decision_reason, local/api hashes).
+        action, gating_detail = self._compute_action_detail(node_type, api_raw)
+        self._record_event(node_type, action, gating_detail, repair_events_out)
 
         if action == "skip_same_version":
             logger.info(
@@ -383,39 +381,124 @@ class NodeSchemaStore:
         if out is not None:
             out.append(event)
 
-    def _compute_action(self, node_type: str, api_raw: dict) -> str:
-        """Determine whether to overwrite the local schema or skip.
+    def _compute_action_detail(
+        self, node_type: str, api_raw: dict
+    ) -> "tuple[str, dict[str, Any]]":
+        """Determine whether to overwrite the local schema and explain why.
 
-        Returns one of:
-          "update_new_node"               — not in local snapshot, adding fresh
-          "skip_same_version"             — version / hash match, no change needed
-          "update_changed_version_or_hash"— version or hash differ, overwrite
-          "update_no_version_info"        — no version on either side, overwrite conservatively
+        M9.5: Single source of truth for repair gating.  Returns both the
+        action string and a detail dict that is injected into the repair event
+        for full observability.
+
+        Decision tree
+        -------------
+        1. Node not in local index          → update_new_node
+        2. Both sides have a version string:
+             versions equal                 → skip_same_version
+             versions differ                → update_changed_version_or_hash
+        3. Fall through to hash comparison:
+             hashes equal                   → skip_same_version
+             hashes differ, no versions     → update_no_version_info
+             hashes differ, partial version → update_changed_version_or_hash
+
+        Returns
+        -------
+        (action, detail_dict)
+
+        action is one of:
+          "update_new_node"
+          "skip_same_version"
+          "update_changed_version_or_hash"
+          "update_no_version_info"
+
+        detail_dict keys (always present):
+          comparison_method : "new_node" | "version" | "hash"
+          decision_reason   : human-readable explanation
+          local_version     : str | None
+          api_version       : str | None
+
+        Additional keys present only for "hash" method:
+          local_hash  : first 16 hex chars of local content hash
+          api_hash    : first 16 hex chars of normalised API content hash
         """
         existing = self._index.get(node_type)
         if existing is None:
-            return "update_new_node"
+            return "update_new_node", {
+                "comparison_method": "new_node",
+                "decision_reason": "node not present in local snapshot — adding fresh",
+                "local_version": None,
+                "api_version": None,
+            }
 
         local_ver = str(existing.get("version") or "").strip()
-        api_ver = str(api_raw.get("version") or "").strip()
+        api_ver   = str(api_raw.get("version")  or "").strip()
 
         if local_ver and api_ver:
-            return "skip_same_version" if local_ver == api_ver else "update_changed_version_or_hash"
+            # Version strings available on both sides — compare directly
+            if local_ver == api_ver:
+                return "skip_same_version", {
+                    "comparison_method": "version",
+                    "decision_reason": f"versions match ({local_ver!r}) — keeping local copy",
+                    "local_version": local_ver,
+                    "api_version": api_ver,
+                }
+            return "update_changed_version_or_hash", {
+                "comparison_method": "version",
+                "decision_reason": f"version changed {local_ver!r} → {api_ver!r}",
+                "local_version": local_ver,
+                "api_version": api_ver,
+            }
 
-        # Fall back to hash comparison
-        local_hash = hashlib.sha256(
+        # No complete version pair — fall back to content hash comparison
+        local_hash_full = hashlib.sha256(
             json.dumps(existing, sort_keys=True, default=str).encode()
         ).hexdigest()
-        normalized = _normalize_api_schema(api_raw)
-        api_hash = hashlib.sha256(
+        normalized   = _normalize_api_schema(api_raw)
+        api_hash_full = hashlib.sha256(
             json.dumps(normalized, sort_keys=True, default=str).encode()
         ).hexdigest()
 
-        if local_hash == api_hash:
-            return "skip_same_version"
+        base_detail: dict[str, Any] = {
+            "comparison_method": "hash",
+            "local_version": local_ver or None,
+            "api_version":   api_ver  or None,
+            "local_hash": local_hash_full[:16],
+            "api_hash":   api_hash_full[:16],
+        }
+
+        if local_hash_full == api_hash_full:
+            return "skip_same_version", {
+                **base_detail,
+                "decision_reason": "hash match — content unchanged",
+            }
         if not local_ver and not api_ver:
-            return "update_no_version_info"
-        return "update_changed_version_or_hash"
+            return "update_no_version_info", {
+                **base_detail,
+                "decision_reason": "hash differs, no version on either side — conservative update",
+            }
+        return "update_changed_version_or_hash", {
+            **base_detail,
+            "decision_reason": (
+                f"hash differs, partial version info "
+                f"(local={local_ver!r}, api={api_ver!r})"
+            ),
+        }
+
+    def _compute_action(self, node_type: str, api_raw: dict) -> str:
+        """Return the action string for the given node_type / api_raw pair.
+
+        Thin wrapper around _compute_action_detail for backwards compatibility.
+        Callers that need the full gating context should use _compute_action_detail
+        directly.
+
+        Returns one of:
+          "update_new_node"
+          "skip_same_version"
+          "update_changed_version_or_hash"
+          "update_no_version_info"
+        """
+        action, _ = self._compute_action_detail(node_type, api_raw)
+        return action
 
     # ------------------------------------------------------------------
     # Persistence

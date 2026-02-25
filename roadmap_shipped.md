@@ -5,7 +5,7 @@ All items in this file have a corresponding Design Decision (DD) entry in
 **DD present = shipped and live.** Source-code inline docstrings reference the
 original roadmap filenames below; those filenames are preserved as-is.
 
-Next available DD number: **DD-075**
+Next available DD number: **DD-076**
 
 ---
 
@@ -203,6 +203,25 @@ See DESIGN_DECISIONS.md §DD-071 through §DD-074.
 
 ---
 
+## roadmap9_production_graph_runtime_hardening.md — Production Graph + Runtime Hardening
+
+> Original file: `roadmap9_production_graph_runtime_hardening.md`
+> Design Decisions: **DD-075** (M9.3 complete; remaining milestones pending)
+
+### M9.3 — Knowledge-First Runtime Contract Alignment (DD-075)
+
+- `_DISCOVER_BASE` (graph.py): "NODE SCHEMA CONTRACT (M9.3)" block — schemas are pre-loaded; patch phase resolves automatically; do NOT call `get_node` during discover
+- `_FLOWISE_DISCOVER_CONTEXT` (tools.py): removed per-node `get_node` instruction; added explicit "Do NOT call get_node during discover" guidance
+- `get_node` tool description: split DISCOVER PHASE (do not call) / PATCH PHASE (call freely)
+- `_MAX_SCHEMA_REPAIRS = 10` (graph.py): budget constant capping targeted API repair calls per patch iteration
+- `_repair_schema_for_ops()` (graph.py): standalone async function extracted from Phase D; fast path (cache hit) = zero API calls; slow path (cache miss) = one targeted `get_node` call; budget enforced
+- Phase D of `_make_patch_node_v2`: delegates to `_repair_schema_for_ops()`; M8.2 telemetry retained
+- `tests/test_m93_knowledge_first.py`: 11 unit tests (prompt contract + repair function behaviour)
+
+See DESIGN_DECISIONS.md §DD-075.
+
+---
+
 ## Quick Reference: DD ↔ Roadmap Index
 
 | DD Range | Roadmap File |
@@ -216,3 +235,4 @@ See DESIGN_DECISIONS.md §DD-071 through §DD-074.
 | DD-062 – DD-065 | `ROADMAP6_Platform Knowledge.md` |
 | DD-066 – DD-070 | `roadmap7_multi_domain_runtime_hardening.md` |
 | DD-071 – DD-074 | `roadmap8_runtime_hardening.md` |
+| DD-075 | `roadmap9_production_graph_runtime_hardening.md` |

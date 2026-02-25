@@ -28,6 +28,10 @@ interface ActiveSession {
   total_output_tokens: number;
   lastNodeSeq: number;
   errorDetail: string | null;
+  /** Latest plan text received (preserved after interrupt clears so Artifacts panel can display it) */
+  latestPlan: string | null;
+  /** Latest test results text (preserved after interrupt clears) */
+  latestTestResults: string | null;
 }
 
 interface SessionStore {
@@ -53,18 +57,38 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   setLoadingSessions: (loading) => set({ loadingSessions: loading }),
 
   active: null,
-  initActive: (id) => set({ active: { id, status: "streaming", interrupt: null, phases: initPhases(), tokens: "", toolCalls: [], chatflow_id: null, iteration: 0, total_input_tokens: 0, total_output_tokens: 0, lastNodeSeq: 0, errorDetail: null } }),
+  initActive: (id) => set({ active: { id, status: "streaming", interrupt: null, phases: initPhases(), tokens: "", toolCalls: [], chatflow_id: null, iteration: 0, total_input_tokens: 0, total_output_tokens: 0, lastNodeSeq: 0, errorDetail: null, latestPlan: null, latestTestResults: null } }),
 
   applySSEEvent: (event) => {
     const a = get().active;
     if (!a) return;
-    switch (event.type) {
-      case "token": set({ active: { ...a, tokens: a.tokens + event.content } }); break;
-      case "tool_call": set({ active: { ...a, toolCalls: [...a.toolCalls, { name: event.name, status: "calling" }] } }); break;
-      case "tool_result": set({ active: { ...a, toolCalls: a.toolCalls.map((tc) => tc.name === event.name ? { ...tc, status: "done", preview: event.preview } : tc) } }); break;
-      case "interrupt": set({ active: { ...a, status: "pending_interrupt" as const, interrupt: event as InterruptPayload } }); break;
+    // The backend spreads the interrupt payload dict into the SSE event, so the top-level
+    // "type" field is the interrupt subtype (e.g. "plan_approval"), not the string "interrupt".
+    // We handle all interrupt subtypes here in addition to the canonical SSE types.
+    const evType = (event as unknown as Record<string, string>).type;
+    switch (evType) {
+      case "token": set({ active: { ...a, tokens: a.tokens + (event as { content: string }).content } }); break;
+      case "tool_call": set({ active: { ...a, toolCalls: [...a.toolCalls, { name: (event as { name: string }).name, status: "calling" }] } }); break;
+      case "tool_result": { const e = event as { name: string; preview: string }; set({ active: { ...a, toolCalls: a.toolCalls.map((tc) => tc.name === e.name ? { ...tc, status: "done", preview: e.preview } : tc) } }); break; }
       case "done": set({ active: { ...a, status: "completed" } }); break;
-      case "error": set({ active: { ...a, status: "error", errorDetail: event.detail } }); break;
+      case "error": set({ active: { ...a, status: "error", errorDetail: (event as { detail: string }).detail } }); break;
+      // Interrupt subtypes — backend sends type: "plan_approval" | "clarification" | etc.
+      case "interrupt":      // future-proof: if api.py is fixed to send type: "interrupt"
+      case "plan_approval":
+      case "clarification":
+      case "credential_check":
+      case "result_review":
+      case "select_target": {
+        const pl = event as unknown as InterruptPayload;
+        set({ active: {
+          ...a,
+          status: "pending_interrupt" as const,
+          interrupt: pl,
+          latestPlan: pl.plan ?? a.latestPlan,
+          latestTestResults: pl.test_results ?? a.latestTestResults,
+        } });
+        break;
+      }
     }
   },
 

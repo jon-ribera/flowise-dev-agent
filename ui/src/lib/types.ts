@@ -1,5 +1,5 @@
 export type SessionStatus = "pending_interrupt" | "completed" | "in_progress" | "error";
-export type InterruptType = "clarification" | "credential_check" | "plan_approval" | "result_review" | "select_target";
+export type InterruptType = "clarification" | "credential_check" | "plan_approval" | "result_review" | "select_target" | "interrupt";
 export type NodeStatus = "pending" | "running" | "completed" | "interrupted" | "failed" | "skipped";
 
 export interface SessionSummary {

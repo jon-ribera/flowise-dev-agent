@@ -4234,6 +4234,7 @@ def _build_graph_v2(
     client: "FlowiseClient | None" = None,
     pattern_store=None,
     capabilities: "list[DomainCapability] | None" = None,
+    emit_event=None,
 ):
     """Build the M9.6 18-node topology (CREATE + UPDATE modes, budgets, bounded retries).
 
@@ -4276,35 +4277,42 @@ def _build_graph_v2(
 
     builder = StateGraph(AgentState)
 
+    # M9.2 node-wrapping helper — works identically to v1 topology
+    def _w2(name: str, fn):
+        if emit_event is None:
+            return fn
+        from flowise_dev_agent.persistence.hooks import wrap_node
+        return wrap_node(name, fn, emit_event)
+
     # ---- Phase A ----
-    builder.add_node("classify_intent",   _make_classify_intent_node(engine))
-    builder.add_node("hydrate_context",   _make_hydrate_context_node(capabilities))
+    builder.add_node("classify_intent",   _w2("classify_intent",   _make_classify_intent_node(engine)))
+    builder.add_node("hydrate_context",   _w2("hydrate_context",   _make_hydrate_context_node(capabilities)))
 
     # ---- Phase B (UPDATE only, skipped for CREATE) ----
-    builder.add_node("resolve_target",     _make_resolve_target_node(domains))
-    builder.add_node("hitl_select_target", _make_hitl_select_target_node())
+    builder.add_node("resolve_target",     _w2("resolve_target",     _make_resolve_target_node(domains)))
+    builder.add_node("hitl_select_target", _w2("hitl_select_target", _make_hitl_select_target_node()))
 
     # ---- Phase C (UPDATE only) ----
-    builder.add_node("load_current_flow",      _make_load_current_flow_node(domains))
-    builder.add_node("summarize_current_flow", _make_summarize_current_flow_node())
+    builder.add_node("load_current_flow",      _w2("load_current_flow",      _make_load_current_flow_node(domains)))
+    builder.add_node("summarize_current_flow", _w2("summarize_current_flow", _make_summarize_current_flow_node()))
 
     # ---- Phase D ----
-    builder.add_node("plan_v2",            _make_plan_node(engine, domains, _template_store, pattern_store=pattern_store))
-    builder.add_node("hitl_plan_v2",       _make_human_plan_approval_node())
-    builder.add_node("define_patch_scope", _make_define_patch_scope_node(engine))
-    builder.add_node("compile_patch_ir",   _make_compile_patch_ir_node(engine, capabilities))
-    builder.add_node("compile_flow_data",  _make_compile_flow_data_node(capabilities, domains))
+    builder.add_node("plan_v2",            _w2("plan_v2",            _make_plan_node(engine, domains, _template_store, pattern_store=pattern_store)))
+    builder.add_node("hitl_plan_v2",       _w2("hitl_plan_v2",       _make_human_plan_approval_node()))
+    builder.add_node("define_patch_scope", _w2("define_patch_scope", _make_define_patch_scope_node(engine)))
+    builder.add_node("compile_patch_ir",   _w2("compile_patch_ir",   _make_compile_patch_ir_node(engine, capabilities)))
+    builder.add_node("compile_flow_data",  _w2("compile_flow_data",  _make_compile_flow_data_node(capabilities, domains)))
 
     # ---- Phase E ----
-    builder.add_node("validate",      _make_validate_node())
-    builder.add_node("repair_schema", _make_repair_schema_node(capabilities, domains))
+    builder.add_node("validate",      _w2("validate",      _make_validate_node()))
+    builder.add_node("repair_schema", _w2("repair_schema", _make_repair_schema_node(capabilities, domains)))
 
     # ---- Phase F ----
-    builder.add_node("preflight_validate_patch", _make_preflight_validate_patch_node())
-    builder.add_node("apply_patch",    _make_apply_patch_node(domains, capabilities))
-    builder.add_node("test_v2",        _make_test_node(engine, domains))
-    builder.add_node("evaluate",       _make_evaluate_node(engine))
-    builder.add_node("hitl_review_v2", _make_hitl_review_node())
+    builder.add_node("preflight_validate_patch", _w2("preflight_validate_patch", _make_preflight_validate_patch_node()))
+    builder.add_node("apply_patch",    _w2("apply_patch",    _make_apply_patch_node(domains, capabilities)))
+    builder.add_node("test_v2",        _w2("test_v2",        _make_test_node(engine, domains)))
+    builder.add_node("evaluate",       _w2("evaluate",       _make_evaluate_node(engine)))
+    builder.add_node("hitl_review_v2", _w2("hitl_review_v2", _make_hitl_review_node()))
 
     # ---- Fixed edges ----
     builder.add_edge(START, "classify_intent")

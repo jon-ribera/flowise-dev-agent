@@ -39,6 +39,7 @@ See DESIGN_DECISIONS.md — DD-007 through DD-010.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -2378,6 +2379,1616 @@ def _route_after_result_review(state: AgentState) -> str:
     return "plan"
 
 
+# ===========================================================================
+# M9.6 — Production-Grade LangGraph Topology v2 (CREATE + UPDATE modes)
+#
+# 18-node topology with:
+#   Phase A: classify_intent, hydrate_context
+#   Phase B: resolve_target, HITL_select_target  (UPDATE only)
+#   Phase C: load_current_flow, summarize_current_flow  (UPDATE only)
+#   Phase D: plan, HITL_plan, define_patch_scope, compile_patch_ir, compile_flow_data
+#   Phase E: validate, repair_schema
+#   Phase F: preflight_validate_patch, apply_patch, test, evaluate, HITL_review
+#
+# See roadmap9_production_graph_runtime_hardening.md — Milestone 9.6
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# M9.6: Classify intent prompt
+# ---------------------------------------------------------------------------
+
+_CLASSIFY_INTENT_SYSTEM = """\
+You are an intent classifier for a Flowise chatflow assistant.
+
+Read the developer's requirement and classify the intent.
+
+Respond with EXACTLY this format:
+INTENT: create | update
+CONFIDENCE: <0.0-1.0>
+TARGET_NAME: <name of existing chatflow if update, else (none)>
+
+Rules:
+- "create" = building a new chatflow from scratch
+- "update" = modifying/changing/fixing/extending an existing chatflow
+- TARGET_NAME = the chatflow name mentioned (e.g. "Support Bot"); use (none) for create intent
+- CONFIDENCE = how certain you are (0.0 = no idea, 1.0 = certain)
+
+Examples:
+  Requirement: "Build a new customer service chatbot"
+  INTENT: create
+  CONFIDENCE: 0.95
+  TARGET_NAME: (none)
+
+  Requirement: "Update the Support Bot chatflow to use GPT-4"
+  INTENT: update
+  CONFIDENCE: 0.9
+  TARGET_NAME: Support Bot
+
+  Requirement: "Add memory to my Sales Agent flow"
+  INTENT: update
+  CONFIDENCE: 0.8
+  TARGET_NAME: Sales Agent
+"""
+
+_DEFINE_PATCH_SCOPE_SYSTEM = """\
+You are scoping the patch phase for a Flowise chatflow builder.
+
+Given the approved plan, output EXACTLY this format:
+MAX_OPS: <integer>
+FOCUS_AREA: <optional short description or (none)>
+PROTECTED_NODES: <comma-separated node IDs or (none)>
+
+Rules:
+- For CREATE: default MAX_OPS is 20 (can increase for complex flows, max 30)
+- For UPDATE: default MAX_OPS is 12 (changes are targeted, fewer ops needed)
+- FOCUS_AREA: brief label for what area the patch targets (e.g. "LLM configuration")
+- PROTECTED_NODES: node IDs that must NOT be removed in UPDATE mode (use (none) for CREATE)
+"""
+
+_COMPILE_PATCH_IR_V2_SYSTEM = """\
+You are a Flowise co-pilot in the COMPILE PATCH IR phase (Topology v2).
+
+Your task: output a JSON array of Patch IR operations that implement the approved plan.
+DO NOT include any explanation, markdown fences, or text outside the JSON array.
+
+AVAILABLE OPERATIONS:
+
+1. AddNode — add a new Flowise node
+   {"op_type":"add_node","node_name":"<flowise_type>","node_id":"<unique_id>","label":"<display>","params":{"modelName":"gpt-4o"}}
+
+2. SetParam — update a configurable parameter on an existing node
+   {"op_type":"set_param","node_id":"<id>","param_name":"<key>","value":"<val>"}
+
+3. Connect — connect two nodes by anchor name (NOT handle IDs — the compiler derives them)
+   {"op_type":"connect","source_node_id":"<id>","source_anchor":"<output_name>","target_node_id":"<id>","target_anchor":"<input_type>"}
+
+4. BindCredential — bind a credential ID at BOTH data.credential levels
+   {"op_type":"bind_credential","node_id":"<id>","credential_id":"<uuid>","credential_type":"<type>"}
+
+RULES:
+1. node_id: unique within the flow — use "<node_name>_<index>" e.g. "chatOpenAI_0"
+2. source_anchor: output anchor name — usually the node_name itself (e.g. "chatOpenAI")
+3. target_anchor: input anchor TYPE — the baseClass it accepts (e.g. "BaseChatModel", "BaseMemory")
+4. EVERY credential-bearing node (LLM, embedding, etc.) MUST have a BindCredential op
+5. Include ALL required nodes + connections for a working flow — never omit the chain/agent node
+6. Do NOT write handle strings, edge IDs, or raw flowData JSON — the compiler derives all of that
+7. For UPDATE: only emit ops for what CHANGES — do NOT re-add nodes already present
+
+OUTPUT: A single JSON array only, nothing else.
+"""
+
+_EVALUATE_SYSTEM = """\
+You are evaluating the result of a Flowise chatflow patch.
+
+Given a diff summary of what changed, produce a verdict.
+
+Respond with EXACTLY one of:
+VERDICT: done
+VERDICT: iterate
+REASON: <one sentence>
+
+Use "done" when all required changes from the plan were applied correctly.
+Use "iterate" when the diff shows missing or incorrect changes.
+"""
+
+
+# ---------------------------------------------------------------------------
+# M9.6: Utility — deterministic flow summarizer (NO LLM)
+# ---------------------------------------------------------------------------
+
+
+def _summarize_flow_data(flow_data: dict | str) -> dict:
+    """Compute a compact structured summary of a Flowise flowData dict.
+
+    This function is DETERMINISTIC — no LLM call. It reads the raw flowData
+    and extracts only the structural metadata needed for planning.
+
+    NEVER puts the full flowData into any LLM prompt. Only the returned
+    summary dict may appear in LLM context.
+
+    Returns a dict with:
+        node_count: int
+        edge_count: int
+        node_types: dict[str, int]  — histogram of node type names
+        top_labels: list[str]       — first 10 node display labels
+        key_tool_nodes: list[str]   — node IDs of tool/agent/chain nodes
+    """
+    if isinstance(flow_data, str):
+        try:
+            flow_data = json.loads(flow_data)
+        except (json.JSONDecodeError, TypeError):
+            return {
+                "node_count": 0,
+                "edge_count": 0,
+                "node_types": {},
+                "top_labels": [],
+                "key_tool_nodes": [],
+            }
+
+    if not isinstance(flow_data, dict):
+        return {
+            "node_count": 0,
+            "edge_count": 0,
+            "node_types": {},
+            "top_labels": [],
+            "key_tool_nodes": [],
+        }
+
+    nodes = flow_data.get("nodes") or []
+    edges = flow_data.get("edges") or []
+
+    node_types: dict[str, int] = {}
+    top_labels: list[str] = []
+    key_tool_nodes: list[str] = []
+
+    # Keywords that identify "key" tool/agent/chain nodes
+    _key_keywords = frozenset({
+        "agent", "chain", "tool", "retriever", "memory", "llm",
+        "chatmodel", "embedding", "vectorstore",
+    })
+
+    for node in nodes[:50]:  # cap at 50 to avoid huge summaries
+        data = node.get("data") or {}
+        node_name = data.get("name") or ""
+        label = data.get("label") or node_name
+        node_id = node.get("id") or ""
+
+        # histogram
+        if node_name:
+            node_types[node_name] = node_types.get(node_name, 0) + 1
+
+        # top labels (limit 10)
+        if label and len(top_labels) < 10:
+            top_labels.append(label)
+
+        # key tool nodes — match by name/label keywords
+        combined = (node_name + " " + label).lower()
+        if any(kw in combined for kw in _key_keywords):
+            key_tool_nodes.append(node_id)
+
+    return {
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "node_types": node_types,
+        "top_labels": top_labels,
+        "key_tool_nodes": key_tool_nodes,
+    }
+
+
+def _repair_schema_for_ops(
+    ops: list,
+    missing_node_types: list[str],
+    node_store,
+) -> list[str]:
+    """Attempt to repair missing node schemas for the given node types.
+
+    Checks the local NodeSchemaStore for each missing type. Returns the list
+    of node types that were successfully found (or already cached). Types that
+    are truly absent from the store cannot be repaired here.
+
+    This is a SYNCHRONOUS helper called from the repair_schema node (which
+    itself is deterministic/sync). Callers that need async repair should use
+    node_store.get_or_repair() directly.
+
+    Args:
+        ops:               The current list of PatchOp objects (used for type checking).
+        missing_node_types: Node type names that failed AddNode during compile.
+        node_store:         NodeSchemaStore instance. May be None (graceful skip).
+
+    Returns:
+        List of node_type strings that are now available in the store.
+    """
+    if node_store is None or not missing_node_types:
+        return []
+
+    repaired: list[str] = []
+    for node_type in missing_node_types:
+        # Check if the store already has this type in its index
+        schema = node_store._index.get(node_type) if hasattr(node_store, "_index") else None
+        if schema:
+            repaired.append(node_type)
+            logger.debug("[repair_schema] '%s' found in local index — no API call needed", node_type)
+        else:
+            logger.warning(
+                "[repair_schema] '%s' not in local schema index — cannot repair without API call",
+                node_type,
+            )
+
+    return repaired
+
+
+# ---------------------------------------------------------------------------
+# M9.6: Phase A nodes — classify_intent, hydrate_context
+# ---------------------------------------------------------------------------
+
+
+def _make_classify_intent_node(engine: ReasoningEngine):
+    """Factory: classify_intent node (LLM-lite, no tools).
+
+    Classifies the developer's requirement as "create" or "update" intent.
+    For "update" intent, also extracts the target chatflow name if mentioned.
+    Initializes budget state in facts["budgets"].
+    """
+    async def classify_intent(state: AgentState) -> dict:
+        logger.info("[CLASSIFY_INTENT] classifying requirement intent")
+
+        response = await engine.complete(
+            messages=[Message(role="user", content=state["requirement"])],
+            system=_CLASSIFY_INTENT_SYSTEM,
+            tools=None,
+        )
+        text = (response.content or "").strip()
+
+        # Parse intent
+        intent = "create"
+        confidence = 0.5
+        target_name: str | None = None
+
+        for line in text.splitlines():
+            line = line.strip()
+            if line.upper().startswith("INTENT:"):
+                val = line.split(":", 1)[1].strip().lower()
+                if val in ("create", "update"):
+                    intent = val
+            elif line.upper().startswith("CONFIDENCE:"):
+                try:
+                    confidence = float(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.upper().startswith("TARGET_NAME:"):
+                raw = line.split(":", 1)[1].strip()
+                if raw.lower() not in ("(none)", "none", ""):
+                    target_name = raw
+
+        logger.info(
+            "[CLASSIFY_INTENT] intent=%s confidence=%.2f target_name=%r",
+            intent, confidence, target_name,
+        )
+
+        # Initialize budget state
+        existing_facts = state.get("facts") or {}
+        existing_flowise = existing_facts.get("flowise") or {}
+
+        new_facts: dict[str, Any] = {
+            "flowise": {
+                **existing_flowise,
+                "intent": intent,
+                "target_name": target_name,
+            },
+            "budgets": {
+                "max_patch_ops_per_iter": 20 if intent == "create" else 12,
+                "max_schema_repairs_per_iter": 2,
+                "max_total_retries_per_iter": 1,
+                "retries_used": 0,
+            },
+            "repair": {"count": 0, "repaired_node_types": []},
+        }
+
+        return {
+            "operation_mode": intent,
+            "target_chatflow_id": None,
+            "intent_confidence": confidence,
+            "facts": new_facts,
+            "total_input_tokens": response.input_tokens,
+            "total_output_tokens": response.output_tokens,
+        }
+
+    return classify_intent
+
+
+def _make_hydrate_context_node(capabilities: "list[DomainCapability] | None" = None):
+    """Factory: hydrate_context node (deterministic, no LLM, no tools).
+
+    Loads local snapshot metadata from NodeSchemaStore (if available).
+    Outputs facts["flowise"]["schema_fingerprint"] and facts["flowise"]["node_count"].
+    Never makes network calls — skips gracefully if knowledge provider is absent.
+    """
+    async def hydrate_context(state: AgentState) -> dict:
+        logger.info("[HYDRATE_CONTEXT] loading local snapshot metadata")
+
+        schema_fingerprint: str | None = None
+        node_count: int = 0
+
+        if capabilities:
+            flowise_cap = next(
+                (c for c in capabilities if c.name == "flowise"), None
+            )
+            if flowise_cap and hasattr(flowise_cap, "knowledge"):
+                provider = flowise_cap.knowledge
+                node_store = getattr(provider, "node_schemas", None)
+                if node_store is not None:
+                    schema_fingerprint = getattr(node_store, "meta_fingerprint", None)
+                    # node_count from the store's index
+                    _index = getattr(node_store, "_index", {})
+                    node_count = len(_index)
+                    logger.debug(
+                        "[HYDRATE_CONTEXT] node_count=%d fingerprint=%s",
+                        node_count,
+                        (schema_fingerprint or "")[:12] if schema_fingerprint else "none",
+                    )
+
+        existing_facts = state.get("facts") or {}
+        existing_flowise = existing_facts.get("flowise") or {}
+
+        updated_flowise = {
+            **existing_flowise,
+            "schema_fingerprint": schema_fingerprint,
+            "node_count": node_count,
+        }
+
+        return {
+            "facts": {"flowise": updated_flowise},
+        }
+
+    return hydrate_context
+
+
+# ---------------------------------------------------------------------------
+# M9.6: Phase B nodes — resolve_target, HITL_select_target  (UPDATE only)
+# ---------------------------------------------------------------------------
+
+
+def _make_resolve_target_node(domains: list[DomainTools]):
+    """Factory: resolve_target node (tool call allowed, bounded max_rounds=5).
+
+    Calls list_chatflows, optionally filters by target_name substring match,
+    and stores the top 10 matches sorted by recency.
+
+    Only runs for UPDATE intent. For CREATE, this node is skipped by routing.
+    """
+    _, executor = merge_tools(domains, "discover")
+
+    async def resolve_target(state: AgentState) -> dict:
+        logger.info("[RESOLVE_TARGET] listing chatflows for target resolution")
+
+        target_name: str | None = (state.get("facts") or {}).get("flowise", {}).get("target_name")
+
+        # Fetch chatflows list
+        cf_result = await execute_tool("list_chatflows", {}, executor)
+
+        chatflows: list[dict] = []
+        if cf_result.ok:
+            raw = cf_result.data
+            if isinstance(raw, list):
+                chatflows = raw
+            elif isinstance(raw, dict) and "chatflows" in raw:
+                chatflows = raw["chatflows"]
+
+        # Filter by target_name (case-insensitive substring match)
+        if target_name:
+            tn_lower = target_name.lower()
+            chatflows = [
+                cf for cf in chatflows
+                if tn_lower in (cf.get("name") or "").lower()
+            ]
+            logger.debug(
+                "[RESOLVE_TARGET] filtered to %d match(es) for target_name=%r",
+                len(chatflows), target_name,
+            )
+
+        # Sort by recency (updated_at or created_at descending)
+        def _sort_key(cf: dict) -> str:
+            return cf.get("updatedDate") or cf.get("createdDate") or ""
+
+        chatflows.sort(key=_sort_key, reverse=True)
+
+        # Limit to top 10
+        top_matches = [
+            {
+                "id": cf.get("id") or "",
+                "name": cf.get("name") or "",
+                "updated_at": cf.get("updatedDate") or cf.get("createdDate") or "",
+            }
+            for cf in chatflows[:10]
+        ]
+
+        logger.info("[RESOLVE_TARGET] top_matches count=%d", len(top_matches))
+
+        existing_facts = state.get("facts") or {}
+        existing_flowise = existing_facts.get("flowise") or {}
+
+        return {
+            "facts": {
+                "flowise": {
+                    **existing_flowise,
+                    "top_matches": top_matches,
+                }
+            }
+        }
+
+    return resolve_target
+
+
+def _make_hitl_select_target_node():
+    """Factory: HITL_select_target node (interrupt).
+
+    Presents top_matches to the developer. Developer selects a chatflow to
+    update OR replies "create new" to switch to CREATE mode.
+    """
+    async def hitl_select_target(state: AgentState) -> dict:
+        logger.info("[HITL_SELECT_TARGET] waiting for developer target selection")
+
+        top_matches = (state.get("facts") or {}).get("flowise", {}).get("top_matches", [])
+
+        interrupt_payload = {
+            "type": "select_target",
+            "top_matches": top_matches,
+            "prompt": (
+                "Select which chatflow to update by replying with the chatflow ID or name.\n"
+                "Or reply 'create new' to build a new chatflow instead.\n\n"
+                "Available chatflows:\n"
+                + "\n".join(
+                    f"  - {m['name']} (id={m['id']}, updated={m['updated_at']})"
+                    for m in top_matches
+                )
+                if top_matches else
+                "No matching chatflows found. Reply 'create new' to build a new chatflow."
+            ),
+        }
+        if state.get("webhook_url"):
+            asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
+
+        developer_response: str = interrupt(interrupt_payload)
+        response_stripped = developer_response.strip()
+
+        existing_facts = state.get("facts") or {}
+        existing_flowise = existing_facts.get("flowise") or {}
+
+        # Parse response
+        if response_stripped.lower() in ("create new", "create", "new"):
+            logger.info("[HITL_SELECT_TARGET] developer chose 'create new'")
+            return {
+                "operation_mode": "create",
+                "target_chatflow_id": None,
+                "facts": {
+                    "flowise": {
+                        **existing_flowise,
+                        "operation_mode": "create",
+                    }
+                },
+            }
+
+        # Try to match by ID first (UUID pattern)
+        matched_id: str | None = None
+        matched_name: str | None = None
+        for match in top_matches:
+            if response_stripped == match["id"] or response_stripped.lower() == match["name"].lower():
+                matched_id = match["id"]
+                matched_name = match["name"]
+                break
+
+        # Fallback: substring name match
+        if not matched_id:
+            response_lower = response_stripped.lower()
+            for match in top_matches:
+                if response_lower in (match["name"] or "").lower():
+                    matched_id = match["id"]
+                    matched_name = match["name"]
+                    break
+
+        if matched_id:
+            logger.info(
+                "[HITL_SELECT_TARGET] selected chatflow id=%s name=%r",
+                matched_id, matched_name,
+            )
+            return {
+                "operation_mode": "update",
+                "target_chatflow_id": matched_id,
+                "facts": {
+                    "flowise": {
+                        **existing_flowise,
+                        "operation_mode": "update",
+                        "target_chatflow_id": matched_id,
+                    }
+                },
+            }
+
+        # Unknown response — treat as "create new"
+        logger.warning(
+            "[HITL_SELECT_TARGET] could not match response %r — defaulting to create new",
+            response_stripped,
+        )
+        return {
+            "operation_mode": "create",
+            "target_chatflow_id": None,
+            "facts": {
+                "flowise": {
+                    **existing_flowise,
+                    "operation_mode": "create",
+                }
+            },
+        }
+
+    return hitl_select_target
+
+
+# ---------------------------------------------------------------------------
+# M9.6: Phase C nodes — load_current_flow, summarize_current_flow  (UPDATE only)
+# ---------------------------------------------------------------------------
+
+
+def _make_load_current_flow_node(domains: list[DomainTools]):
+    """Factory: load_current_flow node (tool allowed, exactly once).
+
+    Fetches full flowData via get_chatflow(chatflow_id). CRITICAL: stores
+    the full JSON in artifacts["flowise"]["current_flow_data"] — NOT in LLM
+    context (messages). Also computes a SHA-256 hash for integrity tracking.
+    """
+    _, executor = merge_tools(domains, "discover")
+
+    async def load_current_flow(state: AgentState) -> dict:
+        target_id = state.get("target_chatflow_id")
+        logger.info("[LOAD_CURRENT_FLOW] fetching chatflow id=%s", target_id)
+
+        if not target_id:
+            logger.warning("[LOAD_CURRENT_FLOW] no target_chatflow_id — skipping")
+            return {}
+
+        cf_result = await execute_tool(
+            "get_chatflow", {"chatflow_id": target_id}, executor
+        )
+
+        if not cf_result.ok or not isinstance(cf_result.data, dict):
+            logger.warning(
+                "[LOAD_CURRENT_FLOW] get_chatflow failed or returned non-dict: %s",
+                cf_result.summary,
+            )
+            return {}
+
+        raw_flow_data = (
+            cf_result.data.get("flowData")
+            or cf_result.data.get("flow_data")
+            or {}
+        )
+
+        # Parse if string
+        if isinstance(raw_flow_data, str):
+            try:
+                flow_data_dict = json.loads(raw_flow_data)
+            except json.JSONDecodeError:
+                flow_data_dict = {}
+            flow_data_str = raw_flow_data
+        else:
+            flow_data_dict = raw_flow_data
+            flow_data_str = json.dumps(raw_flow_data, separators=(",", ":"))
+
+        # Compute hash
+        current_hash = hashlib.sha256(flow_data_str.encode("utf-8")).hexdigest()
+
+        node_count = len((flow_data_dict.get("nodes") or []))
+        edge_count = len((flow_data_dict.get("edges") or []))
+        logger.info(
+            "[LOAD_CURRENT_FLOW] loaded flow: nodes=%d edges=%d hash=%s...",
+            node_count, edge_count, current_hash[:12],
+        )
+
+        # CRITICAL: store full JSON in artifacts, NOT in messages
+        existing_artifacts = state.get("artifacts") or {}
+        existing_flowise_artifacts = existing_artifacts.get("flowise") or {}
+        existing_facts = state.get("facts") or {}
+        existing_flowise_facts = existing_facts.get("flowise") or {}
+
+        return {
+            "artifacts": {
+                "flowise": {
+                    **existing_flowise_artifacts,
+                    "current_flow_data": flow_data_dict,
+                }
+            },
+            "facts": {
+                "flowise": {
+                    **existing_flowise_facts,
+                    "current_flow_hash": current_hash,
+                }
+            },
+        }
+
+    return load_current_flow
+
+
+def _make_summarize_current_flow_node():
+    """Factory: summarize_current_flow node (deterministic, NO LLM call).
+
+    Reads artifacts["flowise"]["current_flow_data"] and computes a compact
+    structured summary. NEVER puts full flowData into any prompt.
+    """
+    async def summarize_current_flow(state: AgentState) -> dict:
+        logger.info("[SUMMARIZE_CURRENT_FLOW] computing flow summary (deterministic)")
+
+        current_flow_data = (
+            (state.get("artifacts") or {})
+            .get("flowise", {})
+            .get("current_flow_data")
+        )
+
+        if not current_flow_data:
+            logger.warning("[SUMMARIZE_CURRENT_FLOW] no current_flow_data in artifacts")
+            flow_summary = {
+                "node_count": 0,
+                "edge_count": 0,
+                "node_types": {},
+                "top_labels": [],
+                "key_tool_nodes": [],
+            }
+        else:
+            flow_summary = _summarize_flow_data(current_flow_data)
+
+        logger.debug(
+            "[SUMMARIZE_CURRENT_FLOW] summary: node_count=%d edge_count=%d types=%d",
+            flow_summary["node_count"],
+            flow_summary["edge_count"],
+            len(flow_summary["node_types"]),
+        )
+
+        existing_facts = state.get("facts") or {}
+        existing_flowise_facts = existing_facts.get("flowise") or {}
+
+        return {
+            "facts": {
+                "flowise": {
+                    **existing_flowise_facts,
+                    "flow_summary": flow_summary,
+                }
+            }
+        }
+
+    return summarize_current_flow
+
+
+# ---------------------------------------------------------------------------
+# M9.6: Phase D nodes — define_patch_scope, compile_patch_ir, compile_flow_data
+# ---------------------------------------------------------------------------
+
+
+def _make_define_patch_scope_node(engine: ReasoningEngine):
+    """Factory: define_patch_scope node (LLM-lite, no tools).
+
+    Single LLM call: given the plan, determine max_ops, focus_area,
+    and protected_nodes. Overrides the budget initialized by classify_intent.
+    """
+    async def define_patch_scope(state: AgentState) -> dict:
+        logger.info("[DEFINE_PATCH_SCOPE] scoping the patch phase")
+
+        plan = state.get("plan") or ""
+        operation_mode = state.get("operation_mode") or "create"
+
+        prompt = (
+            f"Operation mode: {operation_mode}\n\n"
+            f"Approved plan:\n{plan[:2000]}\n\n"
+            "Based on the plan, define the patch scope."
+        )
+
+        response = await engine.complete(
+            messages=[Message(role="user", content=prompt)],
+            system=_DEFINE_PATCH_SCOPE_SYSTEM,
+            tools=None,
+        )
+        text = (response.content or "").strip()
+
+        # Parse response
+        max_ops = 20 if operation_mode == "create" else 12
+        focus_area: str | None = None
+        protected_nodes: list[str] = []
+
+        for line in text.splitlines():
+            line = line.strip()
+            if line.upper().startswith("MAX_OPS:"):
+                try:
+                    max_ops = int(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.upper().startswith("FOCUS_AREA:"):
+                raw = line.split(":", 1)[1].strip()
+                if raw.lower() not in ("(none)", "none", ""):
+                    focus_area = raw
+            elif line.upper().startswith("PROTECTED_NODES:"):
+                raw = line.split(":", 1)[1].strip()
+                if raw.lower() not in ("(none)", "none", ""):
+                    protected_nodes = [n.strip() for n in raw.split(",") if n.strip()]
+
+        logger.info(
+            "[DEFINE_PATCH_SCOPE] max_ops=%d focus_area=%r protected_nodes=%r",
+            max_ops, focus_area, protected_nodes,
+        )
+
+        existing_facts = state.get("facts") or {}
+        existing_budgets = existing_facts.get("budgets") or {}
+
+        return {
+            "facts": {
+                "patch": {
+                    "max_ops": max_ops,
+                    "focus_area": focus_area,
+                    "protected_nodes": protected_nodes,
+                },
+                "budgets": {
+                    **existing_budgets,
+                    "max_patch_ops_per_iter": max_ops,
+                },
+            },
+            "total_input_tokens": response.input_tokens,
+            "total_output_tokens": response.output_tokens,
+        }
+
+    return define_patch_scope
+
+
+def _make_compile_patch_ir_node(
+    engine: ReasoningEngine,
+    capabilities: "list[DomainCapability] | None" = None,
+):
+    """Factory: compile_patch_ir node (LLM, no tools).
+
+    Similar to the existing patch node's IR phase but decoupled from the
+    write step. For UPDATE: uses flow_summary in context (NOT full flowData).
+    Emits a JSON array of Patch IR ops.
+    """
+    flowise_cap: "DomainCapability | None" = next(
+        (cap for cap in (capabilities or []) if cap.name == "flowise"), None
+    )
+
+    async def compile_patch_ir(state: AgentState) -> dict:
+        logger.info("[COMPILE_PATCH_IR] generating patch IR ops")
+
+        plan = state.get("plan") or ""
+        requirement = state.get("requirement", "")
+        operation_mode = state.get("operation_mode") or "create"
+        facts = state.get("facts") or {}
+        flow_summary = facts.get("flowise", {}).get("flow_summary")
+        focus_area = facts.get("patch", {}).get("focus_area")
+        protected_nodes = facts.get("patch", {}).get("protected_nodes") or []
+
+        # Build context — NEVER include full flowData; only use flow_summary
+        context_parts = [
+            f"Requirement:\n{requirement}",
+            f"Operation mode: {operation_mode}",
+            f"Approved plan:\n{plan}",
+        ]
+
+        if operation_mode == "update" and flow_summary:
+            # Compact structural context from summary (NOT full flowData)
+            summary_str = (
+                f"Current flow summary:\n"
+                f"  node_count: {flow_summary.get('node_count', 0)}\n"
+                f"  edge_count: {flow_summary.get('edge_count', 0)}\n"
+                f"  node_types: {json.dumps(flow_summary.get('node_types', {}))}\n"
+                f"  top_labels: {flow_summary.get('top_labels', [])}\n"
+                f"  key_tool_nodes: {flow_summary.get('key_tool_nodes', [])}"
+            )
+            context_parts.append(summary_str)
+
+        if focus_area:
+            context_parts.append(f"Focus area: {focus_area}")
+
+        if protected_nodes:
+            context_parts.append(
+                f"Protected nodes (do NOT remove): {', '.join(protected_nodes)}"
+            )
+
+        # Check if there is a pattern-seeded base graph (for CREATE mode)
+        if operation_mode == "create":
+            base_ir_data = (state.get("artifacts") or {}).get("flowise", {}).get("base_graph_ir")
+            if base_ir_data:
+                base_graph = GraphIR.from_flow_data(base_ir_data)
+                if base_graph.nodes:
+                    existing_lines = [
+                        f"  - {n.id} ({n.node_name}): {n.label}"
+                        for n in base_graph.nodes
+                    ]
+                    context_parts.append(
+                        "Pattern-seeded base nodes already present:\n"
+                        + "\n".join(existing_lines)
+                        + "\nDo NOT re-add these nodes."
+                    )
+
+        user_msg = Message(
+            role="user",
+            content="\n\n".join(context_parts)
+            + "\n\nOutput the JSON array of Patch IR operations.",
+        )
+
+        response = await engine.complete(
+            messages=[user_msg],
+            system=_COMPILE_PATCH_IR_V2_SYSTEM,
+            tools=None,
+        )
+        raw_ops_text = (response.content or "[]").strip()
+
+        # Parse ops
+        ops = []
+        ir_errors: list[str] = []
+        try:
+            ops = ops_from_json(raw_ops_text)
+        except Exception as e:
+            ir_errors = [f"Failed to parse Patch IR JSON: {e}"]
+            logger.warning("[COMPILE_PATCH_IR] ops parse failed: %s", e)
+
+        if not ir_errors:
+            # Validate (without a base graph context here; full validation in compile_flow_data)
+            ir_errors = validate_patch_ops(ops)
+
+        logger.info(
+            "[COMPILE_PATCH_IR] ops=%d ir_errors=%d",
+            len(ops), len(ir_errors),
+        )
+
+        patch_ir_dicts = [op_to_dict(op) for op in ops]
+
+        return {
+            "patch_ir": patch_ir_dicts,
+            "total_input_tokens": response.input_tokens,
+            "total_output_tokens": response.output_tokens,
+        }
+
+    return compile_patch_ir
+
+
+def _make_compile_flow_data_node(
+    capabilities: "list[DomainCapability] | None" = None,
+    domains: "list[DomainTools] | None" = None,
+):
+    """Factory: compile_flow_data node (deterministic compiler).
+
+    CREATE: base = empty GraphIR or pattern skeleton from artifacts["flowise"]["base_graph_ir"]
+    UPDATE: base = normalized GraphIR from artifacts["flowise"]["current_flow_data"]
+    Applies patch_ir ops via compile_patch_ops().
+    """
+    flowise_cap: "DomainCapability | None" = next(
+        (cap for cap in (capabilities or []) if cap.name == "flowise"), None
+    )
+    # Build a discover executor for schema fetching
+    _domains = domains or []
+    _, discover_executor = merge_tools(_domains, "discover")
+
+    async def compile_flow_data(state: AgentState) -> dict:
+        logger.info("[COMPILE_FLOW_DATA] running deterministic compiler")
+
+        operation_mode = state.get("operation_mode") or "create"
+        patch_ir_dicts = state.get("patch_ir") or []
+        artifacts = state.get("artifacts") or {}
+        flowise_artifacts = artifacts.get("flowise") or {}
+
+        # Reconstruct ops from IR dicts
+        try:
+            ops = ops_from_json(json.dumps(patch_ir_dicts))
+        except Exception as e:
+            logger.warning("[COMPILE_FLOW_DATA] failed to reconstruct ops: %s", e)
+            ops = []
+
+        # Determine base graph
+        if operation_mode == "update":
+            current_flow_data = flowise_artifacts.get("current_flow_data") or {}
+            base_graph = GraphIR.from_flow_data(current_flow_data)
+            logger.debug(
+                "[COMPILE_FLOW_DATA] UPDATE base: %d nodes, %d edges",
+                len(base_graph.nodes), len(base_graph.edges),
+            )
+        else:
+            # CREATE: use pattern-seeded base or empty
+            base_ir_data = flowise_artifacts.get("base_graph_ir")
+            if base_ir_data:
+                base_graph = GraphIR.from_flow_data(base_ir_data)
+                logger.debug(
+                    "[COMPILE_FLOW_DATA] CREATE with pattern seed: %d nodes",
+                    len(base_graph.nodes),
+                )
+            else:
+                base_graph = GraphIR()
+                logger.debug("[COMPILE_FLOW_DATA] CREATE from empty GraphIR")
+
+        # Build schema cache for AddNode ops
+        schema_cache: dict[str, dict] = {}
+        new_node_names = {
+            op.node_name for op in ops
+            if isinstance(op, AddNode) and op.node_name
+        }
+
+        if new_node_names:
+            provider = flowise_cap.knowledge if flowise_cap else None
+            node_store = provider.node_schemas if provider else None
+
+            for node_name in new_node_names:
+                if node_store is not None:
+                    # Local-first: use snapshot
+                    schema = node_store._index.get(node_name) if hasattr(node_store, "_index") else None
+                    if schema:
+                        schema_cache[node_name] = schema
+                    else:
+                        # Fallback to API
+                        _result = await execute_tool(
+                            "get_node", {"name": node_name}, discover_executor
+                        )
+                        if isinstance(_result, ToolResult) and _result.ok and isinstance(_result.data, dict):
+                            schema_cache[node_name] = _result.data
+                else:
+                    # No knowledge provider — try API directly
+                    _result = await execute_tool(
+                        "get_node", {"name": node_name}, discover_executor
+                    )
+                    if isinstance(_result, ToolResult) and _result.ok and isinstance(_result.data, dict):
+                        schema_cache[node_name] = _result.data
+
+        # Deterministic compilation
+        compile_result = compile_patch_ops(base_graph, ops, schema_cache)
+
+        if not compile_result.ok:
+            logger.warning("[COMPILE_FLOW_DATA] compile errors: %s", compile_result.errors[:3])
+
+        # Compute proposed flow hash
+        proposed_hash = compile_result.payload_hash
+        logger.info(
+            "[COMPILE_FLOW_DATA] ok=%s ops=%d hash=%s...",
+            compile_result.ok, len(ops), proposed_hash[:12],
+        )
+
+        existing_flowise_artifacts = flowise_artifacts.copy()
+        existing_flowise_facts = (state.get("facts") or {}).get("flowise") or {}
+
+        return {
+            "artifacts": {
+                "flowise": {
+                    **existing_flowise_artifacts,
+                    "proposed_flow_data": compile_result.flow_data,
+                    "compile_errors": compile_result.errors,
+                    "diff_summary": compile_result.diff_summary,
+                }
+            },
+            "facts": {
+                "flowise": {
+                    **existing_flowise_facts,
+                    "proposed_flow_hash": proposed_hash,
+                }
+            },
+        }
+
+    return compile_flow_data
+
+
+# ---------------------------------------------------------------------------
+# M9.6: Phase E nodes — validate, repair_schema
+# ---------------------------------------------------------------------------
+
+
+def _make_validate_node():
+    """Factory: validate node (deterministic).
+
+    Validates artifacts["flowise"]["proposed_flow_data"] using _validate_flow_data.
+    Classifies failure type for routing decisions.
+    """
+    async def validate(state: AgentState) -> dict:
+        logger.info("[VALIDATE] running structural validation on proposed flow")
+
+        proposed_flow_data = (
+            (state.get("artifacts") or {})
+            .get("flowise", {})
+            .get("proposed_flow_data")
+        )
+
+        if not proposed_flow_data:
+            logger.warning("[VALIDATE] no proposed_flow_data in artifacts")
+            existing_facts = state.get("facts") or {}
+            return {
+                "facts": {
+                    "validation": {
+                        "ok": False,
+                        "failure_type": "other",
+                        "missing_node_types": [],
+                    }
+                },
+                "artifacts": {
+                    "validation_report": "No proposed_flow_data available to validate.",
+                },
+            }
+
+        # Run structural validation
+        flow_data_str = json.dumps(proposed_flow_data, separators=(",", ":"))
+        # Check for compile errors first
+        compile_errors = (
+            (state.get("artifacts") or {})
+            .get("flowise", {})
+            .get("compile_errors") or []
+        )
+
+        if compile_errors:
+            # Classify: compile errors often mean missing schemas → schema_mismatch
+            missing_types = []
+            for err in compile_errors:
+                if "no schema for" in err.lower():
+                    # Extract node type from error like "AddNode 'id': no schema for 'type'"
+                    import re as _re
+                    m = _re.search(r"no schema for '([^']+)'", err)
+                    if m:
+                        missing_types.append(m.group(1))
+
+            failure_type = "schema_mismatch" if missing_types else "structural"
+            report = "Compilation errors:\n" + "\n".join(compile_errors)
+
+            logger.info(
+                "[VALIDATE] compile_errors=%d failure_type=%s missing=%r",
+                len(compile_errors), failure_type, missing_types,
+            )
+
+            existing_facts = state.get("facts") or {}
+            return {
+                "facts": {
+                    "validation": {
+                        "ok": False,
+                        "failure_type": failure_type,
+                        "missing_node_types": missing_types,
+                    }
+                },
+                "artifacts": {
+                    "validation_report": report,
+                },
+            }
+
+        # Structural validation of the flow data
+        validation_raw = _validate_flow_data(flow_data_str)
+
+        if validation_raw.get("valid"):
+            logger.info(
+                "[VALIDATE] valid: nodes=%d edges=%d",
+                validation_raw.get("node_count", 0),
+                validation_raw.get("edge_count", 0),
+            )
+            report = (
+                f"Valid: {validation_raw.get('node_count', 0)} nodes, "
+                f"{validation_raw.get('edge_count', 0)} edges."
+            )
+            existing_facts = state.get("facts") or {}
+            return {
+                "facts": {
+                    "validation": {
+                        "ok": True,
+                        "failure_type": None,
+                        "missing_node_types": [],
+                    }
+                },
+                "artifacts": {
+                    "validation_report": report,
+                },
+            }
+        else:
+            errors = validation_raw.get("errors", [])
+            # Classify failure type
+            missing_types = []
+            failure_type = "structural"
+            for err in errors:
+                if "no schema" in err.lower() or "unknown node type" in err.lower():
+                    failure_type = "schema_mismatch"
+                    import re as _re
+                    m = _re.search(r"'([^']+)'", err)
+                    if m:
+                        missing_types.append(m.group(1))
+
+            report = "Validation errors:\n" + "\n".join(errors[:10])
+            logger.info(
+                "[VALIDATE] invalid: errors=%d failure_type=%s",
+                len(errors), failure_type,
+            )
+
+            existing_facts = state.get("facts") or {}
+            return {
+                "facts": {
+                    "validation": {
+                        "ok": False,
+                        "failure_type": failure_type,
+                        "missing_node_types": missing_types,
+                    }
+                },
+                "artifacts": {
+                    "validation_report": report,
+                },
+            }
+
+    return validate
+
+
+def _make_repair_schema_node(
+    capabilities: "list[DomainCapability] | None" = None,
+    domains: "list[DomainTools] | None" = None,
+):
+    """Factory: repair_schema node (deterministic, targeted).
+
+    Only triggered when failure_type == "schema_mismatch". Attempts to re-fetch
+    the missing node schemas using NodeSchemaStore or API fallback.
+    Increments facts["repair"]["count"] and enforces budget.
+    """
+    flowise_cap: "DomainCapability | None" = next(
+        (cap for cap in (capabilities or []) if cap.name == "flowise"), None
+    )
+    _domains = domains or []
+    _, discover_executor = merge_tools(_domains, "discover")
+
+    async def repair_schema(state: AgentState) -> dict:
+        logger.info("[REPAIR_SCHEMA] attempting schema repair")
+
+        facts = state.get("facts") or {}
+        validation_facts = facts.get("validation") or {}
+        missing_node_types = validation_facts.get("missing_node_types") or []
+        repair_facts = facts.get("repair") or {"count": 0, "repaired_node_types": []}
+        budget_facts = facts.get("budgets") or {}
+
+        repair_count = repair_facts.get("count", 0)
+        max_repairs = budget_facts.get("max_schema_repairs_per_iter", 2)
+
+        if repair_count >= max_repairs:
+            logger.warning(
+                "[REPAIR_SCHEMA] budget exceeded: count=%d max=%d",
+                repair_count, max_repairs,
+            )
+            # Budget exceeded — signal via facts but don't loop
+            return {
+                "facts": {
+                    "repair": {
+                        **repair_facts,
+                        "count": repair_count,
+                        "budget_exceeded": True,
+                    }
+                }
+            }
+
+        # Attempt repair for each missing type
+        provider = flowise_cap.knowledge if flowise_cap else None
+        node_store = provider.node_schemas if provider else None
+
+        # Use synchronous helper to check local store
+        locally_found = _repair_schema_for_ops([], missing_node_types, node_store)
+
+        # For types NOT found locally, try API
+        api_fetched: list[str] = []
+        for node_type in missing_node_types:
+            if node_type in locally_found:
+                continue
+            _result = await execute_tool(
+                "get_node", {"name": node_type}, discover_executor
+            )
+            if isinstance(_result, ToolResult) and _result.ok and isinstance(_result.data, dict):
+                # Update the store's index if possible
+                if node_store and hasattr(node_store, "_index"):
+                    node_store._index[node_type] = _result.data
+                    api_fetched.append(node_type)
+                    logger.info("[REPAIR_SCHEMA] fetched '%s' via API", node_type)
+
+        all_repaired = locally_found + api_fetched
+        new_count = repair_count + 1
+
+        logger.info(
+            "[REPAIR_SCHEMA] repaired=%r count=%d",
+            all_repaired, new_count,
+        )
+
+        existing_repaired = repair_facts.get("repaired_node_types") or []
+        return {
+            "facts": {
+                "repair": {
+                    "count": new_count,
+                    "repaired_node_types": existing_repaired + all_repaired,
+                    "budget_exceeded": False,
+                }
+            }
+        }
+
+    return repair_schema
+
+
+# ---------------------------------------------------------------------------
+# M9.6: Phase F nodes — preflight_validate_patch, apply_patch, evaluate, HITL_review
+# ---------------------------------------------------------------------------
+
+
+def _make_preflight_validate_patch_node():
+    """Factory: preflight_validate_patch node (deterministic).
+
+    Checks all budget constraints before authorizing the write.
+    If any budget is exceeded, sets facts["preflight"]["ok"] = False.
+    """
+    async def preflight_validate_patch(state: AgentState) -> dict:
+        logger.info("[PREFLIGHT_VALIDATE_PATCH] checking budgets")
+
+        facts = state.get("facts") or {}
+        budget_facts = facts.get("budgets") or {}
+        repair_facts = facts.get("repair") or {}
+        patch_ir_dicts = state.get("patch_ir") or []
+        patch_facts = facts.get("patch") or {}
+
+        max_ops = patch_facts.get("max_ops") or budget_facts.get("max_patch_ops_per_iter", 20)
+        max_repairs = budget_facts.get("max_schema_repairs_per_iter", 2)
+        max_retries = budget_facts.get("max_total_retries_per_iter", 1)
+        retries_used = budget_facts.get("retries_used", 0)
+        repair_count = repair_facts.get("count", 0)
+        repair_budget_exceeded = repair_facts.get("budget_exceeded", False)
+
+        checks_failed: list[str] = []
+
+        # Check 1: patch_ir length
+        if len(patch_ir_dicts) > max_ops:
+            checks_failed.append(
+                f"patch_ir length {len(patch_ir_dicts)} exceeds max_ops {max_ops}"
+            )
+
+        # Check 2: schema repair count
+        if repair_count > max_repairs or repair_budget_exceeded:
+            checks_failed.append(
+                f"repair_count {repair_count} exceeds max_schema_repairs_per_iter {max_repairs}"
+            )
+
+        # Check 3: total retries
+        if retries_used > max_retries:
+            checks_failed.append(
+                f"retries_used {retries_used} exceeds max_total_retries_per_iter {max_retries}"
+            )
+
+        ok = len(checks_failed) == 0
+        reason = "; ".join(checks_failed) if checks_failed else None
+
+        logger.info(
+            "[PREFLIGHT_VALIDATE_PATCH] ok=%s reason=%r",
+            ok, reason,
+        )
+
+        return {
+            "facts": {
+                "preflight": {
+                    "ok": ok,
+                    "reason": reason,
+                }
+            }
+        }
+
+    return preflight_validate_patch
+
+
+def _make_apply_patch_node(
+    domains: list[DomainTools],
+    capabilities: "list[DomainCapability] | None" = None,
+):
+    """Factory: apply_patch node (write-guarded, single write).
+
+    CREATE: calls create_chatflow
+    UPDATE: calls update_chatflow(target_chatflow_id)
+    Uses WriteGuard to enforce hash match before writing.
+    """
+    _, patch_executor = merge_tools(domains, "patch")
+
+    async def apply_patch(state: AgentState) -> dict:
+        logger.info("[APPLY_PATCH] applying patch to Flowise")
+
+        facts = state.get("facts") or {}
+        flowise_facts = facts.get("flowise") or {}
+        operation_mode = state.get("operation_mode") or "create"
+        target_chatflow_id = state.get("target_chatflow_id")
+
+        proposed_flow_data = (
+            (state.get("artifacts") or {})
+            .get("flowise", {})
+            .get("proposed_flow_data") or {}
+        )
+        proposed_hash = flowise_facts.get("proposed_flow_hash")
+
+        if not proposed_flow_data:
+            logger.warning("[APPLY_PATCH] no proposed_flow_data — skipping write")
+            return {
+                "facts": {
+                    "apply": {
+                        "ok": False,
+                        "chatflow_id": None,
+                        "error": "no proposed_flow_data",
+                    }
+                }
+            }
+
+        flow_data_str = json.dumps(proposed_flow_data, separators=(",", ":"))
+
+        # WriteGuard: authorize then check on write
+        guard = WriteGuard()
+        guard.authorize(flow_data_str)
+
+        orig_create = patch_executor.get("create_chatflow")
+        orig_update = patch_executor.get("update_chatflow")
+
+        async def _guarded_create(**kwargs: Any) -> Any:
+            fd = kwargs.get("flow_data", "")
+            if fd:
+                guard.check(str(fd))
+            result = await orig_create(**kwargs) if orig_create else {"error": "create_chatflow not available"}
+            if fd:
+                guard.revoke()
+            return result
+
+        async def _guarded_update(**kwargs: Any) -> Any:
+            fd = kwargs.get("flow_data", "")
+            if fd:
+                guard.check(str(fd))
+            result = await orig_update(**kwargs) if orig_update else {"error": "update_chatflow not available"}
+            if fd:
+                guard.revoke()
+            return result
+
+        guarded_executor = dict(patch_executor)
+        guarded_executor["create_chatflow"] = _guarded_create
+        guarded_executor["update_chatflow"] = _guarded_update
+
+        new_chatflow_id: str | None = None
+        apply_ok = False
+
+        if operation_mode == "update" and target_chatflow_id:
+            # Store rollback anchor (pre-patch hash)
+            pre_patch_hash = flowise_facts.get("current_flow_hash")
+
+            # Snapshot before update
+            iteration = state.get("iteration", 0)
+            await execute_tool(
+                "snapshot_chatflow",
+                {"chatflow_id": target_chatflow_id, "session_id": f"v2-apply-iter{iteration}"},
+                guarded_executor,
+            )
+
+            write_result = await execute_tool(
+                "update_chatflow",
+                {"chatflow_id": target_chatflow_id, "flow_data": flow_data_str},
+                guarded_executor,
+            )
+            apply_ok = write_result.ok
+            new_chatflow_id = target_chatflow_id
+
+            apply_facts: dict = {
+                "ok": apply_ok,
+                "chatflow_id": new_chatflow_id,
+                "pre_patch_flow_hash": pre_patch_hash,
+            }
+        else:
+            # CREATE mode
+            plan = state.get("plan") or ""
+            chatflow_name = _extract_chatflow_name_from_plan(plan) or state.get("requirement", "")[:50]
+
+            write_result = await execute_tool(
+                "create_chatflow",
+                {"name": chatflow_name, "flow_data": flow_data_str},
+                guarded_executor,
+            )
+            apply_ok = write_result.ok
+
+            if apply_ok:
+                if write_result.artifacts:
+                    ids = write_result.artifacts.get("chatflow_ids", [])
+                    if ids:
+                        new_chatflow_id = ids[0]
+                if not new_chatflow_id and isinstance(write_result.data, dict):
+                    new_chatflow_id = write_result.data.get("id")
+
+            apply_facts = {
+                "ok": apply_ok,
+                "chatflow_id": new_chatflow_id,
+            }
+
+        logger.info(
+            "[APPLY_PATCH] ok=%s chatflow_id=%s",
+            apply_ok, new_chatflow_id,
+        )
+
+        return {
+            "chatflow_id": new_chatflow_id,
+            "facts": {"apply": apply_facts},
+        }
+
+    return apply_patch
+
+
+def _make_evaluate_node(engine: ReasoningEngine):
+    """Factory: evaluate node (deterministic diff + small LLM).
+
+    Computes diff from the diff_summary in artifacts. Produces a verdict:
+    done | iterate. Writes artifacts["diff_summary"] and facts["verdict"].
+    """
+    async def evaluate(state: AgentState) -> dict:
+        logger.info("[EVALUATE] evaluating patch result")
+
+        artifacts = state.get("artifacts") or {}
+        flowise_artifacts = artifacts.get("flowise") or {}
+        diff_summary = flowise_artifacts.get("diff_summary") or "(no diff available)"
+        plan = state.get("plan") or ""
+        test_results = state.get("test_results") or "(no test results)"
+
+        user_content = (
+            f"Plan:\n{plan[:500]}\n\n"
+            f"Diff of changes applied:\n{diff_summary}\n\n"
+            f"Test results:\n{test_results[:500]}\n\n"
+            "Did the patch implement the plan correctly?"
+        )
+
+        response = await engine.complete(
+            messages=[Message(role="user", content=user_content)],
+            system=_EVALUATE_SYSTEM,
+            tools=None,
+        )
+        text = (response.content or "").strip()
+
+        # Parse verdict
+        verdict = "iterate"
+        reason = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if line.upper().startswith("VERDICT:"):
+                raw = line.split(":", 1)[1].strip().lower()
+                if raw in ("done", "iterate"):
+                    verdict = raw
+            elif line.upper().startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+
+        logger.info("[EVALUATE] verdict=%s reason=%r", verdict, reason)
+
+        existing_facts = state.get("facts") or {}
+        return {
+            "artifacts": {
+                "diff_summary": diff_summary,
+            },
+            "facts": {
+                "verdict": {"verdict": verdict, "reason": reason},
+            },
+            "done": verdict == "done",
+            "total_input_tokens": response.input_tokens,
+            "total_output_tokens": response.output_tokens,
+        }
+
+    return evaluate
+
+
+def _make_hitl_review_node():
+    """Factory: HITL_review node (interrupt).
+
+    Shows diff_summary to the user. Same as current human_result_review
+    but uses the v2 diff_summary from artifacts.
+    """
+    async def hitl_review(state: AgentState) -> dict:
+        logger.info("[HITL_REVIEW] waiting for developer review")
+
+        diff_summary = (
+            (state.get("artifacts") or {}).get("diff_summary")
+            or state.get("test_results")
+            or "(no summary available)"
+        )
+
+        interrupt_payload = {
+            "type": "result_review",
+            "diff_summary": diff_summary,
+            "test_results": state.get("test_results"),
+            "chatflow_id": state.get("chatflow_id"),
+            "iteration": state.get("iteration", 0),
+            "prompt": (
+                "Review the changes applied to the chatflow.\n"
+                f"Diff summary:\n{str(diff_summary)[:500]}\n\n"
+                "Reply 'accepted' to finish, or describe what to change for another iteration."
+            ),
+        }
+        if state.get("webhook_url"):
+            asyncio.create_task(_fire_webhook(state["webhook_url"], interrupt_payload))
+
+        developer_response: str = interrupt(interrupt_payload)
+        response_lower = developer_response.strip().lower()
+
+        accepted = response_lower in (
+            "accepted", "accept", "done", "yes", "y", "looks good", "lgtm", "ship it"
+        )
+
+        logger.info("[HITL_REVIEW] accepted=%s", accepted)
+
+        if accepted:
+            return {"done": True, "developer_feedback": None}
+        else:
+            return {
+                "done": False,
+                "developer_feedback": developer_response,
+                "plan": None,
+                "test_results": None,
+            }
+
+    return hitl_review
+
+
+# ---------------------------------------------------------------------------
+# M9.6: Routing functions for Topology v2
+# ---------------------------------------------------------------------------
+
+
+def _route_after_hydrate_context_v2(state: AgentState) -> str:
+    """After hydrate_context: route to resolve_target (update) or plan (create)."""
+    if state.get("operation_mode") == "update":
+        return "resolve_target"
+    return "plan_v2"
+
+
+def _route_after_hitl_select_target(state: AgentState) -> str:
+    """After HITL_select_target: route to load_current_flow (update) or plan (create)."""
+    if state.get("operation_mode") == "update":
+        return "load_current_flow"
+    return "plan_v2"
+
+
+def _route_after_plan_approval_v2(state: AgentState) -> str:
+    """If developer gave feedback → back to plan. If approved → define_patch_scope."""
+    if state.get("developer_feedback"):
+        return "plan_v2"
+    return "define_patch_scope"
+
+
+def _route_after_validate(state: AgentState) -> str:
+    """Route based on validation result.
+
+    ok              → preflight_validate_patch
+    schema_mismatch → repair_schema (if budget allows)
+    other/structural → hitl_review (escalate)
+    """
+    facts = state.get("facts") or {}
+    validation = facts.get("validation") or {}
+    repair = facts.get("repair") or {}
+    budgets = facts.get("budgets") or {}
+
+    if validation.get("ok"):
+        return "preflight_validate_patch"
+
+    failure_type = validation.get("failure_type") or "other"
+    repair_count = repair.get("count", 0)
+    max_repairs = budgets.get("max_schema_repairs_per_iter", 2)
+
+    if failure_type == "schema_mismatch" and repair_count < max_repairs:
+        return "repair_schema"
+
+    # Other failure or budget exceeded → escalate to HITL
+    return "hitl_review_v2"
+
+
+def _route_after_repair_schema(state: AgentState) -> str:
+    """After repair_schema: always retry compile_patch_ir exactly once."""
+    return "compile_patch_ir"
+
+
+def _route_after_preflight(state: AgentState) -> str:
+    """Route based on preflight check result."""
+    facts = state.get("facts") or {}
+    preflight = facts.get("preflight") or {}
+    if preflight.get("ok"):
+        return "apply_patch"
+    return "hitl_review_v2"
+
+
+def _route_after_evaluate_v2(state: AgentState) -> str:
+    """Route based on evaluate verdict."""
+    facts = state.get("facts") or {}
+    verdict_facts = facts.get("verdict") or {}
+    if verdict_facts.get("verdict") == "done":
+        return "hitl_review_v2"
+    return "plan_v2"
+
+
+def _route_after_hitl_review_v2(state: AgentState) -> str:
+    """Route after HITL_review: accepted → END, iterate → plan."""
+    if state.get("done"):
+        return END
+    return "plan_v2"
+
+
 # ---------------------------------------------------------------------------
 # Graph builder
 # ---------------------------------------------------------------------------
@@ -2413,32 +4024,37 @@ def build_graph(
     client: "FlowiseClient | None" = None,
     pattern_store=None,
     capabilities: "list[DomainCapability] | None" = None,
+    topology_version: str = "v1",
 ):
     """Construct and compile the Flowise Builder co-pilot LangGraph.
 
     Args:
-        engine:        Reasoning engine (LLM provider). Use create_engine(settings).
-        domains:       List of DomainTools plugins. v1: [FloviseDomain(client)].
-                       v2 (Workday): [FloviseDomain(client), WorkdayDomain(workday_client)].
-        checkpointer:  LangGraph checkpointer for persistence + HITL support.
-                       Defaults to MemorySaver (in-memory, suitable for development).
-                       For production: use SqliteSaver or PostgresSaver.
-                       See DESIGN_DECISIONS.md — DD-010.
-        client:        Optional FlowiseClient passed to converge for pattern auto-save.
-                       Required when pattern_store is provided (DD-031).
-        pattern_store: Optional PatternStore for pattern library (DD-031).
-                       When provided, PatternDomain is auto-appended to domains,
-                       and converge auto-saves patterns after DONE verdicts.
-        capabilities:  Optional list of DomainCapability instances (DD-046).
-                       When provided:
-                         - discover node uses DomainCapability.discover() for structured
-                           result routing (artifacts, facts, debug state fields).
-                         - patch node switches to the M2 deterministic IR compiler path
-                           (DD-051, DD-052): LLM emits Patch IR ops; compiler builds
-                           flowData deterministically; WriteGuard enforces hash match.
-                       When None (default), all behavior is identical to pre-refactor:
-                         - discover uses legacy DomainTools merge path
-                         - patch uses legacy LLM-driven full flowData generation
+        engine:           Reasoning engine (LLM provider). Use create_engine(settings).
+        domains:          List of DomainTools plugins. v1: [FloviseDomain(client)].
+                          v2 (Workday): [FloviseDomain(client), WorkdayDomain(workday_client)].
+        checkpointer:     LangGraph checkpointer for persistence + HITL support.
+                          Defaults to MemorySaver (in-memory, suitable for development).
+                          For production: use SqliteSaver or PostgresSaver.
+                          See DESIGN_DECISIONS.md — DD-010.
+        client:           Optional FlowiseClient passed to converge for pattern auto-save.
+                          Required when pattern_store is provided (DD-031).
+        pattern_store:    Optional PatternStore for pattern library (DD-031).
+                          When provided, PatternDomain is auto-appended to domains,
+                          and converge auto-saves patterns after DONE verdicts.
+        capabilities:     Optional list of DomainCapability instances (DD-046).
+                          When provided:
+                            - discover node uses DomainCapability.discover() for structured
+                              result routing (artifacts, facts, debug state fields).
+                            - patch node switches to the M2 deterministic IR compiler path
+                              (DD-051, DD-052): LLM emits Patch IR ops; compiler builds
+                              flowData deterministically; WriteGuard enforces hash match.
+                          When None (default), all behavior is identical to pre-refactor:
+                            - discover uses legacy DomainTools merge path
+                            - patch uses legacy LLM-driven full flowData generation
+        topology_version: "v1" (default, 9-node legacy topology) or "v2" (M9.6
+                          18-node CREATE+UPDATE topology with budgets and bounded retries).
+                          Passing "v2" activates the new topology. All callers that do not
+                          pass this parameter continue to use the v1 topology unchanged.
 
     Returns:
         Compiled LangGraph graph ready for ainvoke() / invoke().
@@ -2454,6 +4070,22 @@ def build_graph(
         domains = list(domains) + [PatternDomain(pattern_store)]
         logger.info("PatternDomain injected into domains list")
 
+    # -----------------------------------------------------------------------
+    # M9.6: Topology v2 (18-node CREATE+UPDATE with budgets)
+    # -----------------------------------------------------------------------
+    if topology_version == "v2":
+        return _build_graph_v2(
+            engine=engine,
+            domains=domains,
+            checkpointer=checkpointer,
+            client=client,
+            pattern_store=pattern_store,
+            capabilities=capabilities,
+        )
+
+    # -----------------------------------------------------------------------
+    # Topology v1: original 9-node topology (unchanged — backward compatible)
+    # -----------------------------------------------------------------------
     builder = StateGraph(AgentState)
 
     # Register all nodes
@@ -2507,6 +4139,171 @@ def build_graph(
         "human_result_review",
         _route_after_result_review,
         {END: END, "plan": "plan"},
+    )
+
+    return builder.compile(checkpointer=checkpointer)
+
+
+def _build_graph_v2(
+    engine: ReasoningEngine,
+    domains: list[DomainTools],
+    checkpointer,
+    client: "FlowiseClient | None" = None,
+    pattern_store=None,
+    capabilities: "list[DomainCapability] | None" = None,
+):
+    """Build the M9.6 18-node topology (CREATE + UPDATE modes, budgets, bounded retries).
+
+    Node inventory (18 nodes):
+      Phase A: classify_intent, hydrate_context
+      Phase B: resolve_target, hitl_select_target   (UPDATE path)
+      Phase C: load_current_flow, summarize_current_flow   (UPDATE path)
+      Phase D: plan_v2, hitl_plan_v2, define_patch_scope, compile_patch_ir, compile_flow_data
+      Phase E: validate, repair_schema
+      Phase F: preflight_validate_patch, apply_patch, test_v2, evaluate, hitl_review_v2
+
+    Routing:
+      START → classify_intent → hydrate_context
+        → (update) resolve_target → hitl_select_target
+            → (update) load_current_flow → summarize_current_flow → plan_v2
+            → (create) plan_v2
+        → (create) plan_v2
+      plan_v2 → hitl_plan_v2 → define_patch_scope → compile_patch_ir
+        → compile_flow_data → validate
+          → (ok) preflight_validate_patch
+              → (ok) apply_patch → test_v2 → evaluate
+                  → (done) hitl_review_v2 → (accepted) END
+                                          → (iterate) plan_v2
+                  → (iterate) plan_v2
+              → (budget exceeded) hitl_review_v2
+          → (schema_mismatch, budget ok) repair_schema → compile_patch_ir
+          → (other/budget exceeded) hitl_review_v2
+
+    See roadmap9_production_graph_runtime_hardening.md — Milestone 9.6.
+    """
+    logger.info("[BUILD_GRAPH_V2] building M9.6 18-node topology")
+
+    # Extract TemplateStore from capabilities for planning hints
+    _template_store: TemplateStore | None = None
+    if capabilities:
+        for _cap in capabilities:
+            if hasattr(_cap, "knowledge") and hasattr(_cap.knowledge, "template_store"):
+                _template_store = _cap.knowledge.template_store
+                break
+
+    builder = StateGraph(AgentState)
+
+    # ---- Phase A ----
+    builder.add_node("classify_intent",   _make_classify_intent_node(engine))
+    builder.add_node("hydrate_context",   _make_hydrate_context_node(capabilities))
+
+    # ---- Phase B (UPDATE only, skipped for CREATE) ----
+    builder.add_node("resolve_target",     _make_resolve_target_node(domains))
+    builder.add_node("hitl_select_target", _make_hitl_select_target_node())
+
+    # ---- Phase C (UPDATE only) ----
+    builder.add_node("load_current_flow",      _make_load_current_flow_node(domains))
+    builder.add_node("summarize_current_flow", _make_summarize_current_flow_node())
+
+    # ---- Phase D ----
+    builder.add_node("plan_v2",            _make_plan_node(engine, domains, _template_store, pattern_store=pattern_store))
+    builder.add_node("hitl_plan_v2",       _make_human_plan_approval_node())
+    builder.add_node("define_patch_scope", _make_define_patch_scope_node(engine))
+    builder.add_node("compile_patch_ir",   _make_compile_patch_ir_node(engine, capabilities))
+    builder.add_node("compile_flow_data",  _make_compile_flow_data_node(capabilities, domains))
+
+    # ---- Phase E ----
+    builder.add_node("validate",      _make_validate_node())
+    builder.add_node("repair_schema", _make_repair_schema_node(capabilities, domains))
+
+    # ---- Phase F ----
+    builder.add_node("preflight_validate_patch", _make_preflight_validate_patch_node())
+    builder.add_node("apply_patch",    _make_apply_patch_node(domains, capabilities))
+    builder.add_node("test_v2",        _make_test_node(engine, domains))
+    builder.add_node("evaluate",       _make_evaluate_node(engine))
+    builder.add_node("hitl_review_v2", _make_hitl_review_node())
+
+    # ---- Fixed edges ----
+    builder.add_edge(START, "classify_intent")
+    builder.add_edge("classify_intent", "hydrate_context")
+
+    # Phase B chain (UPDATE path enters from hydrate_context conditional)
+    builder.add_edge("resolve_target", "hitl_select_target")
+
+    # Phase C chain
+    builder.add_edge("load_current_flow", "summarize_current_flow")
+    builder.add_edge("summarize_current_flow", "plan_v2")
+
+    # Phase D chain
+    builder.add_edge("plan_v2", "hitl_plan_v2")
+    builder.add_edge("define_patch_scope", "compile_patch_ir")
+    builder.add_edge("compile_patch_ir", "compile_flow_data")
+    builder.add_edge("compile_flow_data", "validate")
+
+    # Phase F chain
+    builder.add_edge("apply_patch", "test_v2")
+    builder.add_edge("test_v2", "evaluate")
+
+    # ---- Conditional edges ----
+
+    # After hydrate_context: route by intent
+    builder.add_conditional_edges(
+        "hydrate_context",
+        _route_after_hydrate_context_v2,
+        {"resolve_target": "resolve_target", "plan_v2": "plan_v2"},
+    )
+
+    # After HITL_select_target: route by operation_mode
+    builder.add_conditional_edges(
+        "hitl_select_target",
+        _route_after_hitl_select_target,
+        {"load_current_flow": "load_current_flow", "plan_v2": "plan_v2"},
+    )
+
+    # After hitl_plan_v2: approved → define_patch_scope, feedback → plan_v2
+    builder.add_conditional_edges(
+        "hitl_plan_v2",
+        _route_after_plan_approval_v2,
+        {"define_patch_scope": "define_patch_scope", "plan_v2": "plan_v2"},
+    )
+
+    # After validate: ok → preflight, schema_mismatch (budget) → repair, other → hitl
+    builder.add_conditional_edges(
+        "validate",
+        _route_after_validate,
+        {
+            "preflight_validate_patch": "preflight_validate_patch",
+            "repair_schema": "repair_schema",
+            "hitl_review_v2": "hitl_review_v2",
+        },
+    )
+
+    # After repair_schema: retry compile_patch_ir once
+    builder.add_conditional_edges(
+        "repair_schema",
+        _route_after_repair_schema,
+        {"compile_patch_ir": "compile_patch_ir"},
+    )
+
+    # After preflight: ok → apply_patch, budget exceeded → hitl
+    builder.add_conditional_edges(
+        "preflight_validate_patch",
+        _route_after_preflight,
+        {"apply_patch": "apply_patch", "hitl_review_v2": "hitl_review_v2"},
+    )
+
+    # After evaluate: done → hitl_review_v2, iterate → plan_v2
+    builder.add_conditional_edges(
+        "evaluate",
+        _route_after_evaluate_v2,
+        {"hitl_review_v2": "hitl_review_v2", "plan_v2": "plan_v2"},
+    )
+
+    # After hitl_review_v2: accepted → END, iterate → plan_v2
+    builder.add_conditional_edges(
+        "hitl_review_v2",
+        _route_after_hitl_review_v2,
+        {END: END, "plan_v2": "plan_v2"},
     )
 
     return builder.compile(checkpointer=checkpointer)

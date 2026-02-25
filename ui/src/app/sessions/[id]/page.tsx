@@ -1,6 +1,8 @@
 "use client";
 import { useEffect, useRef, useCallback } from "react";
+import { useRouter } from "next/navigation";
 import { useSessionStore } from "@/store/session-store";
+import { useToast } from "@/components/ui/Toast";
 import { api } from "@/lib/api";
 import { openNodeStream, openResumeStream } from "@/lib/sse";
 import { SessionHeader } from "@/components/session/SessionHeader";
@@ -11,10 +13,13 @@ import type { SSEEvent } from "@/lib/types";
 
 export default function SessionDetailPage({ params }: { params: { id: string } }) {
   const { id } = params;
-  const { initActive, applySSEEvent, applyNodeEvent, active } = useSessionStore((s) => ({
+  const router = useRouter();
+  const { toast } = useToast();
+  const { initActive, applySSEEvent, applyNodeEvent, setReconnectAttempt, active } = useSessionStore((s) => ({
     initActive: s.initActive,
     applySSEEvent: s.applySSEEvent,
     applyNodeEvent: s.applyNodeEvent,
+    setReconnectAttempt: s.setReconnectAttempt,
     active: s.active,
   }));
 
@@ -39,15 +44,28 @@ export default function SessionDetailPage({ params }: { params: { id: string } }
         }
         // status === "in_progress" means a stream is already active (from NewSessionModal)
       })
-      .catch(() => {
-        // Silently ignore — session may be brand new and not yet persisted
+      .catch((e: unknown) => {
+        const status = (e as { status?: number }).status;
+        if (status === 404) {
+          toast("Session not found", "error");
+          router.push("/");
+        } else if (status === 401) {
+          toast("API key required — check settings above", "error");
+        }
+        // else: brand-new session not yet persisted — silently ignore
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
-  // 2. Open node lifecycle SSE for PhaseTimeline (always, reconnects automatically)
+  // 2. Open node lifecycle SSE for PhaseTimeline (auto-reconnects with banner feedback)
   useEffect(() => {
-    const stopNodeStream = openNodeStream(id, 0, applyNodeEvent);
+    const stopNodeStream = openNodeStream(
+      id,
+      0,
+      applyNodeEvent,
+      () => setReconnectAttempt(4),
+      (attempt) => setReconnectAttempt(attempt === 0 ? null : attempt),
+    );
     return stopNodeStream;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);

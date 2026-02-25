@@ -32,6 +32,8 @@ interface ActiveSession {
   latestPlan: string | null;
   /** Latest test results text (preserved after interrupt clears) */
   latestTestResults: string | null;
+  /** SSE reconnect state: null=ok, 1-3=retrying, 4=lost */
+  reconnectAttempt: number | null;
 }
 
 interface SessionStore {
@@ -43,6 +45,7 @@ interface SessionStore {
   initActive: (id: string) => void;
   applySSEEvent: (event: SSEEvent) => void;
   applyNodeEvent: (event: NodeSSEEvent) => void;
+  setReconnectAttempt: (n: number | null) => void;
   clearActive: () => void;
   modalOpen: boolean;
   setModalOpen: (open: boolean) => void;
@@ -57,7 +60,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   setLoadingSessions: (loading) => set({ loadingSessions: loading }),
 
   active: null,
-  initActive: (id) => set({ active: { id, status: "streaming", interrupt: null, phases: initPhases(), tokens: "", toolCalls: [], chatflow_id: null, iteration: 0, total_input_tokens: 0, total_output_tokens: 0, lastNodeSeq: 0, errorDetail: null, latestPlan: null, latestTestResults: null } }),
+  initActive: (id) => set({ active: { id, status: "streaming", interrupt: null, phases: initPhases(), tokens: "", toolCalls: [], chatflow_id: null, iteration: 0, total_input_tokens: 0, total_output_tokens: 0, lastNodeSeq: 0, errorDetail: null, latestPlan: null, latestTestResults: null, reconnectAttempt: null } }),
 
   applySSEEvent: (event) => {
     const a = get().active;
@@ -114,6 +117,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     set({ active: { ...a, phases, lastNodeSeq: seq } });
   },
 
+  setReconnectAttempt: (n) => {
+    const a = get().active;
+    if (a) set({ active: { ...a, reconnectAttempt: n } });
+  },
   clearActive: () => set({ active: null }),
   modalOpen: false,
   setModalOpen: (open) => set({ modalOpen: open }),

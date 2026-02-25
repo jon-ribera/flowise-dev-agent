@@ -64,7 +64,9 @@ export function openResumeStream(
 
 export function openNodeStream(
   threadId: string, afterSeq: number,
-  onEvent: (e: NodeSSEEvent) => void, onError?: (err: unknown) => void
+  onEvent: (e: NodeSSEEvent) => void,
+  onError?: (err: unknown) => void,
+  onReconnecting?: (attempt: number) => void,
 ): () => void {
   let stopped = false, attempt = 0, lastSeq = afterSeq;
   const connect = () => {
@@ -75,6 +77,7 @@ export function openNodeStream(
           headers: getApiKey() ? { Authorization: `Bearer ${getApiKey()}` } : {},
         });
         if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+        if (attempt > 0) onReconnecting?.(0);  // signal successful reconnect
         attempt = 0;
         await readSSEStream(res.body, (ev) => {
           if (ev && typeof ev === "object" && "seq" in ev) lastSeq = (ev as { seq: number }).seq;
@@ -83,8 +86,11 @@ export function openNodeStream(
         });
       } catch (e) {
         if (stopped) return;
-        if (attempt < 3) { const delay = Math.pow(2, attempt++) * 1000; setTimeout(connect, delay); }
-        else onError?.(e);
+        if (attempt < 3) {
+          onReconnecting?.(attempt + 1);
+          const delay = Math.pow(2, attempt++) * 1000;
+          setTimeout(connect, delay);
+        } else onError?.(e);
       }
     })();
   };

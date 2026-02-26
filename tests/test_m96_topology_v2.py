@@ -327,7 +327,8 @@ def test_schema_mismatch_routes_to_repair_then_retries_once():
         f"After repair should route to 'compile_patch_ir', got {route_after_repair!r}"
     )
 
-    # Second failure (repair count = 2 = max): should route to hitl_review_v2
+    # Second failure (repair count = 2 = max): should route to hitl_plan_v2
+    # (escalate to plan review, not hitl_review_v2 which expects test results)
     state_budget_exceeded = _base_state(
         facts={
             "validation": {
@@ -345,8 +346,8 @@ def test_schema_mismatch_routes_to_repair_then_retries_once():
         }
     )
     route_budget_exceeded = _route_after_validate(state_budget_exceeded)
-    assert route_budget_exceeded == "hitl_review_v2", (
-        f"Budget exceeded should route to 'hitl_review_v2', got {route_budget_exceeded!r}"
+    assert route_budget_exceeded == "hitl_plan_v2", (
+        f"Budget exceeded should route to 'hitl_plan_v2', got {route_budget_exceeded!r}"
     )
 
 

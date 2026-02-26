@@ -2339,7 +2339,7 @@ def _make_validate_node():
             )
 
             existing_facts = state.get("facts") or {}
-            return {
+            result: dict = {
                 "facts": {
                     "validation": {
                         "ok": False,
@@ -2351,6 +2351,15 @@ def _make_validate_node():
                     "validation_report": report,
                 },
             }
+            # Structural errors route back to plan_v2 — inject compile errors
+            # as developer_feedback so the LLM can self-correct the plan.
+            if failure_type == "structural":
+                result["developer_feedback"] = (
+                    "The previous plan produced compilation errors.  "
+                    "Please revise the plan to fix the following issues:\n\n"
+                    + report
+                )
+            return result
 
         # Structural validation of the flow data
         validation_raw = _validate_flow_data(flow_data_str)
@@ -2847,7 +2856,8 @@ def _route_after_validate(state: AgentState) -> str:
 
     ok              → preflight_validate_patch
     schema_mismatch → repair_schema (if budget allows)
-    other/structural → hitl_review (escalate)
+    structural      → plan_v2  (re-plan with compile error feedback)
+    other/budget    → hitl_plan_v2  (escalate — user sees errors)
     """
     facts = state.get("facts") or {}
     validation = facts.get("validation") or {}
@@ -2864,8 +2874,16 @@ def _route_after_validate(state: AgentState) -> str:
     if failure_type == "schema_mismatch" and repair_count < max_repairs:
         return "repair_schema"
 
-    # Other failure or budget exceeded → escalate to HITL
-    return "hitl_review_v2"
+    # Structural compile errors: re-plan with error context (validate node
+    # already set developer_feedback).  The LLM re-plans → user approves at
+    # hitl_plan_v2 → define_patch_scope → compile → validate again.
+    if failure_type == "structural":
+        return "plan_v2"
+
+    # Other failure or budget exceeded → escalate to HITL plan review
+    # so the user sees what went wrong (not hitl_review_v2 which expects
+    # test results that don't exist yet).
+    return "hitl_plan_v2"
 
 
 def _route_after_repair_schema(state: AgentState) -> str:
@@ -3112,14 +3130,16 @@ def _build_graph_v2(
         {"define_patch_scope": "define_patch_scope", "plan_v2": "plan_v2"},
     )
 
-    # After validate: ok → preflight, schema_mismatch (budget) → repair, other → hitl
+    # After validate: ok → preflight, schema_mismatch → repair,
+    # structural → plan_v2 (re-plan with errors), other → hitl_plan_v2 (escalate)
     builder.add_conditional_edges(
         "validate",
         _route_after_validate,
         {
             "preflight_validate_patch": "preflight_validate_patch",
             "repair_schema": "repair_schema",
-            "hitl_review_v2": "hitl_review_v2",
+            "plan_v2": "plan_v2",
+            "hitl_plan_v2": "hitl_plan_v2",
         },
     )
 

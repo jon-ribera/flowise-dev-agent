@@ -2513,3 +2513,148 @@ forward-looking regression gate.
 
 **Files**:
 - `tests/test_m98_compact_context.py` — 7 regression tests (no production code changes)
+
+
+---
+
+## DD-084 — LangSmith Redaction Layer
+
+**Roadmap**: LangSmith Observability Integration — Phase 1
+
+**Decision**: Implement pattern-based redaction of all sensitive data before it
+reaches LangSmith traces. Adapts agent-forge's `src/app/util/langsmith/redaction.py`
+pattern for the Flowise Dev Agent.
+
+**Rationale**: LangSmith traces are stored externally. API keys, passwords, JWTs,
+Postgres DSNs, and credential IDs must never appear in trace inputs, outputs, or
+metadata. The redaction layer operates at the data boundary — before any dict is
+sent to LangSmith — so it catches all sensitive values regardless of source.
+
+**What is redacted**:
+- Anthropic API keys (`sk-ant-*`)
+- OpenAI API keys (`sk-proj-*`, `sk-*`)
+- LangSmith API keys (`lsv2_pt_*`)
+- GitHub tokens (`ghp_*`)
+- Bearer tokens and JWTs
+- Postgres DSN passwords
+- Literal env-var values (if the actual value of `FLOWISE_API_KEY` etc. appears)
+- All fields named `password`, `api_key`, `secret`, `credential_id`, `encrypted_data`, etc.
+
+**What was added**:
+- `flowise_dev_agent/util/__init__.py` — empty init
+- `flowise_dev_agent/util/langsmith/__init__.py` — `get_client()`, `is_enabled()`, `current_session_id` ContextVar
+- `flowise_dev_agent/util/langsmith/redaction.py` — `redact_string()`, `redact_dict()`, `hide_inputs()`, `hide_outputs()`, `hide_metadata()`
+- `api.py` — `_langsmith_config()` applies `hide_metadata()` before injecting into RunnableConfig
+- `tests/test_langsmith_redaction.py` — 24 tests
+
+**Alternatives considered**:
+- No redaction (trust LangSmith's built-in privacy): rejected — our `.env` contains
+  production keys that should never be in an external trace store.
+- Field-level allowlist (only send whitelisted fields): too restrictive, misses
+  useful debugging context.
+
+---
+
+## DD-085 — Post-hoc Metadata Enrichment
+
+**Roadmap**: LangSmith Observability Integration — Phase 2
+
+**Decision**: Enrich LangSmith run metadata **after** `graph.ainvoke()` returns via
+`Client.update_run()`, rather than trying to inject state-dependent metadata at
+config time (when state doesn't exist yet).
+
+**Approach**:
+1. `_langsmith_config()` generates a stable `run_id` (UUID) and injects it into the config.
+2. After `_build_response()` reads the final state, `_enrich_langsmith_run()` fires
+   as a background task (`asyncio.create_task`) — never blocks the API response.
+3. Metadata is extracted by `extract_session_metadata()` into flat, dot-namespaced keys:
+   - `agent.*` — operation_mode, intent_confidence, iteration, pattern_used, done
+   - `telemetry.*` — token totals, schema fingerprint, drift detection, per-phase durations, repair events
+   - `verdict.*` — converge verdict value, category, reason
+   - `pattern.*` — pattern_used, pattern_id, ops_in_base
+4. Outcome tags (`outcome:completed`, `mode:create`, `pattern:reused`, `iterations:2-3`)
+   are appended for LangSmith dashboard filtering.
+
+**What was added**:
+- `flowise_dev_agent/util/langsmith/metadata.py` — `extract_session_metadata()`, `extract_outcome_tags()`
+- `api.py` — `_enrich_langsmith_run()` async helper, `run_id` injection in `_langsmith_config()`
+- `tests/test_langsmith_metadata.py` — 17 tests
+
+---
+
+## DD-086 — ContextVar for HITL Feedback
+
+**Roadmap**: LangSmith Observability Integration — Phase 3
+
+**Decision**: Propagate `session_id` (thread_id) into HITL interrupt nodes via a
+`contextvars.ContextVar` set in `wrap_node()`. HITL nodes use `interrupt()` and do
+not receive `config`, so a ContextVar is the cleanest way to pass the session ID
+for LangSmith feedback submission.
+
+**Flow**:
+1. `wrap_node()` in `hooks.py` sets `current_session_id` ContextVar before calling the node function.
+2. HITL plan approval and result review nodes read `current_session_id.get()`.
+3. After determining approval/rejection, they fire `asyncio.create_task(submit_hitl_feedback(...))`.
+4. Feedback appears in LangSmith as `hitl_plan_approval` or `hitl_result_review` with score 1.0/0.0.
+5. The ContextVar is reset after the node returns (or on exception).
+
+**What was added**:
+- `flowise_dev_agent/util/langsmith/feedback.py` — `submit_hitl_feedback()` async helper
+- `persistence/hooks.py` — ContextVar set/reset in `wrap_node()`
+- `agent/graph.py` — feedback fire-and-forget in `_make_human_plan_approval_node()` and `_make_hitl_review_node()`
+- `tests/test_langsmith_feedback.py` — 6 tests
+
+---
+
+## DD-087 — Evaluators as Pure Functions
+
+**Roadmap**: LangSmith Observability Integration — Phase 3
+
+**Decision**: Implement evaluators as pure Python functions that operate on state
+dicts and return `{"key": str, "score": float, "comment": str}`. They can run both
+as online evaluators on production traces and offline in CI against the golden dataset,
+with zero modification.
+
+**Evaluators**:
+| Function | Key | What it scores |
+|---|---|---|
+| `compile_success` | `compile_success` | chatflow_id set + done + no ITERATE verdict |
+| `intent_confidence` | `intent_confidence` | Raw confidence float (0.0–1.0) |
+| `iteration_efficiency` | `iteration_efficiency` | Done in <= 3 iterations |
+| `token_budget` | `token_budget` | Per-phase token limits respected |
+| `plan_quality` | `plan_quality` | Section completeness (70%) + metadata sections (30%) |
+
+**What was added**:
+- `flowise_dev_agent/util/langsmith/evaluators.py` — 5 evaluators + `ALL_EVALUATORS` registry
+- `tests/test_langsmith_evaluators.py` — 28 tests
+
+---
+
+## DD-088 — Automation Rules via UI + Programmatic Routing
+
+**Roadmap**: LangSmith Observability Integration — Phase 3–4
+
+**Decision**: LangSmith v0.4.x does not expose automation rules via the Python SDK.
+Rules must be configured in the LangSmith UI. However, programmatic routing is
+implemented for the two most common actions: routing failed sessions to the annotation
+queue and saving successful sessions to the golden dataset.
+
+**Programmatic routing** (in `_enrich_langsmith_run()`):
+- `state["done"] == True` → `add_to_dataset(run_id)` (golden set)
+- Session had iterations but did not complete → `add_to_annotation_queue(run_id)`
+
+**LangSmith UI rules** (documented in `rules.py:setup_instructions()`):
+1. Route failed sessions → annotation queue (100% sampling)
+2. Sample successful sessions → golden dataset (20% sampling)
+3. Flag low-confidence intent classification (< 0.7) → annotation queue
+4. Flag high iteration count (4+) → annotation queue
+
+**What was added**:
+- `flowise_dev_agent/util/langsmith/rules.py` — `add_to_annotation_queue()`, `add_to_dataset()`, `setup_instructions()`
+- `flowise_dev_agent/util/langsmith/datasets.py` — `save_session_to_dataset()` + CLI
+- `flowise_dev_agent/util/langsmith/tracer.py` — `@dev_tracer` decorator (environment-aware)
+- `flowise_dev_agent/util/langsmith/ci_eval.py` — `run_golden_set_eval()` + CLI
+- `.env.example` — new LangSmith config vars
+- `tests/test_langsmith_rules.py` — 5 tests
+- `tests/test_langsmith_datasets.py` — 4 tests
+- `tests/test_langsmith_tracer.py` — 7 tests

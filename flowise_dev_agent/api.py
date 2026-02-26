@@ -63,6 +63,54 @@ _POSTGRES_DSN: str | None = os.environ.get("POSTGRES_DSN")
 _bearer = HTTPBearer(auto_error=False)
 
 
+def _langsmith_config(
+    thread_id: str,
+    *,
+    session_name: str | None = None,
+    requirement: str | None = None,
+    endpoint: str = "create",
+) -> dict:
+    """Build a LangGraph config dict enriched with LangSmith metadata.
+
+    LangSmith uses ``metadata`` and ``tags`` from the RunnableConfig to annotate
+    traces, making them filterable and searchable in the LangSmith UI.
+    """
+    from uuid import uuid4 as _uuid4
+
+    config: dict = {"configurable": {"thread_id": thread_id}}
+
+    # Only inject tracing extras when LangSmith is active
+    if not os.getenv("LANGCHAIN_TRACING_V2"):
+        return config
+
+    # DD-085: stable run_id so _enrich_langsmith_run can update this run later
+    config["run_id"] = str(_uuid4())
+
+    metadata: dict[str, str] = {
+        "thread_id": thread_id,
+        "endpoint": endpoint,
+        "reasoning_engine": os.getenv("REASONING_ENGINE", "claude"),
+        "reasoning_model": os.getenv("REASONING_MODEL", ""),
+        "flowise_endpoint": os.getenv("FLOWISE_API_ENDPOINT", ""),
+    }
+    if session_name:
+        metadata["session_name"] = session_name
+    if requirement:
+        # Truncate to keep trace metadata lean
+        metadata["requirement"] = requirement[:200]
+
+    tags = [endpoint, os.getenv("REASONING_ENGINE", "claude")]
+    if session_name:
+        tags.append(session_name)
+
+    # DD-084: redact any sensitive values before they reach LangSmith
+    from flowise_dev_agent.util.langsmith.redaction import hide_metadata
+
+    config["metadata"] = hide_metadata(metadata)
+    config["tags"] = tags
+    return config
+
+
 def _verify_api_key(
     credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
 ) -> None:
@@ -388,6 +436,49 @@ def _get_client(request: Request, instance_id: str | None = None):
 # ---------------------------------------------------------------------------
 
 
+async def _enrich_langsmith_run(config: dict, state: dict) -> None:
+    """Post-hoc enrichment of LangSmith run with session telemetry (DD-085).
+
+    Fire-and-forget — failures are logged at debug level, never block the API.
+    """
+    from flowise_dev_agent.util.langsmith import get_client, is_enabled
+    from flowise_dev_agent.util.langsmith.metadata import (
+        extract_outcome_tags,
+        extract_session_metadata,
+    )
+    from flowise_dev_agent.util.langsmith.redaction import hide_metadata
+
+    if not is_enabled():
+        return
+
+    client = get_client()
+    if client is None:
+        return
+
+    run_id = config.get("run_id")
+    if not run_id:
+        return
+
+    try:
+        meta = hide_metadata(extract_session_metadata(state))
+        tags = extract_outcome_tags(state)
+        client.update_run(run_id, extra={"metadata": meta}, tags=tags)
+
+        # DD-088: Auto-route to annotation queue or golden dataset
+        from flowise_dev_agent.util.langsmith.rules import (
+            add_to_annotation_queue,
+            add_to_dataset,
+        )
+
+        if state.get("done"):
+            await add_to_dataset(run_id)
+        elif state.get("iteration", 0) > 0 and not state.get("done"):
+            # Session failed or abandoned after at least one iteration
+            await add_to_annotation_queue(run_id)
+    except Exception as exc:
+        logger.debug("LangSmith metadata enrichment failed (non-fatal): %s", exc)
+
+
 async def _build_response(graph, config: dict, thread_id: str) -> SessionResponse:
     """Inspect the graph state and build a SessionResponse.
 
@@ -401,6 +492,10 @@ async def _build_response(graph, config: dict, thread_id: str) -> SessionRespons
         raise HTTPException(status_code=500, detail=f"Failed to read session state: {e}")
 
     state = snapshot.values
+
+    # DD-085: Enrich LangSmith run with session telemetry (fire-and-forget)
+    import asyncio as _aio
+    _aio.create_task(_enrich_langsmith_run(config, state))
 
     # Collect all pending interrupts from all tasks
     pending_interrupts: list[dict] = []
@@ -686,11 +781,16 @@ async def create_session(request: Request, body: StartSessionRequest) -> Session
     graph = _get_graph(request)
     engine = request.app.state.engine
     thread_id = body.thread_id or str(uuid4())
-    config = {"configurable": {"thread_id": thread_id}}
 
     logger.info("Creating session %s: %r", thread_id, body.requirement[:80])
 
     session_name = await _generate_session_name(body.requirement, engine)
+    config = _langsmith_config(
+        thread_id,
+        session_name=session_name,
+        requirement=body.requirement,
+        endpoint="create",
+    )
 
     try:
         await graph.ainvoke(
@@ -729,7 +829,7 @@ async def resume_session(
     from langgraph.types import Command
 
     graph = _get_graph(request)
-    config = {"configurable": {"thread_id": thread_id}}
+    config = _langsmith_config(thread_id, endpoint="resume")
 
     # Verify the session exists before resuming
     try:
@@ -1064,11 +1164,16 @@ async def stream_create_session(request: Request, body: StartSessionRequest) -> 
     graph = _get_graph(request)
     engine = request.app.state.engine
     thread_id = body.thread_id or str(uuid4())
-    config = {"configurable": {"thread_id": thread_id}}
 
     logger.info("Streaming new session %s: %r", thread_id, body.requirement[:80])
 
     session_name = await _generate_session_name(body.requirement, engine)
+    config = _langsmith_config(
+        thread_id,
+        session_name=session_name,
+        requirement=body.requirement,
+        endpoint="stream_create",
+    )
 
     async def event_stream():
         yield ": connected\n\n"  # flush immediately so the browser sees open connection
@@ -1117,7 +1222,7 @@ async def stream_resume_session(
     from langgraph.types import Command
 
     graph = _get_graph(request)
-    config = {"configurable": {"thread_id": thread_id}}
+    config = _langsmith_config(thread_id, endpoint="stream_resume")
 
     logger.info("Streaming resume session %s: %r", thread_id, body.response[:80])
 

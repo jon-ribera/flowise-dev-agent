@@ -848,6 +848,20 @@ def _make_human_plan_approval_node():
 
         logger.info("[HUMAN PLAN APPROVAL] approved=%s", approved)
 
+        # DD-086: Submit HITL feedback to LangSmith (fire-and-forget)
+        try:
+            from flowise_dev_agent.util.langsmith import current_session_id
+            from flowise_dev_agent.util.langsmith.feedback import submit_hitl_feedback
+
+            asyncio.create_task(submit_hitl_feedback(
+                thread_id=current_session_id.get(),
+                interrupt_type="plan_approval",
+                approved=approved,
+                developer_response=developer_response,
+            ))
+        except Exception:
+            pass  # never block graph
+
         if approved:
             return {"developer_feedback": None}
         else:
@@ -2811,6 +2825,20 @@ def _make_hitl_review_node():
         )
 
         logger.info("[HITL_REVIEW] accepted=%s", accepted)
+
+        # DD-086: Submit HITL feedback to LangSmith (fire-and-forget)
+        try:
+            from flowise_dev_agent.util.langsmith import current_session_id
+            from flowise_dev_agent.util.langsmith.feedback import submit_hitl_feedback
+
+            asyncio.create_task(submit_hitl_feedback(
+                thread_id=current_session_id.get(),
+                interrupt_type="result_review",
+                approved=accepted,
+                developer_response=developer_response,
+            ))
+        except Exception:
+            pass  # never block graph
 
         if accepted:
             return {"done": True, "developer_feedback": None}

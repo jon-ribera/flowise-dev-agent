@@ -233,6 +233,10 @@ def wrap_node(
         if config is not None:
             session_id = (config.get("configurable") or {}).get("thread_id", "")
 
+        # DD-086: Propagate session_id via ContextVar for HITL feedback nodes
+        from flowise_dev_agent.util.langsmith import current_session_id
+        _ctx_token = current_session_id.set(session_id)
+
         # ── node_start ───────────────────────────────────────────────────
         await emit_event(
             session_id=session_id,
@@ -256,6 +260,7 @@ def wrap_node(
                 duration_ms=duration_ms,
                 summary=None if is_interrupt else str(exc)[:200],
             )
+            current_session_id.reset(_ctx_token)
             raise  # always re-raise; graph routing must not be interrupted
 
         duration_ms = int((time.monotonic() - start) * 1000)
@@ -268,6 +273,7 @@ def wrap_node(
             duration_ms=duration_ms,
             summary=_node_summary(node_name, result),
         )
+        current_session_id.reset(_ctx_token)
         return result
 
     # Preserve the original function name for LangGraph introspection

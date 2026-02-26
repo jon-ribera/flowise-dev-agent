@@ -433,8 +433,10 @@ async def _build_response(graph, config: dict, thread_id: str) -> SessionRespons
             total_output_tokens=out_tok,
         )
 
-    # No interrupts — graph finished
-    if not snapshot.next:
+    # No interrupts — graph finished.
+    # Guard: `not snapshot.next` is also True for an empty/uninitialised snapshot.
+    # Only treat as "completed" when the state actually has values.
+    if not snapshot.next and state:
         return SessionResponse(
             thread_id=thread_id,
             status="completed",
@@ -763,8 +765,13 @@ async def get_session(thread_id: str, request: Request) -> SessionResponse:
     config = {"configurable": {"thread_id": thread_id}}
 
     try:
-        await graph.aget_state(config)
+        snapshot = await graph.aget_state(config)
     except Exception:
+        raise HTTPException(status_code=404, detail=f"Session '{thread_id}' not found.")
+
+    # LangGraph returns an empty snapshot (values={}, next=()) for unknown thread_ids
+    # without raising.  Treat that as a 404 — the session hasn't been initialised yet.
+    if not snapshot or not snapshot.values:
         raise HTTPException(status_code=404, detail=f"Session '{thread_id}' not found.")
 
     return await _build_response(graph, config, thread_id)

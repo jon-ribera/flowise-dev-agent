@@ -2739,3 +2739,42 @@ the source code.
    an immediate diagnostic to verify the server is executing the expected code version.
 
 **Files**: `flowise_dev_agent/api.py`, `flowise_dev_agent/agent/graph.py`
+
+## DD-092 — Compiler Handle Resolution + Structural Retry Guard
+
+**Roadmap**: Production Graph Runtime Hardening — Compiler Resilience
+
+**Decision**: Add a 5th resolution pass to `_resolve_anchor_id()` using camelCase token
+matching, and replace the hard `plan_v2 → hitl_plan_v2` edge with a conditional edge
+that auto-retries structural errors up to 2 times without requiring user re-approval.
+
+**Problem**: Session `ebb04388` was stuck in an infinite plan-approval loop. The LLM
+emitted `Connect(target_anchor="BaseMemory")` (following the prompt which says to use
+"input anchor TYPE"). The `toolAgent` node's actual input anchor is `name="memory"`,
+`type="BaseChatMemory"`. The 4-pass resolver in `_resolve_anchor_id()` couldn't match
+`"BaseMemory"` to `"BaseChatMemory"` — Pass 3 (exact type-part) missed because
+`"basememory" ∉ ["basechatmemory"]`, and Pass 4 (suffix) missed because
+`"basechatmemory"` does not end with `"basememory"`. The fallback generated a bogus
+handle `toolAgent_0-input-BaseMemory-BaseMemory`, which validation rightfully rejected
+as structural. The `validate → plan_v2 → hitl_plan_v2` routing forced the user to
+re-approve the plan on every retry, but the same compiler produced the same wrong handle.
+
+**Solution** (two parts):
+
+*Fix A — Pass 5 (camelCase token match)*: Split both anchor_name and anchor type on
+camelCase boundaries and match when ALL tokens from anchor_name appear in the type.
+Example: `"BaseMemory" → {"Base","Memory"} ⊆ "BaseChatMemory" → {"Base","Chat","Memory"}`.
+This handles class hierarchy relationships where the parent class name is a subset of
+the child class tokens.
+
+*Fix B — Autonomous structural retry*: Replace the hard edge `plan_v2 → hitl_plan_v2`
+with a conditional edge via `_route_after_plan_v2()`. When `structural_retries > 0` and
+`≤ 2`, route directly to `define_patch_scope` (skip user approval). The validate node
+increments `facts["validation"]["structural_retries"]` on structural failures and resets
+to 0 on success. After 2 failed retries or on first plan, route to `hitl_plan_v2` for
+human approval. This prevents the infinite approval loop while preserving the HITL
+interrupt for initial plans and budget-exceeded escalation.
+
+**Files**: `flowise_dev_agent/agent/compiler.py` (Pass 5), `flowise_dev_agent/agent/graph.py`
+(`_route_after_plan_v2`, validate retry tracking, conditional edge), `tests/test_compiler_integration.py`
+(regression test `test_type_hierarchy_substring_match`)

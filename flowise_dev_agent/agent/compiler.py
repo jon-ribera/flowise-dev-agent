@@ -272,6 +272,10 @@ def _resolve_anchor_id(
          succeeds when anchor_name equals any pipe-separated segment of anchor["type"].
       4. Type-part suffix match — handles semantic shorthand (e.g. "retriever"
          is a suffix of "VectorStoreRetriever" and "BaseRetriever").
+      5. Type-hierarchy token match — the LLM says "BaseMemory" and the
+         anchor type is "BaseChatMemory".  Split both on camelCase boundaries;
+         match when ALL tokens from anchor_name appear in the type
+         (e.g. {"Base","Memory"} ⊆ {"Base","Chat","Memory"}).
     """
     if direction == "output":
         anchors = schema.get("outputAnchors") or []
@@ -305,6 +309,21 @@ def _resolve_anchor_id(
         if any(part.endswith(anchor_name_lower) for part in type_parts):
             anchor_id = anchor.get("id", "")
             return anchor_id.replace("{nodeId}", node_id)
+
+    # Pass 5: type-hierarchy token match — the LLM says "BaseMemory" and the
+    # anchor type is "BaseChatMemory" (a subclass).  Split both on camelCase
+    # boundaries and match when ALL tokens from anchor_name appear in the type.
+    # E.g. "BaseMemory" → {"base","memory"} ⊆ "BaseChatMemory" → {"base","chat","memory"}.
+    import re as _re5
+    anchor_tokens = set(_re5.findall(r"[A-Z][a-z]*", anchor_name))
+    if anchor_tokens:  # only if anchor_name is camelCase
+        for anchor in anchors:
+            anchor_type = anchor.get("type", "")
+            for part in anchor_type.split("|"):
+                type_tokens = set(_re5.findall(r"[A-Z][a-z]*", part.strip()))
+                if anchor_tokens <= type_tokens:
+                    anchor_id = anchor.get("id", "")
+                    return anchor_id.replace("{nodeId}", node_id)
 
     return None
 

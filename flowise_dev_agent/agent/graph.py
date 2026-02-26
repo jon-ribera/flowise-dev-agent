@@ -2419,12 +2419,16 @@ def _make_validate_node():
             )
 
             existing_facts = state.get("facts") or {}
+            existing_retries = (
+                (existing_facts.get("validation") or {}).get("structural_retries", 0)
+            )
             result: dict = {
                 "facts": {
                     "validation": {
                         "ok": False,
                         "failure_type": failure_type,
                         "missing_node_types": missing_types,
+                        "structural_retries": existing_retries,
                     }
                 },
                 "artifacts": {
@@ -2434,6 +2438,7 @@ def _make_validate_node():
             # Structural errors route back to plan_v2 — inject compile errors
             # as developer_feedback so the LLM can self-correct the plan.
             if failure_type == "structural":
+                result["facts"]["validation"]["structural_retries"] = existing_retries + 1
                 result["developer_feedback"] = (
                     "The previous plan produced compilation errors.  "
                     "Please revise the plan to fix the following issues:\n\n"
@@ -2461,6 +2466,7 @@ def _make_validate_node():
                         "ok": True,
                         "failure_type": None,
                         "missing_node_types": [],
+                        "structural_retries": 0,
                     }
                 },
                 "artifacts": {
@@ -2487,18 +2493,30 @@ def _make_validate_node():
             )
 
             existing_facts = state.get("facts") or {}
-            return {
+            existing_retries = (
+                (existing_facts.get("validation") or {}).get("structural_retries", 0)
+            )
+            result = {
                 "facts": {
                     "validation": {
                         "ok": False,
                         "failure_type": failure_type,
                         "missing_node_types": missing_types,
+                        "structural_retries": existing_retries,
                     }
                 },
                 "artifacts": {
                     "validation_report": report,
                 },
             }
+            if failure_type == "structural":
+                result["facts"]["validation"]["structural_retries"] = existing_retries + 1
+                result["developer_feedback"] = (
+                    "The previous plan produced structural validation errors.  "
+                    "Please revise the plan to fix the following issues:\n\n"
+                    + report
+                )
+            return result
 
     return validate
 
@@ -2938,6 +2956,26 @@ def _route_after_hitl_select_target(state: AgentState) -> str:
     return "plan_v2"
 
 
+def _route_after_plan_v2(state: AgentState) -> str:
+    """After plan_v2: auto-retry on structural errors, else require approval.
+
+    When validate detected a structural error, it incremented structural_retries
+    and routed here via plan_v2.  Allow up to 2 autonomous retries (skip user
+    approval); after that, escalate to hitl_plan_v2.  First plan (retries==0)
+    always requires approval.
+    """
+    facts = state.get("facts") or {}
+    validation = facts.get("validation") or {}
+    structural_retries = validation.get("structural_retries", 0)
+
+    # Structural retry: skip approval if within budget
+    # (retries > 0 means validate already failed at least once)
+    if 0 < structural_retries <= 2:
+        return "define_patch_scope"
+
+    return "hitl_plan_v2"
+
+
 def _route_after_plan_approval_v2(state: AgentState) -> str:
     """If developer gave feedback → back to plan. If approved → define_patch_scope."""
     if state.get("developer_feedback"):
@@ -3200,7 +3238,11 @@ def _build_graph_v2(
     builder.add_edge("summarize_current_flow", "plan_v2")
 
     # Phase D chain
-    builder.add_edge("plan_v2", "hitl_plan_v2")
+    builder.add_conditional_edges(
+        "plan_v2",
+        _route_after_plan_v2,
+        {"hitl_plan_v2": "hitl_plan_v2", "define_patch_scope": "define_patch_scope"},
+    )
     builder.add_edge("define_patch_scope", "compile_patch_ir")
     builder.add_edge("compile_patch_ir", "compile_flow_data")
     builder.add_edge("compile_flow_data", "validate")

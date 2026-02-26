@@ -373,6 +373,44 @@ def test_type_name_anchor_resolution(schema_cache):
 
 
 # ---------------------------------------------------------------------------
+# Test 8b: Pass 5 — type-hierarchy substring match (BaseMemory → BaseChatMemory)
+# ---------------------------------------------------------------------------
+
+
+def test_type_hierarchy_substring_match(schema_cache):
+    """Verify Pass 5 of _resolve_anchor_id: LLM writes 'BaseMemory' but
+    toolAgent expects 'memory' (type BaseChatMemory).
+
+    Pass 3 misses because 'basememory' is not in ['basechatmemory'].
+    Pass 4 misses because 'basechatmemory' does not end with 'basememory'.
+    Pass 5 matches because 'basememory' is a substring of 'basechatmemory'.
+
+    Regression test for the ebb04388 structural validation loop.
+    """
+    ops = [
+        AddNode(node_name="chatOpenAI", node_id="chatOpenAI_0", label="ChatOpenAI"),
+        AddNode(node_name="bufferMemory", node_id="bufferMemory_0", label="Buffer Memory"),
+        AddNode(node_name="toolAgent", node_id="toolAgent_0", label="Tool Agent"),
+        BindCredential(node_id="chatOpenAI_0", credential_id="cred", credential_type="openAIApi"),
+        Connect(source_node_id="chatOpenAI_0", source_anchor="chatOpenAI", target_node_id="toolAgent_0", target_anchor="BaseChatModel"),
+        Connect(source_node_id="bufferMemory_0", source_anchor="bufferMemory", target_node_id="toolAgent_0", target_anchor="BaseMemory"),
+    ]
+    result = compile_patch_ops(GraphIR(), ops, schema_cache)
+    assert result.errors == [], f"Pass 5 type-hierarchy resolution failed: {result.errors}"
+
+    phase_f = _validate_flow_data(result.flow_data_str)
+    assert phase_f["valid"], (
+        f"Structural validation failed after Pass 5 resolution: {phase_f.get('errors')}"
+    )
+
+    # The template expression must use the resolved anchor name 'memory'
+    agent_inputs = _node_data(result.flow_data, "toolAgent_0")["inputs"]
+    assert "memory" in agent_inputs, (
+        f"Expected 'memory' in toolAgent inputs: {list(agent_inputs.keys())}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Test 9: REGRESSION — every node in the snapshot compiles as AddNode
 # ---------------------------------------------------------------------------
 

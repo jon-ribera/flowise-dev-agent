@@ -2155,6 +2155,36 @@ def _make_compile_flow_data_node(
             logger.warning("[COMPILE_FLOW_DATA] failed to reconstruct ops: %s", e)
             ops = []
 
+        # Resolve non-UUID credential_ids in BindCredential ops before compilation.
+        # The LLM in compile_patch_ir writes e.g. "MISSING_openAIApi" when it doesn't
+        # know the real Flowise credential UUID.  We resolve here using the local
+        # CredentialStore (sync, O(1), no API call needed).
+        _cred_store = None
+        if flowise_cap and hasattr(flowise_cap, "knowledge"):
+            _kp = flowise_cap.knowledge
+            if hasattr(_kp, "credential_store"):
+                _cred_store = _kp.credential_store
+        if _cred_store is not None:
+            for _op in ops:
+                if isinstance(_op, BindCredential) and not _UUID_RE.match(_op.credential_id or ""):
+                    # Strip LLM-emitted "MISSING_" prefix (e.g. "MISSING_openAIApi" → "openAIApi")
+                    _cred_query = (_op.credential_id or "").replace("MISSING_", "")
+                    _resolved = _cred_store.resolve(_cred_query) or (
+                        _cred_store.resolve(_op.credential_type) if _op.credential_type else None
+                    )
+                    if _resolved:
+                        logger.info(
+                            "[COMPILE_FLOW_DATA] Resolved credential %r → %s",
+                            _op.credential_id, _resolved,
+                        )
+                        _op.credential_id = _resolved
+                    else:
+                        logger.warning(
+                            "[COMPILE_FLOW_DATA] Could not resolve credential %r (type=%r) — "
+                            "run: python -m flowise_dev_agent.knowledge.refresh --credentials",
+                            _op.credential_id, _op.credential_type,
+                        )
+
         # Determine base graph
         if operation_mode == "update":
             current_flow_data = flowise_artifacts.get("current_flow_data") or {}

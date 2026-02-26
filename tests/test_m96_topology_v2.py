@@ -238,11 +238,7 @@ async def test_load_current_flow_single_fetch():
     from flowise_dev_agent.agent.graph import _make_load_current_flow_node
     from flowise_dev_agent.agent.tools import FloviseDomain, ToolResult
 
-    # Build a domain with a mock get_chatflow
-    client = MagicMock()
-    domain = FloviseDomain(client)
-
-    # Mock the executor's get_chatflow
+    # Build an executor dict with a mock get_chatflow (M10.3: factory takes executor, not domains)
     sample_flow_data = {"nodes": [{"id": "chatOpenAI_0", "data": {"name": "chatOpenAI", "label": "ChatOpenAI"}}], "edges": []}
     call_count = 0
 
@@ -251,9 +247,9 @@ async def test_load_current_flow_single_fetch():
         call_count += 1
         return {"id": "abc123", "flowData": json.dumps(sample_flow_data)}
 
-    domain.executor["get_chatflow"] = mock_get_chatflow
+    executor = {"get_chatflow": mock_get_chatflow}
 
-    node = _make_load_current_flow_node([domain])
+    node = _make_load_current_flow_node(executor)
     state = _base_state(
         operation_mode="update",
         target_chatflow_id="abc123",

@@ -119,7 +119,7 @@ def create_agent_from_env():
     For persistent sessions, use the HTTP server (flowise-agent serve).
     """
     from flowise_dev_agent.agent import create_agent
-    from cursorwise.config import Settings
+    from flowise_dev_agent.client import Settings
     from flowise_dev_agent.reasoning import ReasoningSettings
 
     settings = Settings.from_env()

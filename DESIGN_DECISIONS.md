@@ -2778,3 +2778,193 @@ interrupt for initial plans and budget-exceeded escalation.
 **Files**: `flowise_dev_agent/agent/compiler.py` (Pass 5), `flowise_dev_agent/agent/graph.py`
 (`_route_after_plan_v2`, validate retry tracking, conditional edge), `tests/test_compiler_integration.py`
 (regression test `test_type_hierarchy_substring_match`)
+
+---
+
+## DD-093 — FlowiseClient Internalization (Roadmap 10, M10.1)
+
+**Decision**: Remove the `cursorwise` pip dependency and internalize the Flowise HTTP
+client as `flowise_dev_agent/client/`. The client is a thin async httpx wrapper with
+no business logic, returning raw `dict | list` responses.
+
+**Problem**: The agent depended on `cursorwise @ git+...` (a separate repo) for all
+Flowise HTTP communication. This external dependency complicated installation, blocked
+the MCP tool surface definition, and created a circular concern: the client repo
+had no knowledge of ToolResult, the compiler, or the agent's state model, yet every
+Flowise operation flowed through it.
+
+**Solution**:
+- `flowise_dev_agent/client/flowise_client.py` (627 lines): direct port of
+  `cursorwise/client.py` — `FlowiseClient` class with 50+ async methods covering
+  the full Flowise REST API surface (chatflows, nodes, predictions, credentials,
+  assistants, tools, variables, document stores, feedback, leads, vectors).
+- `flowise_dev_agent/client/config.py`: `Settings` frozen dataclass with `from_env()`
+  classmethod. Env vars: `FLOWISE_API_KEY`, `FLOWISE_API_ENDPOINT`, `FLOWISE_TIMEOUT`.
+- All 6 import sites updated (`graph.py`, `tools.py`, `api.py`, `instance_pool.py`,
+  `cli.py`, `knowledge/refresh.py`).
+- `cursorwise` removed from `pyproject.toml`; `httpx>=0.27` added.
+
+**Rejected alternatives**:
+- Keep cursorwise as optional: adds installation friction and split maintenance burden
+- Rewrite the client from scratch: unnecessary risk; direct port preserves battle-tested HTTP mechanics
+
+**Files**: `flowise_dev_agent/client/` (new package), `pyproject.toml`,
+`tests/test_m101_flowise_client.py` (318 lines, 19 tests)
+
+---
+
+## DD-094 — Native Flowise MCP Tool Surface (Roadmap 10, M10.2)
+
+**Decision**: Define all 50 Flowise operations as first-class async Python tool
+functions in `flowise_dev_agent/mcp/tools.py`, each returning a `ToolResult` envelope.
+Register them in the `ToolRegistry` under the `flowise` namespace.
+
+**Problem**: Flowise operations were called directly via `FlowiseClient` methods
+scattered across graph node functions. This made it impossible to uniformly observe,
+mock, rate-limit, or replace Flowise I/O at a single point.
+
+**Solution**:
+- `FlowiseMCPTools` class (636 lines): 50 `async def` methods, each wrapping the
+  corresponding `FlowiseClient` method and returning `ToolResult(ok, summary, facts,
+  data, error, artifacts)`. `_ok()` / `_fail()` helpers enforce the envelope contract.
+- `_CREDENTIAL_ALLOWLIST` applied in `list_credentials()` (same policy as `CredentialStore`).
+- `register_flowise_mcp_tools()` in `registry.py` (527 lines): registers all 50 tools
+  with `ToolDef` definitions (name, description, JSON Schema parameters) under the
+  `flowise` namespace. Dual-key access: `flowise__list_chatflows` + `list_chatflows`.
+- Three-layer separation enforced: `client.py` owns HTTP, `tools.py` owns the I/O
+  contract (ToolResult), `compiler.py` owns transformation logic. No cross-ownership.
+
+**Files**: `flowise_dev_agent/mcp/tools.py`, `flowise_dev_agent/mcp/registry.py`,
+`flowise_dev_agent/mcp/__init__.py`, `tests/test_m102_flowise_mcp_tools.py` (371 lines)
+
+---
+
+## DD-095 — Canonical Schema Normalization Contract (Roadmap 10, M10.2a)
+
+**Decision**: Create `AnchorDictionaryStore` as a derived view of `NodeSchemaStore`
+that normalizes raw node schemas into canonical anchor dictionaries with exact `name`
+fields, schema-sourced `id_template` values, and computed `compatible_types` arrays.
+
+**Problem**: The compiler's 5-pass fuzzy resolver (`_resolve_anchor_id()`) was brittle —
+each new anchor name mismatch required a new resolver pass. Session `ebb04388` showed
+`"BaseMemory"` couldn't match `"BaseChatMemory"`, patched by DD-092's Pass 5 (camelCase
+token matching). A canonical anchor dictionary eliminates guessing by providing the LLM
+with exact anchor names before it emits Patch IR.
+
+**Solution**:
+- `AnchorDictionaryStore` (323 lines): derived from `NodeSchemaStore._index`, not a
+  parallel pipeline. Three O(1) indices: `_by_node_type`, `_by_anchor_name`,
+  `_by_type_token`. Rebuilds on invalidation.
+- `get(node_type)` returns `{input_anchors: [...], output_anchors: [...]}`.
+- `get_or_repair(node_type, api_fetcher)` async fallback: fetches via API, normalizes
+  into the same canonical format (no raw schema dialect leakage).
+- `compute_compatible_types()`: splits pipe-separated type strings, adds CamelCase
+  parent tokens (e.g. `"BaseChatMemory"` → also `"BaseMemory"`).
+- `compatible_types` is advisory, not a hard gate — final validation is by
+  `_validate_flow_data()` and the test execution phase.
+- `FlowiseKnowledgeProvider.anchor_dictionary` property added.
+
+**Files**: `flowise_dev_agent/knowledge/anchor_store.py`,
+`flowise_dev_agent/knowledge/provider.py`, `tests/test_m102a_anchor_store.py` (524 lines)
+
+---
+
+## DD-096 — Anchor Dictionary Tool (Roadmap 10, M10.2b)
+
+**Decision**: Add `flowise.get_anchor_dictionary(node_type)` as tool #51 in the MCP
+tool surface. The LLM calls it to get exact anchor specifications before emitting
+Connect ops in Patch IR.
+
+**Problem**: The LLM received anchor guidance only through prompt instructions (which
+conflicted: skills doc said "match by name", compile prompt said "use type"). No runtime
+tool existed to look up exact anchor names, so the LLM guessed — and the compiler
+compensated with 5 fuzzy passes.
+
+**Solution**:
+- `get_anchor_dictionary()` method added to `FlowiseMCPTools`. Returns `ToolResult`
+  with `data = {node_type, input_anchors, output_anchors}` and a summary like
+  `"toolAgent: 2 inputs (memory, model), 1 output (toolAgent)"`.
+- Registered in `registry.py` as `flowise.get_anchor_dictionary`.
+- `_COMPILE_PATCH_IR_V2_SYSTEM` prompt updated with ANCHOR RESOLUTION RULES:
+  canonical names required, type names deprecated, `get_anchor_dictionary` on-demand.
+- Prefetch strategy: anchor dictionaries prefetched in-process for all AddNode types
+  (CREATE mode) plus existing node types being re-wired (UPDATE mode). LLM calls the
+  tool on-demand only for uncovered types.
+- Skills doc (`flowise_builder.md`) updated: `target_anchor` = canonical name, not type.
+
+**Files**: `flowise_dev_agent/mcp/tools.py`, `flowise_dev_agent/mcp/registry.py`,
+`flowise_dev_agent/agent/graph.py` (prompt), `flowise_dev_agent/agent/tools.py`,
+`flowise_dev_agent/skills/flowise_builder.md`, `tests/test_m102b_anchor_tool.py` (351 lines)
+
+---
+
+## DD-097 — LangGraph MCP Tool Executor Wiring (Roadmap 10, M10.3)
+
+**Decision**: Re-wire the M9.6 LangGraph graph topology so all Flowise API operations
+flow through `execute_tool()` → `ToolRegistry` → `FlowiseMCPTools` instead of direct
+`FlowiseClient` method calls embedded in graph node functions.
+
+**Problem**: Graph nodes called `FlowiseClient` methods directly (e.g.
+`client.list_chatflows()`, `client.create_chatflow()`). This bypassed the tool registry,
+making it impossible to uniformly observe, mock, or replace Flowise I/O. The MCP tool
+surface (M10.2) existed but wasn't wired into the graph.
+
+**Solution**:
+- All 6 node factory functions updated: signature changed from `(capabilities, domains)`
+  to `(capabilities, executor: dict | None)` where `executor` is the pre-built MCP
+  tool executor dict.
+- `_build_graph_v2()` creates the MCP executor at graph init: `FlowiseMCPTools` →
+  `ToolRegistry` → `executor("discover")`, then merges domain-only tools
+  (`validate_flow_data`, `snapshot_chatflow`, `rollback_chatflow`).
+- `FlowiseCapability.__init__` updated to accept optional `client` parameter: when
+  provided, registers MCP tools via `register_flowise_mcp_tools`; when `None`, falls
+  back to legacy `register_domain` path.
+- `make_default_capabilities()` and `api.py` updated to thread `client` through.
+- `_wrap_result()` in `tools.py` gains Rule 0: `if isinstance(raw, ToolResult): return raw`
+  — ToolResult passthrough for MCP tools that already return the envelope.
+
+**Rejected alternatives**:
+- Keep direct client calls alongside MCP: violates "single I/O boundary" principle
+- Remove legacy path entirely: breaks `capabilities=None` backwards compat
+
+**Files**: `flowise_dev_agent/agent/graph.py`, `flowise_dev_agent/agent/tools.py`,
+`flowise_dev_agent/api.py`, `tests/test_m103_graph_mcp_wiring.py` (626 lines, 25 tests)
+
+---
+
+## DD-098 — Patch IR Anchor Contract Update (Roadmap 10, M10.3a)
+
+**Decision**: Change the `Connect` dataclass contract from "type name" to "canonical
+anchor name" semantics. Restructure the compiler's `_resolve_anchor_id()` as
+exact-match-first with a deprecated fuzzy fallback. Track resolution metrics.
+
+**Problem**: The `Connect` docstring told the LLM to use type names (e.g.
+`"BaseChatModel"`) as `target_anchor` values, then the compiler tried 5 fuzzy passes
+to match these to actual anchor names. With the anchor dictionary tool (DD-096) now
+providing exact names, this indirection was unnecessary and error-prone.
+
+**Solution**:
+- **Connect docstring** updated: `source_anchor` and `target_anchor` are now described
+  as "Canonical NAME from the anchor dictionary". Type names marked DEPRECATED.
+- **`_resolve_anchor_id()`** restructured: Pass 1 = exact name match (case-insensitive),
+  increments `exact_name_matches`. If no exact match, calls
+  `_resolve_anchor_id_fuzzy_deprecated()` which contains the old 5-pass logic, emits
+  a deprecation warning, and increments `fuzzy_fallbacks`.
+- **`validate_patch_ops()`** return type changed from `list[str]` to
+  `tuple[list[str], list[str]]` (errors, warnings). New optional params:
+  `anchor_store`, `node_type_map`. When provided, validates Connect anchor names
+  against canonical dictionaries, producing warnings with valid options list.
+- **`CompileResult.anchor_metrics`** new field: `{total_connections, exact_name_matches,
+  fuzzy_fallbacks, exact_match_rate, fuzzy_details}`.
+- **`debug["flowise"]["anchor_resolution"]`** written by compile_flow_data node.
+- **LangSmith metadata**: `telemetry.anchor_exact_match_rate`,
+  `telemetry.anchor_fuzzy_fallbacks`, `telemetry.anchor_total_connections` extracted
+  in `metadata.py`.
+
+**Target**: `exact_match_rate` = 1.0 for all new sessions using the anchor dictionary.
+Legacy sessions (pre-anchor dictionary) still work via deprecated fuzzy fallback.
+
+**Files**: `flowise_dev_agent/agent/patch_ir.py`, `flowise_dev_agent/agent/compiler.py`,
+`flowise_dev_agent/agent/graph.py`, `flowise_dev_agent/agent/domains/workday.py`,
+`flowise_dev_agent/util/langsmith/metadata.py`, `tests/test_m103a_anchor_contract.py`
+(559 lines, 29 tests), `tests/test_patch_ir.py` (updated 7 call sites)

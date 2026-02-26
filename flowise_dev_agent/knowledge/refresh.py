@@ -710,8 +710,7 @@ async def _fetch_templates_slim_async() -> list[dict]:
 
     Returns a list of slim metadata dicts (no flowData).
     """
-    from cursorwise.client import FlowiseClient
-    from cursorwise.config import Settings
+    from flowise_dev_agent.client import FlowiseClient, Settings
 
     settings = Settings.from_env()
     client = FlowiseClient(settings)
@@ -859,8 +858,7 @@ async def _fetch_credentials_async() -> list[dict]:
     Reads FLOWISE_API_ENDPOINT (default http://localhost:3000) and
     FLOWISE_API_KEY from the environment.
     """
-    from cursorwise.client import FlowiseClient
-    from cursorwise.config import Settings
+    from flowise_dev_agent.client import FlowiseClient, Settings
 
     settings = Settings.from_env()
     client = FlowiseClient(settings)

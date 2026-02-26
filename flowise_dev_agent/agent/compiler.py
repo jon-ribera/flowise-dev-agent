@@ -197,13 +197,16 @@ class GraphIR:
 class CompileResult:
     """Result of compiling PatchOps against a base GraphIR.
 
-    flow_data:      Final graph in Flowise API dict format.
-    flow_data_str:  Compact JSON string of flow_data (no extra whitespace).
-                    This is the exact string passed to create_chatflow / update_chatflow.
-    payload_hash:   SHA-256 hex digest of flow_data_str.
-                    WriteGuard requires this hash to authorize the write.
-    diff_summary:   Human-readable summary of changes (NODES ADDED / EDGES ADDED, etc.).
-    errors:         Compilation errors. Empty list = success (use .ok property).
+    flow_data:        Final graph in Flowise API dict format.
+    flow_data_str:    Compact JSON string of flow_data (no extra whitespace).
+                      This is the exact string passed to create_chatflow / update_chatflow.
+    payload_hash:     SHA-256 hex digest of flow_data_str.
+                      WriteGuard requires this hash to authorize the write.
+    diff_summary:     Human-readable summary of changes (NODES ADDED / EDGES ADDED, etc.).
+    errors:           Compilation errors. Empty list = success (use .ok property).
+    anchor_metrics:   Anchor resolution metrics (M10.3a). Dict with keys:
+                        total_connections, exact_name_matches, fuzzy_fallbacks,
+                        exact_match_rate, fuzzy_details.
     """
 
     flow_data: dict[str, Any]
@@ -211,6 +214,7 @@ class CompileResult:
     payload_hash: str
     diff_summary: str
     errors: list[str] = field(default_factory=list)
+    anchor_metrics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -255,6 +259,7 @@ def _resolve_anchor_id(
     node_id: str,
     anchor_name: str,
     direction: str,
+    metrics: dict[str, Any] | None = None,
 ) -> str | None:
     """Resolve the full anchor ID for a given anchor name in a processed node schema.
 
@@ -264,25 +269,19 @@ def _resolve_anchor_id(
     Replaces the {nodeId} placeholder with the actual node_id.
     Returns None if the anchor is not found.
 
-    Resolution order:
-      1. Exact name match  (anchor["name"] == anchor_name)
-      2. Case-insensitive name match
-      3. Exact type-part match — the LLM often uses the base-class type (e.g.
-         "BaseChatModel") instead of the anchor name (e.g. "model").  A match
-         succeeds when anchor_name equals any pipe-separated segment of anchor["type"].
-      4. Type-part suffix match — handles semantic shorthand (e.g. "retriever"
-         is a suffix of "VectorStoreRetriever" and "BaseRetriever").
-      5. Type-hierarchy token match — the LLM says "BaseMemory" and the
-         anchor type is "BaseChatMemory".  Split both on camelCase boundaries;
-         match when ALL tokens from anchor_name appear in the type
-         (e.g. {"Base","Memory"} ⊆ {"Base","Chat","Memory"}).
+    Resolution strategy (M10.3a):
+      1. Exact name match — the canonical path when the LLM uses
+         get_anchor_dictionary names. Covers exact + case-insensitive.
+      2. Deprecated fuzzy fallback — handles legacy sessions that used
+         type names (e.g. "BaseChatModel") instead of canonical anchor names.
+         Emits a warning and records in metrics.
     """
     if direction == "output":
         anchors = schema.get("outputAnchors") or []
     else:
         anchors = schema.get("inputAnchors") or []
 
-    # Pass 1 + 2: name match (exact then case-insensitive)
+    # Pass 1: Exact name match (exact then case-insensitive)
     for anchor in anchors:
         anchor_anchor_name = anchor.get("name", "")
         if (
@@ -290,42 +289,105 @@ def _resolve_anchor_id(
             or anchor_anchor_name.lower() == anchor_name.lower()
         ):
             anchor_id = anchor.get("id", "")
+            if metrics is not None:
+                metrics["exact_name_matches"] = metrics.get("exact_name_matches", 0) + 1
             return anchor_id.replace("{nodeId}", node_id)
 
-    # Pass 3: exact type-part match — handles LLM using class names as anchor names
+    # Pass 2: Deprecated fuzzy fallback
+    result = _resolve_anchor_id_fuzzy_deprecated(
+        anchors, node_id, anchor_name, direction, metrics,
+    )
+    return result
+
+
+def _resolve_anchor_id_fuzzy_deprecated(
+    anchors: list[dict[str, Any]],
+    node_id: str,
+    anchor_name: str,
+    direction: str,
+    metrics: dict[str, Any] | None = None,
+) -> str | None:
+    """DEPRECATED fuzzy anchor resolution — legacy 4-pass fallback.
+
+    This function handles sessions where the LLM used type names (e.g.
+    "BaseChatModel") instead of canonical anchor names (e.g. "model").
+    New sessions using get_anchor_dictionary should never reach this code.
+
+    When a match is found, a deprecation warning is logged and the
+    fuzzy_fallbacks metric is incremented.
+
+    Pass 3: Exact type-part match — anchor_name matches a pipe-separated
+            segment of anchor["type"].
+    Pass 4: Type-part suffix match — "retriever" is a suffix of
+            "VectorStoreRetriever".
+    Pass 5: Type-hierarchy token match — "BaseMemory" tokens ⊆
+            "BaseChatMemory" tokens.
+    """
     anchor_name_lower = anchor_name.lower()
+
+    # Pass 3: exact type-part match
     for anchor in anchors:
         anchor_type = anchor.get("type", "")
         type_parts = [t.strip().lower() for t in anchor_type.split("|")]
         if anchor_name_lower in type_parts:
             anchor_id = anchor.get("id", "")
+            _record_fuzzy_fallback(
+                metrics, node_id, anchor_name, anchor.get("name", ""), 3,
+            )
             return anchor_id.replace("{nodeId}", node_id)
 
-    # Pass 4: type-part suffix match — handles semantic shorthand like "retriever"
-    # matching "VectorStoreRetriever" or "BaseRetriever"
+    # Pass 4: type-part suffix match
     for anchor in anchors:
         anchor_type = anchor.get("type", "")
         type_parts = [t.strip().lower() for t in anchor_type.split("|")]
         if any(part.endswith(anchor_name_lower) for part in type_parts):
             anchor_id = anchor.get("id", "")
+            _record_fuzzy_fallback(
+                metrics, node_id, anchor_name, anchor.get("name", ""), 4,
+            )
             return anchor_id.replace("{nodeId}", node_id)
 
-    # Pass 5: type-hierarchy token match — the LLM says "BaseMemory" and the
-    # anchor type is "BaseChatMemory" (a subclass).  Split both on camelCase
-    # boundaries and match when ALL tokens from anchor_name appear in the type.
-    # E.g. "BaseMemory" → {"base","memory"} ⊆ "BaseChatMemory" → {"base","chat","memory"}.
+    # Pass 5: type-hierarchy token match
     import re as _re5
     anchor_tokens = set(_re5.findall(r"[A-Z][a-z]*", anchor_name))
-    if anchor_tokens:  # only if anchor_name is camelCase
+    if anchor_tokens:
         for anchor in anchors:
             anchor_type = anchor.get("type", "")
             for part in anchor_type.split("|"):
                 type_tokens = set(_re5.findall(r"[A-Z][a-z]*", part.strip()))
                 if anchor_tokens <= type_tokens:
                     anchor_id = anchor.get("id", "")
+                    _record_fuzzy_fallback(
+                        metrics, node_id, anchor_name, anchor.get("name", ""), 5,
+                    )
                     return anchor_id.replace("{nodeId}", node_id)
 
     return None
+
+
+def _record_fuzzy_fallback(
+    metrics: dict[str, Any] | None,
+    node_id: str,
+    anchor_name: str,
+    resolved_to: str,
+    pass_num: int,
+) -> None:
+    """Record a deprecated fuzzy fallback in metrics and emit a warning."""
+    logger.warning(
+        "DEPRECATED fuzzy anchor resolution used: node=%s anchor=%r "
+        "resolved_to=%r (pass %d). Use canonical anchor names from "
+        "get_anchor_dictionary instead.",
+        node_id, anchor_name, resolved_to, pass_num,
+    )
+    if metrics is not None:
+        metrics["fuzzy_fallbacks"] = metrics.get("fuzzy_fallbacks", 0) + 1
+        details = metrics.setdefault("fuzzy_details", [])
+        details.append({
+            "node": node_id,
+            "anchor": anchor_name,
+            "resolved_to": resolved_to,
+            "pass": pass_num,
+        })
 
 
 def _build_node_data(
@@ -496,6 +558,15 @@ def compile_patch_ops(
     diff_lines: list[str] = []
     new_node_count: int = 0
 
+    # M10.3a: Anchor resolution metrics
+    _anchor_metrics: dict[str, Any] = {
+        "total_connections": 0,
+        "exact_name_matches": 0,
+        "fuzzy_fallbacks": 0,
+        "exact_match_rate": 0.0,
+        "fuzzy_details": [],
+    }
+
     def _get_schema_for_node(node_id: str, node_name: str) -> dict[str, Any]:
         """Try schema_cache first, then fall back to existing node's data."""
         if node_name in schema_cache:
@@ -569,9 +640,12 @@ def compile_patch_ops(
                 )
                 continue
 
+            _anchor_metrics["total_connections"] += 1
+
             src_schema = _get_schema_for_node(op.source_node_id, src_node.node_name)
             src_handle = _resolve_anchor_id(
-                src_schema, op.source_node_id, op.source_anchor, "output"
+                src_schema, op.source_node_id, op.source_anchor, "output",
+                metrics=_anchor_metrics,
             )
             if src_handle is None:
                 # Graceful fallback: construct handle from convention
@@ -586,7 +660,8 @@ def compile_patch_ops(
 
             tgt_schema = _get_schema_for_node(op.target_node_id, tgt_node.node_name)
             tgt_handle = _resolve_anchor_id(
-                tgt_schema, op.target_node_id, op.target_anchor, "input"
+                tgt_schema, op.target_node_id, op.target_anchor, "input",
+                metrics=_anchor_metrics,
             )
             if tgt_handle is None:
                 tgt_handle = (
@@ -663,10 +738,19 @@ def compile_patch_ops(
     payload_hash = hashlib.sha256(flow_data_str.encode("utf-8")).hexdigest()
     diff_summary = "\n".join(diff_lines) if diff_lines else "(no changes)"
 
+    # M10.3a: Compute exact_match_rate
+    _total = _anchor_metrics["total_connections"]
+    if _total > 0:
+        _exact = _anchor_metrics["exact_name_matches"]
+        _anchor_metrics["exact_match_rate"] = _exact / (_exact + _anchor_metrics["fuzzy_fallbacks"]) if (_exact + _anchor_metrics["fuzzy_fallbacks"]) > 0 else 1.0
+    else:
+        _anchor_metrics["exact_match_rate"] = 1.0  # vacuously true
+
     return CompileResult(
         flow_data=flow_data,
         flow_data_str=flow_data_str,
         payload_hash=payload_hash,
         diff_summary=diff_summary,
         errors=errors,
+        anchor_metrics=_anchor_metrics,
     )

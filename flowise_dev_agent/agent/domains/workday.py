@@ -375,7 +375,7 @@ class WorkdayCapability(DomainCapability):
             ),
         ]
 
-        errors = validate_patch_ops(ops)
+        errors, _warnings = validate_patch_ops(ops)
         if errors:
             msg = f"Workday compile_ops validation failed: {'; '.join(errors)}"
             logger.error("[WorkdayCapability.compile_ops] %s", msg)

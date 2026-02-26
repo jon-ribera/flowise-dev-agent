@@ -34,7 +34,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from cursorwise.client import FlowiseClient
+from flowise_dev_agent.client import FlowiseClient
 from flowise_dev_agent.reasoning import ToolDef
 
 logger = logging.getLogger("flowise_dev_agent.agent.tools")
@@ -981,6 +981,10 @@ def _wrap_result(tool_name: str, raw: Any) -> "ToolResult":
       6. other dict                     → first 200 chars of JSON
       7. scalar / string                → first 300 chars
     """
+    # Rule 0: ToolResult passthrough — MCP tools already return ToolResult envelopes
+    if isinstance(raw, ToolResult):
+        return raw
+
     # Rule 1: explicit error dict
     if isinstance(raw, dict) and "error" in raw:
         msg = str(raw["error"])

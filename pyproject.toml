@@ -8,7 +8,6 @@ version = "0.1.0"
 description = "LangGraph co-pilot for building Flowise chatflows — discover, plan, patch, test, converge"
 requires-python = ">=3.11"
 dependencies = [
-    "cursorwise @ git+https://github.com/jon-ribera/cursorwise.git",  # FlowiseClient + Settings
     "langgraph>=0.2",
     "langchain-core>=0.3",
     "fastapi>=0.115",

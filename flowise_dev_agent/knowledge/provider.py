@@ -1185,6 +1185,7 @@ class FlowiseKnowledgeProvider:
             base / "flowise_credentials.snapshot.json",
             base / "flowise_credentials.meta.json",
         )
+        self._anchor_store: AnchorDictionaryStore | None = None  # lazy M10.2a
 
     @property
     def node_schemas(self) -> NodeSchemaStore:
@@ -1200,3 +1201,15 @@ class FlowiseKnowledgeProvider:
     def credential_store(self) -> CredentialStore:
         """The credential metadata sub-store (Milestone 3, allowlisted — no secrets)."""
         return self._credential_store
+
+    @property
+    def anchor_dictionary(self) -> "AnchorDictionaryStore":
+        """Canonical anchor dictionary derived from NodeSchemaStore (M10.2a, DD-093).
+
+        Lazy: created on first access and reused for session lifetime.
+        """
+        if self._anchor_store is None:
+            from flowise_dev_agent.knowledge.anchor_store import AnchorDictionaryStore
+
+            self._anchor_store = AnchorDictionaryStore(self._node_schemas)
+        return self._anchor_store

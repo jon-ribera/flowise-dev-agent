@@ -75,11 +75,9 @@ from flowise_dev_agent.agent.tools import (
     _validate_flow_data,
     execute_tool,
     merge_context,
-    merge_tools,
     result_to_str,
 )
-from cursorwise.client import FlowiseClient
-from cursorwise.config import Settings
+from flowise_dev_agent.client import FlowiseClient, Settings
 from flowise_dev_agent.reasoning import Message, ReasoningEngine, ReasoningSettings, ToolDef, create_engine
 from flowise_dev_agent.knowledge.provider import FlowiseKnowledgeProvider, TemplateStore
 from flowise_dev_agent.agent.metrics import MetricsCollector
@@ -933,8 +931,7 @@ def _extract_chatflow_name_from_plan(plan: str) -> str:
 
 
 
-def _make_test_node(engine: ReasoningEngine, domains: list[DomainTools]):
-    _, executor = merge_tools(domains, "test")
+def _make_test_node(engine: ReasoningEngine, executor: dict, domains: list[DomainTools]):
     system = _build_system_prompt(_TEST_BASE, domains, "test")
 
     async def test(state: AgentState) -> dict:
@@ -1126,17 +1123,32 @@ class FlowiseCapability(DomainCapability):
         flowise_domain: "DomainTools",
         engine: ReasoningEngine,
         system: str,
+        client: "FlowiseClient | None" = None,
     ) -> None:
         self._flowise_domain = flowise_domain
         self._engine = engine
         self._system = system
+        self._client = client
         self._registry = ToolRegistry()
-        self._registry.register_domain(flowise_domain)
+
+        # M10.3: Register MCP tools when client is available; fall back to
+        # domain-based registration for legacy path (capabilities=None).
+        if client is not None:
+            from flowise_dev_agent.mcp.tools import FlowiseMCPTools
+            from flowise_dev_agent.mcp.registry import register_flowise_mcp_tools
+
+            self._knowledge = FlowiseKnowledgeProvider()
+            _anchor_getter = self._knowledge.anchor_dictionary.get
+            self._mcp_tools = FlowiseMCPTools(client, anchor_dict_getter=_anchor_getter)
+            register_flowise_mcp_tools(self._registry, self._mcp_tools)
+        else:
+            self._mcp_tools = None
+            self._registry.register_domain(flowise_domain)
+            self._knowledge = FlowiseKnowledgeProvider()
+
         self._registry.register_context("flowise", "discover", flowise_domain.discover_context)
         self._registry.register_context("flowise", "patch", flowise_domain.patch_context)
         self._registry.register_context("flowise", "test", flowise_domain.test_context)
-        # Roadmap 6 M1: local-first node schema provider (no parallel orchestrator fork)
-        self._knowledge = FlowiseKnowledgeProvider()
 
     @property
     def name(self) -> str:
@@ -1227,7 +1239,7 @@ class FlowiseCapability(DomainCapability):
         raw_text = (response.content or "[]").strip()
         try:
             ops = ops_from_json(raw_text)
-            errors = validate_patch_ops(ops)
+            errors, _warnings = validate_patch_ops(ops)
             return DomainPatchResult(
                 stub=False,
                 ops=ops,
@@ -1392,11 +1404,20 @@ AVAILABLE OPERATIONS:
 RULES:
 1. node_id: unique within the flow — use "<node_name>_<index>" e.g. "chatOpenAI_0"
 2. source_anchor: output anchor name — usually the node_name itself (e.g. "chatOpenAI")
-3. target_anchor: input anchor TYPE — the baseClass it accepts (e.g. "BaseChatModel", "BaseMemory")
+3. target_anchor: input anchor NAME from the anchor dictionary (e.g. "memory", "model", "tools")
 4. EVERY credential-bearing node (LLM, embedding, etc.) MUST have a BindCredential op
 5. Include ALL required nodes + connections for a working flow — never omit the chain/agent node
 6. Do NOT write handle strings, edge IDs, or raw flowData JSON — the compiler derives all of that
 7. For UPDATE: only emit ops for what CHANGES — do NOT re-add nodes already present
+
+ANCHOR RESOLUTION RULES:
+- Connect ops MUST use canonical anchor NAMES (e.g. "memory", "model", "tools"), NOT type names
+  (e.g. do NOT use "BaseChatModel" or "BaseMemory" as target_anchor).
+- The canonical anchor name is the "name" field from the anchor dictionary entry.
+- Anchor dictionaries for node types in this flow are prefetched and available in context below.
+  If you need the dictionary for a node type not shown, call get_anchor_dictionary(node_type).
+- compatible_types in anchor dictionaries are ADVISORY only — they hint at what can connect,
+  but the compiler resolves actual handle IDs from the canonical name.
 
 OUTPUT: A single JSON array only, nothing else.
 """
@@ -1675,15 +1696,15 @@ def _make_hydrate_context_node(capabilities: "list[DomainCapability] | None" = N
 # ---------------------------------------------------------------------------
 
 
-def _make_resolve_target_node(domains: list[DomainTools]):
+def _make_resolve_target_node(executor: dict):
     """Factory: resolve_target node (tool call allowed, bounded max_rounds=5).
 
-    Calls list_chatflows, optionally filters by target_name substring match,
+    Calls list_chatflows via execute_tool through MCP-backed executor.
+    Optionally filters by target_name substring match,
     and stores the top 10 matches sorted by recency.
 
     Only runs for UPDATE intent. For CREATE, this node is skipped by routing.
     """
-    _, executor = merge_tools(domains, "discover")
 
     async def resolve_target(state: AgentState) -> dict:
         logger.info("[RESOLVE_TARGET] listing chatflows for target resolution")
@@ -1854,14 +1875,14 @@ def _make_hitl_select_target_node():
 # ---------------------------------------------------------------------------
 
 
-def _make_load_current_flow_node(domains: list[DomainTools]):
+def _make_load_current_flow_node(executor: dict):
     """Factory: load_current_flow node (tool allowed, exactly once).
 
-    Fetches full flowData via get_chatflow(chatflow_id). CRITICAL: stores
-    the full JSON in artifacts["flowise"]["current_flow_data"] — NOT in LLM
-    context (messages). Also computes a SHA-256 hash for integrity tracking.
+    Fetches full flowData via get_chatflow through MCP-backed executor.
+    CRITICAL: stores the full JSON in artifacts["flowise"]["current_flow_data"]
+    — NOT in LLM context (messages). Also computes a SHA-256 hash for integrity
+    tracking.
     """
-    _, executor = merge_tools(domains, "discover")
 
     async def load_current_flow(state: AgentState) -> dict:
         target_id = state.get("target_chatflow_id")
@@ -2128,6 +2149,66 @@ def _make_compile_patch_ir_node(
                         + "\nDo NOT re-add these nodes."
                     )
 
+        # M10.2b: Prefetch anchor dictionaries for node types likely to appear
+        # in Connect ops. Inject compact summaries into LLM context so the LLM
+        # uses canonical anchor NAMES (not type names) in Connect ops.
+        _anchor_store = None
+        if flowise_cap and hasattr(flowise_cap, "knowledge"):
+            _kp = flowise_cap.knowledge
+            if hasattr(_kp, "anchor_dictionary"):
+                _anchor_store = _kp.anchor_dictionary
+
+        if _anchor_store is not None:
+            prefetch_types: set[str] = set()
+
+            # Collect node types mentioned in the plan
+            # (plan text typically contains node type names like "chatOpenAI", "toolAgent")
+            if flowise_cap and hasattr(flowise_cap, "knowledge"):
+                _nss = flowise_cap.knowledge.node_schemas
+                _nss._load()
+                for nt in _nss._index:
+                    if nt in plan:
+                        prefetch_types.add(nt)
+
+            # For UPDATE mode: include existing node types from flow_summary
+            if operation_mode == "update" and flow_summary:
+                for nt in (flow_summary.get("node_types") or {}):
+                    prefetch_types.add(nt)
+
+            # For CREATE with pattern seed: include base graph node types
+            if operation_mode == "create":
+                base_ir_data_check = (state.get("artifacts") or {}).get("flowise", {}).get("base_graph_ir")
+                if base_ir_data_check and isinstance(base_ir_data_check, dict):
+                    for node in (base_ir_data_check.get("nodes") or []):
+                        data = node.get("data") or {}
+                        nt = data.get("name") or ""
+                        if nt:
+                            prefetch_types.add(nt)
+
+            # Fetch and inject
+            if prefetch_types:
+                anchor_lines: list[str] = []
+                for nt in sorted(prefetch_types):
+                    entry = _anchor_store.get(nt)
+                    if entry:
+                        inputs = entry.get("input_anchors", [])
+                        outputs = entry.get("output_anchors", [])
+                        in_parts = [f"{a['name']}({a['type']})" for a in inputs]
+                        out_parts = [f"{a['name']}({a['type']})" for a in outputs]
+                        anchor_lines.append(
+                            f"  {nt}: inputs=[{', '.join(in_parts)}] "
+                            f"outputs=[{', '.join(out_parts)}]"
+                        )
+                if anchor_lines:
+                    context_parts.append(
+                        "Prefetched anchor dictionaries (use 'name' as anchor in Connect ops):\n"
+                        + "\n".join(anchor_lines)
+                    )
+                    logger.info(
+                        "[COMPILE_PATCH_IR] Prefetched anchor dictionaries for %d node types",
+                        len(anchor_lines),
+                    )
+
         user_msg = Message(
             role="user",
             content="\n\n".join(context_parts)
@@ -2152,7 +2233,7 @@ def _make_compile_patch_ir_node(
 
         if not ir_errors:
             # Validate (without a base graph context here; full validation in compile_flow_data)
-            ir_errors = validate_patch_ops(ops)
+            ir_errors, _ir_warnings = validate_patch_ops(ops)
 
         logger.info(
             "[COMPILE_PATCH_IR] ops=%d ir_errors=%d",
@@ -2172,7 +2253,7 @@ def _make_compile_patch_ir_node(
 
 def _make_compile_flow_data_node(
     capabilities: "list[DomainCapability] | None" = None,
-    domains: "list[DomainTools] | None" = None,
+    executor: dict | None = None,
 ):
     """Factory: compile_flow_data node (deterministic compiler).
 
@@ -2183,9 +2264,7 @@ def _make_compile_flow_data_node(
     flowise_cap: "DomainCapability | None" = next(
         (cap for cap in (capabilities or []) if cap.name == "flowise"), None
     )
-    # Build a discover executor for schema fetching
-    _domains = domains or []
-    _, discover_executor = merge_tools(_domains, "discover")
+    discover_executor = executor or {}
 
     async def compile_flow_data(state: AgentState) -> dict:
         logger.info("[COMPILE_FLOW_DATA] running deterministic compiler")
@@ -2333,6 +2412,19 @@ def _make_compile_flow_data_node(
 
         existing_flowise_artifacts = flowise_artifacts.copy()
         existing_flowise_facts = (state.get("facts") or {}).get("flowise") or {}
+        existing_flowise_debug = (state.get("debug") or {}).get("flowise") or {}
+
+        # M10.3a: Log anchor resolution metrics
+        _anchor_metrics = compile_result.anchor_metrics
+        if _anchor_metrics.get("total_connections", 0) > 0:
+            logger.info(
+                "[COMPILE_FLOW_DATA] anchor resolution: %d connections, "
+                "exact=%d fuzzy=%d rate=%.2f",
+                _anchor_metrics["total_connections"],
+                _anchor_metrics["exact_name_matches"],
+                _anchor_metrics["fuzzy_fallbacks"],
+                _anchor_metrics["exact_match_rate"],
+            )
 
         return {
             "artifacts": {
@@ -2347,6 +2439,12 @@ def _make_compile_flow_data_node(
                 "flowise": {
                     **existing_flowise_facts,
                     "proposed_flow_hash": proposed_hash,
+                }
+            },
+            "debug": {
+                "flowise": {
+                    **existing_flowise_debug,
+                    "anchor_resolution": _anchor_metrics,
                 }
             },
         }
@@ -2523,19 +2621,19 @@ def _make_validate_node():
 
 def _make_repair_schema_node(
     capabilities: "list[DomainCapability] | None" = None,
-    domains: "list[DomainTools] | None" = None,
+    executor: dict | None = None,
 ):
     """Factory: repair_schema node (deterministic, targeted).
 
     Only triggered when failure_type == "schema_mismatch". Attempts to re-fetch
-    the missing node schemas using NodeSchemaStore or API fallback.
+    the missing node schemas using NodeSchemaStore or API fallback via
+    MCP-backed executor.
     Increments facts["repair"]["count"] and enforces budget.
     """
     flowise_cap: "DomainCapability | None" = next(
         (cap for cap in (capabilities or []) if cap.name == "flowise"), None
     )
-    _domains = domains or []
-    _, discover_executor = merge_tools(_domains, "discover")
+    discover_executor = executor or {}
 
     async def repair_schema(state: AgentState) -> dict:
         logger.info("[REPAIR_SCHEMA] attempting schema repair")
@@ -2677,16 +2775,16 @@ def _make_preflight_validate_patch_node():
 
 
 def _make_apply_patch_node(
-    domains: list[DomainTools],
+    executor: dict,
     capabilities: "list[DomainCapability] | None" = None,
 ):
     """Factory: apply_patch node (write-guarded, single write).
 
-    CREATE: calls create_chatflow
-    UPDATE: calls update_chatflow(target_chatflow_id)
+    CREATE: calls create_chatflow via MCP-backed executor
+    UPDATE: calls update_chatflow(target_chatflow_id) via MCP-backed executor
     Uses WriteGuard to enforce hash match before writing.
     """
-    _, patch_executor = merge_tools(domains, "patch")
+    patch_executor = executor
 
     async def apply_patch(state: AgentState) -> dict:
         logger.info("[APPLY_PATCH] applying patch to Flowise")
@@ -3056,11 +3154,18 @@ def _route_after_hitl_review_v2(state: AgentState) -> str:
 def make_default_capabilities(
     engine: ReasoningEngine,
     domains: list[DomainTools],
+    client: "FlowiseClient | None" = None,
 ) -> list[DomainCapability]:
     """Build the default capability list for capability-first mode (M7.1, DD-066).
 
     Constructs a FlowiseCapability with the pre-built discover system prompt so
     callers (api.py lifespan) don't need to import private helpers.
+
+    Args:
+        engine:  Reasoning engine (LLM provider).
+        domains: List of DomainTools plugins.
+        client:  Optional FlowiseClient. When provided, FlowiseCapability
+                 registers MCP tools via FlowiseMCPTools (M10.3).
 
     Returns:
         list containing one FlowiseCapability instance wrapping the first
@@ -3073,7 +3178,7 @@ def make_default_capabilities(
         domains[0],
     )
     system = _build_system_prompt(_DISCOVER_BASE, domains, "discover")
-    return [FlowiseCapability(flowise_domain, engine, system)]
+    return [FlowiseCapability(flowise_domain, engine, system, client=client)]
 
 
 def build_graph(
@@ -3187,6 +3292,49 @@ def _build_graph_v2(
                 _template_store = _cap.knowledge.template_store
                 break
 
+    # ------------------------------------------------------------------
+    # M10.3: Build MCP-backed executor (DD-079/DD-094)
+    # All Flowise API operations go through ToolRegistry → FlowiseMCPTools.
+    # Domain-only tools (validate_flow_data, snapshot_chatflow, rollback_chatflow)
+    # are merged in from the domain executor.
+    # ------------------------------------------------------------------
+    _mcp_executor: dict = {}
+    _flowise_client = client
+    if _flowise_client is None:
+        # Fallback: extract client from FloviseDomain executor
+        for _d in domains:
+            if _d.name == "flowise" and "list_chatflows" in _d.executor:
+                # Use the domain executor as-is when no client available
+                _mcp_executor = dict(_d.executor)
+                break
+    if _flowise_client is not None:
+        from flowise_dev_agent.mcp.tools import FlowiseMCPTools
+        from flowise_dev_agent.mcp.registry import register_flowise_mcp_tools
+
+        # Build anchor_dict_getter from capabilities knowledge layer
+        _anchor_getter = None
+        if capabilities:
+            for _cap in capabilities:
+                if _cap.name == "flowise" and hasattr(_cap, "knowledge"):
+                    _kp = _cap.knowledge
+                    if hasattr(_kp, "anchor_dictionary"):
+                        _anchor_getter = _kp.anchor_dictionary.get
+                    break
+
+        _mcp_tools = FlowiseMCPTools(_flowise_client, anchor_dict_getter=_anchor_getter)
+        _mcp_registry = ToolRegistry()
+        register_flowise_mcp_tools(_mcp_registry, _mcp_tools)
+        _mcp_executor = _mcp_registry.executor("discover")
+        # Merge domain-only tools (not in MCP) from the domain executor
+        for _d in domains:
+            if _d.name == "flowise":
+                for _tool_name in ("validate_flow_data", "snapshot_chatflow", "rollback_chatflow"):
+                    if _tool_name in _d.executor:
+                        _mcp_executor[_tool_name] = _d.executor[_tool_name]
+                break
+
+    logger.info("[BUILD_GRAPH_V2] MCP executor: %d tools", len(_mcp_executor))
+
     builder = StateGraph(AgentState)
 
     # M9.2 node-wrapping helper — works identically to v1 topology
@@ -3201,11 +3349,11 @@ def _build_graph_v2(
     builder.add_node("hydrate_context",   _w2("hydrate_context",   _make_hydrate_context_node(capabilities)))
 
     # ---- Phase B (UPDATE only, skipped for CREATE) ----
-    builder.add_node("resolve_target",     _w2("resolve_target",     _make_resolve_target_node(domains)))
+    builder.add_node("resolve_target",     _w2("resolve_target",     _make_resolve_target_node(_mcp_executor)))
     builder.add_node("hitl_select_target", _w2("hitl_select_target", _make_hitl_select_target_node()))
 
     # ---- Phase C (UPDATE only) ----
-    builder.add_node("load_current_flow",      _w2("load_current_flow",      _make_load_current_flow_node(domains)))
+    builder.add_node("load_current_flow",      _w2("load_current_flow",      _make_load_current_flow_node(_mcp_executor)))
     builder.add_node("summarize_current_flow", _w2("summarize_current_flow", _make_summarize_current_flow_node()))
 
     # ---- Phase D ----
@@ -3213,16 +3361,16 @@ def _build_graph_v2(
     builder.add_node("hitl_plan_v2",       _w2("hitl_plan_v2",       _make_human_plan_approval_node()))
     builder.add_node("define_patch_scope", _w2("define_patch_scope", _make_define_patch_scope_node(engine)))
     builder.add_node("compile_patch_ir",   _w2("compile_patch_ir",   _make_compile_patch_ir_node(engine, capabilities)))
-    builder.add_node("compile_flow_data",  _w2("compile_flow_data",  _make_compile_flow_data_node(capabilities, domains)))
+    builder.add_node("compile_flow_data",  _w2("compile_flow_data",  _make_compile_flow_data_node(capabilities, executor=_mcp_executor)))
 
     # ---- Phase E ----
     builder.add_node("validate",      _w2("validate",      _make_validate_node()))
-    builder.add_node("repair_schema", _w2("repair_schema", _make_repair_schema_node(capabilities, domains)))
+    builder.add_node("repair_schema", _w2("repair_schema", _make_repair_schema_node(capabilities, executor=_mcp_executor)))
 
     # ---- Phase F ----
     builder.add_node("preflight_validate_patch", _w2("preflight_validate_patch", _make_preflight_validate_patch_node()))
-    builder.add_node("apply_patch",    _w2("apply_patch",    _make_apply_patch_node(domains, capabilities)))
-    builder.add_node("test_v2",        _w2("test_v2",        _make_test_node(engine, domains)))
+    builder.add_node("apply_patch",    _w2("apply_patch",    _make_apply_patch_node(_mcp_executor, capabilities)))
+    builder.add_node("test_v2",        _w2("test_v2",        _make_test_node(engine, _mcp_executor, domains)))
     builder.add_node("evaluate",       _w2("evaluate",       _make_evaluate_node(engine)))
     builder.add_node("hitl_review_v2", _w2("hitl_review_v2", _make_hitl_review_node()))
 
@@ -3335,7 +3483,7 @@ def create_agent(flowise_settings: Settings, reasoning_settings: ReasoningSettin
         The client is returned separately so it can be closed on shutdown.
 
     Example:
-        from cursorwise.config import Settings
+        from flowise_dev_agent.client import Settings
         from flowise_dev_agent.reasoning import ReasoningSettings
         from flowise_dev_agent.agent import create_agent
 

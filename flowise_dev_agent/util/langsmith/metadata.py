@@ -77,6 +77,13 @@ def extract_session_metadata(state: dict[str, Any]) -> dict[str, Any]:
         meta["pattern.pattern_id"] = pattern_metrics.get("pattern_id")
         meta["pattern.ops_in_base"] = pattern_metrics.get("ops_in_base", 0)
 
+    # -- Anchor resolution metrics (M10.3a) -----------------------------------
+    anchor_res = flowise_debug.get("anchor_resolution")
+    if anchor_res and isinstance(anchor_res, dict):
+        meta["telemetry.anchor_exact_match_rate"] = anchor_res.get("exact_match_rate", 1.0)
+        meta["telemetry.anchor_fuzzy_fallbacks"] = anchor_res.get("fuzzy_fallbacks", 0)
+        meta["telemetry.anchor_total_connections"] = anchor_res.get("total_connections", 0)
+
     # -- Converge verdict -----------------------------------------------------
     verdict = state.get("converge_verdict")
     if verdict and isinstance(verdict, dict):

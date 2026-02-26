@@ -69,17 +69,24 @@ class SetParam:
 
 @dataclass
 class Connect:
-    """Connect two nodes by their anchor names.
+    """Connect two nodes by their canonical anchor names.
 
     The compiler resolves the actual handle IDs from node schemas.
-    The LLM must supply anchor names, not handle strings.
+    The LLM MUST call get_anchor_dictionary(node_type) to obtain the exact
+    anchor name before emitting Connect ops.
 
     source_node_id:  ID of the node providing the output.
-    source_anchor:   Name of the output anchor (e.g. "chatOpenAI", "ConversationChain").
+    source_anchor:   Canonical NAME from the output anchor dictionary
+                     (e.g. "chatOpenAI", "conversationChain").
                      Usually the node_name itself for single-output nodes.
     target_node_id:  ID of the node receiving the input.
-    target_anchor:   Name of the input anchor type (e.g. "BaseChatModel", "BaseMemory").
-                     This is the baseClass type expected at the target input slot.
+    target_anchor:   Canonical NAME from the input anchor dictionary
+                     (e.g. "memory", "model", "tools").
+
+    DEPRECATED: Using type names (e.g. "BaseChatModel", "BaseMemory") as
+    anchor values still works via a fuzzy fallback in the compiler, but
+    emits a deprecation warning and increments fuzzy_fallbacks metrics.
+    New sessions should always use canonical names from the anchor dictionary.
     """
 
     op_type: str = "connect"
@@ -144,21 +151,34 @@ class PatchIRValidationError(Exception):
 def validate_patch_ops(
     ops: list[PatchOp],
     base_node_ids: set[str] | None = None,
-) -> list[str]:
-    """Validate a list of Patch IR ops. Returns list of error strings (empty = valid).
+    anchor_store=None,
+    node_type_map: dict[str, str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Validate a list of Patch IR ops. Returns (errors, warnings).
 
     Checks performed:
     - Required string fields are non-empty
     - No duplicate node_ids across AddNode ops in the same ops list
     - Connect / SetParam / BindCredential reference node_ids that exist in either
       `base_node_ids` (nodes already in the graph) or declared by an AddNode in this list
+    - (Optional) Anchor name validation when anchor_store and node_type_map provided
 
     base_node_ids: optional set of existing node IDs in the base graph.
                    When None, only cross-op references are validated.
+    anchor_store:  optional AnchorDictionaryStore. When provided along with
+                   node_type_map, Connect anchors are validated against canonical
+                   anchor dictionaries. compatible_types are advisory only — never
+                   a hard gate.
+    node_type_map: optional {node_id → node_type} mapping. Built from base graph
+                   nodes + AddNode ops. Required for anchor validation.
     """
     errors: list[str] = []
+    warnings: list[str] = []
     seen_add_ids: set[str] = set()
     known_ids: set[str] = set(base_node_ids or set())
+
+    # Build node_type_map from AddNode ops
+    _add_node_types: dict[str, str] = {}
 
     # Pass 1: collect AddNode IDs (they must come before references in ops list
     # logically, but we allow any order by pre-scanning first).
@@ -173,6 +193,13 @@ def validate_patch_ops(
             else:
                 seen_add_ids.add(op.node_id)
                 known_ids.add(op.node_id)
+                _add_node_types[op.node_id] = op.node_name
+
+    # Union node_type_map: caller's map + AddNode ops
+    _effective_type_map: dict[str, str] = {}
+    if node_type_map:
+        _effective_type_map.update(node_type_map)
+    _effective_type_map.update(_add_node_types)
 
     # Pass 2: validate references in non-AddNode ops
     for i, op in enumerate(ops):
@@ -207,6 +234,12 @@ def validate_patch_ops(
             if not op.target_anchor:
                 errors.append(f"ops[{i}] Connect: target_anchor is required")
 
+            # Anchor name validation (advisory — warnings only)
+            if anchor_store is not None:
+                _validate_connect_anchors(
+                    i, op, _effective_type_map, anchor_store, warnings,
+                )
+
         elif isinstance(op, BindCredential):
             if not op.node_id:
                 errors.append(f"ops[{i}] BindCredential: node_id is required")
@@ -218,7 +251,54 @@ def validate_patch_ops(
             if not op.credential_id:
                 errors.append(f"ops[{i}] BindCredential: credential_id is required")
 
-    return errors
+    return errors, warnings
+
+
+def _validate_connect_anchors(
+    op_idx: int,
+    op: Connect,
+    type_map: dict[str, str],
+    anchor_store,
+    warnings: list[str],
+) -> None:
+    """Validate Connect anchor names against canonical anchor dictionaries.
+
+    Adds warnings (never errors) for unknown anchor names so the compiler can
+    still attempt fuzzy fallback. compatible_types are advisory only.
+    """
+    # Source anchor validation
+    src_type = type_map.get(op.source_node_id)
+    if src_type is None:
+        warnings.append(
+            f"ops[{op_idx}] Connect: no node_type mapping for source '{op.source_node_id}'"
+        )
+    else:
+        src_dict = anchor_store.get(src_type)
+        if src_dict is not None:
+            output_names = [a["name"] for a in src_dict.get("output_anchors", [])]
+            if op.source_anchor not in output_names:
+                warnings.append(
+                    f"ops[{op_idx}] Connect: source_anchor '{op.source_anchor}' "
+                    f"not found in {src_type} output anchors. "
+                    f"Valid options: {output_names}"
+                )
+
+    # Target anchor validation
+    tgt_type = type_map.get(op.target_node_id)
+    if tgt_type is None:
+        warnings.append(
+            f"ops[{op_idx}] Connect: no node_type mapping for target '{op.target_node_id}'"
+        )
+    else:
+        tgt_dict = anchor_store.get(tgt_type)
+        if tgt_dict is not None:
+            input_names = [a["name"] for a in tgt_dict.get("input_anchors", [])]
+            if op.target_anchor not in input_names:
+                warnings.append(
+                    f"ops[{op_idx}] Connect: target_anchor '{op.target_anchor}' "
+                    f"not found in {tgt_type} input anchors. "
+                    f"Valid options: {input_names}"
+                )
 
 
 # ---------------------------------------------------------------------------

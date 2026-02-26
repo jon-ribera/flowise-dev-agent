@@ -303,7 +303,7 @@ class TestPatchIRValidation:
                 target_anchor="BaseChatModel",
             ),
         ]
-        errors = validate_patch_ops(ops, base_node_ids=set())
+        errors, _warnings = validate_patch_ops(ops, base_node_ids=set())
         assert any("ghost_0" in e for e in errors), f"Expected error about ghost_0, got: {errors}"
 
     def test_connect_to_nonexistent_target_node_is_caught(self):
@@ -317,7 +317,7 @@ class TestPatchIRValidation:
                 target_anchor="BaseChatModel",
             ),
         ]
-        errors = validate_patch_ops(ops)
+        errors, _warnings = validate_patch_ops(ops)
         assert any("missing_chain" in e for e in errors), f"Got: {errors}"
 
     def test_existing_base_nodes_are_valid_refs(self):
@@ -330,7 +330,7 @@ class TestPatchIRValidation:
                 target_anchor="BaseChatModel",
             ),
         ]
-        errors = validate_patch_ops(ops, base_node_ids={"chatOpenAI_0", "chain_0"})
+        errors, _warnings = validate_patch_ops(ops, base_node_ids={"chatOpenAI_0", "chain_0"})
         assert errors == [], f"Unexpected errors: {errors}"
 
     def test_duplicate_node_id_in_add_ops_is_caught(self):
@@ -339,7 +339,7 @@ class TestPatchIRValidation:
             AddNode(node_name="chatOpenAI", node_id="shared_id"),
             AddNode(node_name="conversationChain", node_id="shared_id"),  # duplicate
         ]
-        errors = validate_patch_ops(ops)
+        errors, _warnings = validate_patch_ops(ops)
         assert any("shared_id" in e for e in errors), f"Got: {errors}"
 
     def test_missing_required_fields_are_caught(self):
@@ -348,7 +348,7 @@ class TestPatchIRValidation:
             AddNode(node_name="", node_id="chatOpenAI_0"),   # empty node_name
             AddNode(node_name="conversationChain", node_id=""),  # empty node_id
         ]
-        errors = validate_patch_ops(ops)
+        errors, _warnings = validate_patch_ops(ops)
         assert len(errors) >= 2, f"Expected at least 2 errors, got: {errors}"
 
     def test_bind_credential_missing_id_is_caught(self):
@@ -357,7 +357,7 @@ class TestPatchIRValidation:
             AddNode(node_name="chatOpenAI", node_id="chatOpenAI_0"),
             BindCredential(node_id="chatOpenAI_0", credential_id=""),
         ]
-        errors = validate_patch_ops(ops)
+        errors, _warnings = validate_patch_ops(ops)
         assert any("credential_id" in e for e in errors), f"Got: {errors}"
 
     def test_valid_ops_produce_no_errors(self):
@@ -374,7 +374,7 @@ class TestPatchIRValidation:
             BindCredential(node_id="chatOpenAI_0", credential_id="cred-uuid-123"),
             SetParam(node_id="chain_0", param_name="systemMessagePrompt", value="Hello!"),
         ]
-        errors = validate_patch_ops(ops)
+        errors, _warnings = validate_patch_ops(ops)
         assert errors == [], f"Unexpected validation errors: {errors}"
 
 

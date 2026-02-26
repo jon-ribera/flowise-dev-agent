@@ -28,8 +28,7 @@ import logging
 import os
 from typing import Any
 
-from cursorwise.client import FlowiseClient
-from cursorwise.config import Settings
+from flowise_dev_agent.client import FlowiseClient, Settings
 
 logger = logging.getLogger("flowise_dev_agent.instance_pool")
 

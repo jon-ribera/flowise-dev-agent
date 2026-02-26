@@ -196,7 +196,7 @@ async def lifespan(app: FastAPI):
         pattern_store = await PatternStore.open(pattern_db_path)
 
         # M7.1 (DD-066): capability-first is the default; compat_legacy only when opted in.
-        _capabilities = None if _COMPAT_LEGACY else make_default_capabilities(engine, domains)
+        _capabilities = None if _COMPAT_LEGACY else make_default_capabilities(engine, domains, client=default_client)
         _runtime_mode = "compat_legacy" if _COMPAT_LEGACY else "capability_first"
         logger.info("Runtime mode: %s (FLOWISE_COMPAT_LEGACY=%s)", _runtime_mode, _COMPAT_LEGACY)
 

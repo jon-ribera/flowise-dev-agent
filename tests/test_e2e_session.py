@@ -17,6 +17,8 @@ Tests:
   3. POST /sessions/{id}/resume with "approved" reaches result_review
   4. GET /sessions returns the created session in the list
   5. GET /healthz (or /docs) responds 200 — server is alive
+  6. Approved session has a chatflow_id (flow created in Flowise)
+  7. Credential binding produces a valid chatflow UUID
 
 All tests marked @pytest.mark.slow so they can be excluded from fast CI:
     pytest tests/test_e2e_session.py -v -m "not slow"   # skips all e2e tests
@@ -25,6 +27,7 @@ All tests marked @pytest.mark.slow so they can be excluded from fast CI:
 from __future__ import annotations
 
 import os
+import re
 
 import pytest
 
@@ -85,6 +88,29 @@ def session_id(client):
     return tid
 
 
+@pytest.fixture(scope="module")
+def approved_session(client):
+    """Create a session, approve the plan, and return (thread_id, response_body).
+
+    Shared across credential-binding tests to avoid duplicate 5-minute API calls.
+    """
+    r1 = client.post(
+        "/sessions",
+        json={"requirement": _SIMPLE_REQUIREMENT, "test_trials": 1},
+        timeout=120,
+    )
+    assert r1.status_code == 200, f"POST /sessions failed: {r1.status_code}"
+    body1 = r1.json()
+    tid = body1.get("thread_id", "")
+    assert tid, "thread_id missing"
+    assert body1.get("status") == "pending_interrupt"
+
+    # Approve the plan
+    r2 = client.post(f"/sessions/{tid}/resume", json={"response": "approved"}, timeout=300)
+    assert r2.status_code == 200, f"Resume failed: {r2.status_code} — {r2.text[:400]}"
+    return tid, r2.json()
+
+
 # ---------------------------------------------------------------------------
 # Test 1: POST /sessions returns pending_interrupt
 # ---------------------------------------------------------------------------
@@ -137,24 +163,9 @@ def test_plan_approval_has_non_empty_plan_text(client, session_id):
 # ---------------------------------------------------------------------------
 
 
-def test_resume_approved_reaches_result_review(client):
+def test_resume_approved_reaches_result_review(approved_session):
     """After approving the plan, the next interrupt must be result_review."""
-    # Create a fresh session for this test (independent of session_id fixture)
-    r1 = client.post(
-        "/sessions",
-        json={"requirement": _SIMPLE_REQUIREMENT, "test_trials": 1},
-        timeout=120,
-    )
-    assert r1.status_code == 200
-    body1 = r1.json()
-    tid = body1.get("thread_id", "")
-    assert tid, "thread_id missing"
-    assert body1.get("status") == "pending_interrupt"
-
-    # Approve the plan
-    r2 = client.post(f"/sessions/{tid}/resume", json={"response": "approved"}, timeout=300)
-    assert r2.status_code == 200, f"Resume failed: {r2.status_code} — {r2.text[:400]}"
-    body2 = r2.json()
+    _tid, body2 = approved_session
 
     # After approval we expect either result_review interrupt or completed
     status2 = body2.get("status")
@@ -207,3 +218,53 @@ def test_list_sessions_has_m82_telemetry_fields(client, session_id):
     assert isinstance(target["knowledge_repair_count"], int)
     assert isinstance(target["get_node_calls_total"], int)
     assert isinstance(target["phase_durations_ms"], dict)
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Approved session has chatflow_id
+# ---------------------------------------------------------------------------
+
+
+def test_approved_session_has_chatflow_id(client, approved_session):
+    """After plan approval and execution, chatflow_id must be set.
+
+    Proves BindCredential ops didn't cause a compiler error — the flow was
+    successfully created in Flowise with credentials bound.
+    """
+    tid, body2 = approved_session
+    chatflow_id = body2.get("chatflow_id")
+
+    # If not in resume response, try GET
+    if not chatflow_id:
+        r = client.get(f"/sessions/{tid}")
+        assert r.status_code == 200
+        chatflow_id = r.json().get("chatflow_id")
+
+    assert chatflow_id, (
+        f"Session {tid} has no chatflow_id — flow was not created in Flowise.\n"
+        f"Resume response: {body2}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Credential binding produces a valid chatflow UUID
+# ---------------------------------------------------------------------------
+
+
+def test_credential_binding_produces_valid_chatflow(client, approved_session):
+    """chatflow_id must be a valid UUID, proving the full pipeline worked:
+    plan → patch IR with BindCredential → credential resolution → compile → Flowise create.
+    """
+    tid, body2 = approved_session
+    chatflow_id = body2.get("chatflow_id")
+
+    if not chatflow_id:
+        r = client.get(f"/sessions/{tid}")
+        chatflow_id = r.json().get("chatflow_id")
+
+    if not chatflow_id:
+        pytest.skip("No chatflow_id available — flow was not created in this run")
+
+    assert re.match(r"^[0-9a-fA-F-]{36}$", chatflow_id), (
+        f"chatflow_id does not look like a UUID: {chatflow_id!r}"
+    )

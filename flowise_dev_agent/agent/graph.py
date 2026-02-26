@@ -599,8 +599,20 @@ def _make_plan_node(
     domains: list[DomainTools],
     template_store: TemplateStore | None = None,
     pattern_store=None,
+    capabilities: "list[DomainCapability] | None" = None,
 ):
     system = _build_system_prompt(_PLAN_BASE, domains, "discover")  # plan uses discover context
+
+    # Extract available credential info from the knowledge layer so the LLM
+    # knows what credentials are already configured (prevents MISSING status).
+    _cred_summary: list[dict] = []
+    if capabilities:
+        for _cap in capabilities:
+            if _cap.name == "flowise" and hasattr(_cap, "knowledge"):
+                _kp = _cap.knowledge
+                if hasattr(_kp, "credential_store") and _kp.credential_store is not None:
+                    _cred_summary = _kp.credential_store.available_credentials_summary
+                break
 
     # Stop-words filtered out when extracting keywords for template matching.
     _STOP = frozenset({
@@ -712,6 +724,27 @@ def _make_plan_node(
             f"Requirement:\n{state['requirement']}\n\n"
             f"Discovery summary:\n{state.get('discovery_summary') or '(none)'}"
         )
+        if _cred_summary:
+            cred_lines: list[str] = []
+            for _cs in _cred_summary:
+                if _cs["count"] == 1:
+                    # Single credential — just show type (LLM uses type in BindCredential)
+                    line = f"  - {_cs['type']}"
+                    if _cs["names"]:
+                        line += f" (name: {_cs['names']})"
+                    cred_lines.append(line)
+                else:
+                    # Multiple credentials of same type — show names so LLM can pick
+                    cred_lines.append(
+                        f"  - {_cs['type']} ({_cs['count']} available: {_cs['names']})"
+                        "\n    Use the credential NAME (not type) in BindCredential.credential_id"
+                        " when multiple exist."
+                    )
+            base_content += (
+                "\n\nAvailable credentials (already configured in Flowise):\n"
+                + "\n".join(cred_lines)
+                + "\nUse CREDENTIALS_STATUS: AVAILABLE when the required types are listed above."
+            )
         if template_hint:
             base_content += f"\n\n{template_hint}"
 
@@ -2178,6 +2211,28 @@ def _make_compile_flow_data_node(
             _kp = flowise_cap.knowledge
             if hasattr(_kp, "credential_store"):
                 _cred_store = _kp.credential_store
+
+        # Diagnostic logging: surface why credential resolution may be skipped
+        _bind_ops = [op for op in ops if isinstance(op, BindCredential)]
+        if _bind_ops:
+            if flowise_cap is None:
+                logger.warning(
+                    "[COMPILE_FLOW_DATA] %d BindCredential ops but flowise_cap is None "
+                    "(capabilities not passed to build_graph? FLOWISE_COMPAT_LEGACY=true?)",
+                    len(_bind_ops),
+                )
+            elif _cred_store is None:
+                logger.warning(
+                    "[COMPILE_FLOW_DATA] %d BindCredential ops but credential_store is None "
+                    "(run: python -m flowise_dev_agent.knowledge.refresh --credentials)",
+                    len(_bind_ops),
+                )
+            else:
+                logger.info(
+                    "[COMPILE_FLOW_DATA] Resolving %d BindCredential ops (store: %d entries)",
+                    len(_bind_ops), _cred_store.credential_count,
+                )
+
         if _cred_store is not None:
             for _op in ops:
                 if isinstance(_op, BindCredential) and not _UUID_RE.match(_op.credential_id or ""):
@@ -2198,6 +2253,17 @@ def _make_compile_flow_data_node(
                             "run: python -m flowise_dev_agent.knowledge.refresh --credentials",
                             _op.credential_id, _op.credential_type,
                         )
+
+            # Resolution summary
+            if _bind_ops:
+                _resolved_count = sum(1 for op in _bind_ops if _UUID_RE.match(op.credential_id or ""))
+                if _resolved_count < len(_bind_ops):
+                    logger.warning(
+                        "[COMPILE_FLOW_DATA] Credentials: %d/%d resolved",
+                        _resolved_count, len(_bind_ops),
+                    )
+                else:
+                    logger.info("[COMPILE_FLOW_DATA] All %d credentials resolved", _resolved_count)
 
         # Determine base graph
         if operation_mode == "update":
@@ -3067,6 +3133,14 @@ def _build_graph_v2(
     """
     logger.info("[BUILD_GRAPH_V2] building M9.6 18-node topology")
 
+    # Fingerprint: verify correct source is loaded (guards against stale __pycache__)
+    import hashlib as _hl
+    _rf_hash = _hl.sha256(
+        _route_after_validate.__code__.co_code
+        + _route_after_preflight.__code__.co_code
+    ).hexdigest()[:12]
+    logger.info("[BUILD_GRAPH_V2] routing fingerprint: %s", _rf_hash)
+
     # Extract TemplateStore from capabilities for planning hints
     _template_store: TemplateStore | None = None
     if capabilities:
@@ -3097,7 +3171,7 @@ def _build_graph_v2(
     builder.add_node("summarize_current_flow", _w2("summarize_current_flow", _make_summarize_current_flow_node()))
 
     # ---- Phase D ----
-    builder.add_node("plan_v2",            _w2("plan_v2",            _make_plan_node(engine, domains, _template_store, pattern_store=pattern_store)))
+    builder.add_node("plan_v2",            _w2("plan_v2",            _make_plan_node(engine, domains, _template_store, pattern_store=pattern_store, capabilities=capabilities)))
     builder.add_node("hitl_plan_v2",       _w2("hitl_plan_v2",       _make_human_plan_approval_node()))
     builder.add_node("define_patch_scope", _w2("define_patch_scope", _make_define_patch_scope_node(engine)))
     builder.add_node("compile_patch_ir",   _w2("compile_patch_ir",   _make_compile_patch_ir_node(engine, capabilities)))

@@ -58,16 +58,31 @@ def _make_mock_cursor(rows: list, description=None):
 # ---------------------------------------------------------------------------
 
 
+def _make_mock_conn_with_cursor(rows, description=None):
+    """Return (mock_conn, cursor_mock) where mock_conn.cursor() is an async ctx mgr."""
+    ctx_mock, cur_mock = _make_mock_cursor(rows, description)
+    conn_mock = MagicMock()
+    conn_mock.cursor = MagicMock(return_value=ctx_mock)
+    return conn_mock, cur_mock
+
+
 @pytest.mark.asyncio
 async def test_list_thread_ids_returns_ids():
     """_list_thread_ids handles dict_row format (AsyncPostgresSaver uses row_factory=dict_row)."""
     rows = [{"thread_id": "thread-a"}, {"thread_id": "thread-b"}]
-    ctx_mock, cur_mock = _make_mock_cursor(rows)
+    conn_mock, cur_mock = _make_mock_conn_with_cursor(rows)
 
     cp = MagicMock()
-    cp.conn.cursor = MagicMock(return_value=ctx_mock)
 
-    result = await _list_thread_ids(cp)
+    # Patch get_connection to yield our mock connection (bypasses pool type check)
+    from contextlib import asynccontextmanager as _acm
+
+    @_acm
+    async def _fake_get_conn(_):
+        yield conn_mock
+
+    with patch("flowise_dev_agent.persistence.checkpointer.get_connection", _fake_get_conn):
+        result = await _list_thread_ids(cp)
 
     assert result == ["thread-a", "thread-b"]
     executed_sql = cur_mock.execute.call_args[0][0]
@@ -83,10 +98,17 @@ async def test_list_thread_ids_returns_ids():
 @pytest.mark.asyncio
 async def test_list_thread_ids_empty():
     """_list_thread_ids returns [] when no checkpoints exist."""
-    ctx_mock, _ = _make_mock_cursor([])
+    conn_mock, _ = _make_mock_conn_with_cursor([])
     cp = MagicMock()
-    cp.conn.cursor = MagicMock(return_value=ctx_mock)
-    assert await _list_thread_ids(cp) == []
+
+    from contextlib import asynccontextmanager as _acm
+
+    @_acm
+    async def _fake_get_conn(_):
+        yield conn_mock
+
+    with patch("flowise_dev_agent.persistence.checkpointer.get_connection", _fake_get_conn):
+        assert await _list_thread_ids(cp) == []
 
 
 # ---------------------------------------------------------------------------
@@ -97,10 +119,17 @@ async def test_list_thread_ids_empty():
 @pytest.mark.asyncio
 async def test_thread_exists_true():
     """_thread_exists returns True when a row is found."""
-    ctx_mock, cur_mock = _make_mock_cursor([(1,)])
+    conn_mock, cur_mock = _make_mock_conn_with_cursor([(1,)])
     cp = MagicMock()
-    cp.conn.cursor = MagicMock(return_value=ctx_mock)
-    assert await _thread_exists(cp, "thread-abc") is True
+
+    from contextlib import asynccontextmanager as _acm
+
+    @_acm
+    async def _fake_get_conn(_):
+        yield conn_mock
+
+    with patch("flowise_dev_agent.persistence.checkpointer.get_connection", _fake_get_conn):
+        assert await _thread_exists(cp, "thread-abc") is True
 
     sql = cur_mock.execute.call_args[0][0]
     assert "checkpoints" in sql
@@ -116,10 +145,17 @@ async def test_thread_exists_true():
 @pytest.mark.asyncio
 async def test_thread_exists_false():
     """_thread_exists returns False when no row is found."""
-    ctx_mock, _ = _make_mock_cursor([])
+    conn_mock, _ = _make_mock_conn_with_cursor([])
     cp = MagicMock()
-    cp.conn.cursor = MagicMock(return_value=ctx_mock)
-    assert await _thread_exists(cp, "missing") is False
+
+    from contextlib import asynccontextmanager as _acm
+
+    @_acm
+    async def _fake_get_conn(_):
+        yield conn_mock
+
+    with patch("flowise_dev_agent.persistence.checkpointer.get_connection", _fake_get_conn):
+        assert await _thread_exists(cp, "missing") is False
 
 
 # ---------------------------------------------------------------------------
@@ -129,30 +165,31 @@ async def test_thread_exists_false():
 
 @pytest.mark.asyncio
 async def test_make_checkpointer_yields_saver_with_helpers():
-    """make_checkpointer yields raw AsyncPostgresSaver with list/exist helpers attached."""
+    """make_checkpointer yields AsyncPostgresSaver backed by pool with helpers attached."""
     mock_cp = MagicMock()
     mock_cp.setup = AsyncMock()
 
-    mock_ctx = MagicMock()
-    mock_ctx.__aenter__ = AsyncMock(return_value=mock_cp)
-    mock_ctx.__aexit__ = AsyncMock(return_value=False)
+    mock_pool = AsyncMock()
+    mock_pool.open = AsyncMock()
+    mock_pool.close = AsyncMock()
 
-    mock_saver_cls = MagicMock()
-    mock_saver_cls.from_conn_string = MagicMock(return_value=mock_ctx)
-
-    with patch.dict("sys.modules", {"langgraph.checkpoint.postgres.aio": MagicMock(
-        AsyncPostgresSaver=mock_saver_cls
-    )}):
+    with patch(
+        "flowise_dev_agent.persistence.checkpointer.AsyncConnectionPool",
+        return_value=mock_pool,
+    ), patch(
+        "flowise_dev_agent.persistence.checkpointer.AsyncPostgresSaver",
+        return_value=mock_cp,
+    ):
         from flowise_dev_agent.persistence.checkpointer import make_checkpointer
 
         async with make_checkpointer("postgresql://test:test@localhost/db") as cp:
-            # Must be the raw AsyncPostgresSaver (passes LangGraph isinstance guard)
             assert cp is mock_cp
-            # setup() must be called to create LangGraph tables
             mock_cp.setup.assert_called_once()
-            # Helper methods must be patched on
             assert callable(getattr(cp, "list_thread_ids", None))
             assert callable(getattr(cp, "thread_exists", None))
+
+        mock_pool.open.assert_called_once()
+        mock_pool.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

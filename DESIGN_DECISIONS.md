@@ -2658,3 +2658,84 @@ queue and saving successful sessions to the golden dataset.
 - `tests/test_langsmith_rules.py` — 5 tests
 - `tests/test_langsmith_datasets.py` — 4 tests
 - `tests/test_langsmith_tracer.py` — 7 tests
+
+---
+
+## DD-089 — Plan Node Credential Injection
+
+**Roadmap**: Production Graph Runtime Hardening — Credential Awareness
+
+**Decision**: Inject available credential metadata into the `plan_v2` node's LLM context
+at graph build time, so the LLM knows which credentials are already configured in Flowise.
+
+**Problem**: The LLM in `plan_v2` always emitted `CREDENTIALS_STATUS: MISSING` because
+the plan prompt contained no credential availability information. This triggered unnecessary
+HITL credential interrupts and caused `BindCredential` ops to use placeholder values
+(e.g. `MISSING_openAIApi`) that required post-hoc resolution.
+
+**Solution**:
+1. `_make_plan_node()` accepts a `capabilities` parameter from `_build_graph_v2()`.
+2. At factory time, extracts `CredentialStore.available_credentials_summary` from the
+   `FlowiseCapability`'s knowledge provider.
+3. Appends credential info to `base_content` before the LLM call:
+   - Single credential per type: `"- openAIApi (name: cursorwise-dev-agent)"`
+   - Multiple per type: `"- openAIApi (2 available: key-prod, key-dev)"` with guidance
+     to use credential NAME in `BindCredential.credential_id`.
+
+**New public API** on `CredentialStore`:
+- `available_types` — `list[str]` of credential types (original case)
+- `available_credentials_summary` — `list[dict]` with `type`, `count`, `names`
+
+**Files**: `flowise_dev_agent/agent/graph.py`, `flowise_dev_agent/knowledge/provider.py`
+
+---
+
+## DD-090 — `_build_response` Race Condition Guard
+
+**Roadmap**: Production Graph Runtime Hardening — Streaming Reliability
+
+**Decision**: Tighten the completion guard in `_build_response()` from
+`if not snapshot.next and state:` to `if not snapshot.next and state and state.get("done"):`
+to prevent false "completed" status during streaming initialization.
+
+**Problem**: During SSE streaming, LangGraph checkpoints the initial state before the
+first node runs. A concurrent `GET /sessions/{id}` sees `snapshot.next == ()` (no pending
+nodes) and `state` is truthy (a dict with `done=False`). The old guard returned
+`status="completed"`, causing a "Built Successfully" flash in the UI before the stream
+had even started.
+
+**Solution (backend)**: The `done` field in `AgentState` is the authoritative completion
+signal — `False` in `_initial_state()` and only set to `True` when the graph finishes.
+Added `state.get("done")` as a required condition. When `done=False` and `next==()`,
+the response returns `"pending_interrupt"` with a "mid-execution" message.
+
+**Solution (frontend)**: `page.tsx` `useEffect` #1 checks
+`if (current?.status === "streaming") return;` before applying the GET response, preventing
+stale checkpoint data from overwriting the active streaming state.
+
+**Files**: `flowise_dev_agent/api.py`, `ui/src/app/sessions/[id]/page.tsx`
+**Tests**: `tests/test_build_response_race.py` (3 regression tests)
+
+---
+
+## DD-091 — Stale Bytecode Prevention (Windows + uvicorn --reload)
+
+**Roadmap**: Production Graph Runtime Hardening — Developer Experience
+
+**Decision**: Prevent `__pycache__` bytecode file creation during development and log
+a routing fingerprint hash at graph build time for diagnostic verification.
+
+**Problem**: On Windows, Python's `__pycache__` bytecode files persist across restarts.
+When source files change, `uvicorn --reload` may still serve code from stale `.pyc` files.
+Zombie child processes from previous reloader cycles compound the issue by holding file
+locks. This caused the graph to execute old routing logic that had already been fixed in
+the source code.
+
+**Solution**:
+1. `serve()` in `api.py` sets `os.environ["PYTHONDONTWRITEBYTECODE"] = "1"` and
+   `sys.dont_write_bytecode = True` before launching uvicorn. Prevents `.pyc` creation.
+2. `_build_graph_v2()` in `graph.py` computes a SHA-256 hash of all routing function
+   bytecodes and logs it: `[BUILD_GRAPH_V2] routing fingerprint: <hash>`. This provides
+   an immediate diagnostic to verify the server is executing the expected code version.
+
+**Files**: `flowise_dev_agent/api.py`, `flowise_dev_agent/agent/graph.py`

@@ -37,7 +37,7 @@ flowise-agent-cli = "flowise_dev_agent.cli:main"
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 markers = [
-    "slow: end-to-end tests requiring a live agent server (deselect with -m 'not slow')",
+    "slow: tests requiring a live server or heavy subprocess/parsing (deselect with -m 'not slow')",
 ]
 
 [tool.setuptools.packages.find]

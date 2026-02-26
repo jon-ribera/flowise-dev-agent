@@ -1029,6 +1029,48 @@ class CredentialStore:
         self._load()
         return len(self._by_id)
 
+    @property
+    def available_types(self) -> list[str]:
+        """Return sorted list of credential type strings present in the snapshot (original case)."""
+        self._load()
+        # _by_type keys are lowercased; recover original case from entry dicts
+        seen: dict[str, str] = {}
+        for entries in self._by_type.values():
+            for entry in entries:
+                orig = entry.get("type", "")
+                if orig and orig.lower() not in seen:
+                    seen[orig.lower()] = orig
+        return sorted(seen.values())
+
+    @property
+    def available_credentials_summary(self) -> list[dict[str, str | int]]:
+        """Return a summary of available credentials grouped by type.
+
+        Each entry: ``{"type": "openAIApi", "count": 2, "names": "key-prod, key-dev"}``.
+        When count == 1, ``names`` is the single credential name.
+        """
+        self._load()
+        result: list[dict[str, str | int]] = []
+        # Iterate in sorted order of original-case type
+        type_map: dict[str, tuple[str, list[str]]] = {}
+        for entries in self._by_type.values():
+            for entry in entries:
+                orig_type = entry.get("type", "")
+                name = entry.get("name", "")
+                key = orig_type.lower()
+                if key not in type_map:
+                    type_map[key] = (orig_type, [])
+                if name:
+                    type_map[key][1].append(name)
+        for _key in sorted(type_map):
+            orig_type, names = type_map[_key]
+            result.append({
+                "type": orig_type,
+                "count": len(names) or 1,
+                "names": ", ".join(sorted(names)) if names else "",
+            })
+        return result
+
     # ------------------------------------------------------------------
     # Repair event helpers
     # ------------------------------------------------------------------

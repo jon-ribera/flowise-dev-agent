@@ -34,6 +34,12 @@ export default function SessionDetailPage({ params }: { params: { id: string } }
     api
       .getSession(id)
       .then((session) => {
+        // Guard: if a POST stream is already feeding events (status === "streaming"),
+        // skip applying the GET response — it may reflect stale mid-checkpoint state.
+        // This prevents "Built Successfully" flashing on brand-new sessions.
+        const current = useSessionStore.getState().active;
+        if (current?.status === "streaming") return;
+
         if (session.interrupt) {
           // Restore HITL state without overwriting a live stream already in progress
           applySSEEvent({ ...session.interrupt, type: session.interrupt.type } as unknown as SSEEvent);
@@ -47,8 +53,12 @@ export default function SessionDetailPage({ params }: { params: { id: string } }
       .catch((e: unknown) => {
         const status = (e as { status?: number }).status;
         if (status === 404) {
-          toast("Session not found", "error");
-          router.push("/");
+          // Brand-new session not yet checkpointed — skip toast/redirect if streaming
+          const current = useSessionStore.getState().active;
+          if (current?.status !== "streaming") {
+            toast("Session not found", "error");
+            router.push("/");
+          }
         } else if (status === 401) {
           toast("API key required — check settings above", "error");
         }

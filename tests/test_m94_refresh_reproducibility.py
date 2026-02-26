@@ -97,6 +97,7 @@ def test_canonical_reference_file_is_non_empty():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_dry_run_nodes_exits_zero():
     """python -m flowise_dev_agent.knowledge.refresh --nodes --dry-run must exit 0."""
     result = subprocess.run(
@@ -112,6 +113,7 @@ def test_dry_run_nodes_exits_zero():
     )
 
 
+@pytest.mark.slow
 def test_dry_run_output_mentions_node_count():
     """Dry-run output should report how many schemas were parsed."""
     result = subprocess.run(
@@ -192,6 +194,7 @@ def test_missing_reference_error_contains_recovery_hint(capsys, caplog):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_dry_run_with_present_file_exits_zero():
     """refresh_nodes(dry_run=True) must return 0 when the canonical file exists."""
     exit_code = refresh_nodes(dry_run=True)
@@ -205,6 +208,7 @@ def test_dry_run_with_present_file_exits_zero():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_dry_run_does_not_write_snapshot(tmp_path):
     """Dry-run must not create or modify flowise_nodes.snapshot.json."""
     fake_snapshot = tmp_path / "flowise_nodes.snapshot.json"

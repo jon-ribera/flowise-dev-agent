@@ -25,9 +25,16 @@ import json
 import logging
 import os
 import pathlib
+import sys
 from contextlib import asynccontextmanager
 from typing import Literal
 from uuid import uuid4
+
+# Windows: psycopg async requires SelectorEventLoop (not the default ProactorEventLoop).
+# Set at module level so it applies regardless of how the server is started
+# (serve(), python -m uvicorn, etc.).
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.responses import FileResponse
@@ -528,10 +535,14 @@ async def _build_response(graph, config: dict, thread_id: str) -> SessionRespons
             total_output_tokens=out_tok,
         )
 
-    # No interrupts — graph finished.
-    # Guard: `not snapshot.next` is also True for an empty/uninitialised snapshot.
-    # Only treat as "completed" when the state actually has values.
-    if not snapshot.next and state:
+    # No interrupts — check if graph truly finished vs. just starting.
+    # `not snapshot.next` is True for three distinct cases:
+    #   1. Graph completed (done=True) — return "completed"
+    #   2. Empty/uninitialised snapshot (state falsy) — handled by caller's 404 guard
+    #   3. Graph between node scheduling during streaming (done=False) — treat as mid-run
+    # Use `done` flag as the authoritative completion signal (consistent with
+    # _session_is_done at line ~1316 which uses the same pattern).
+    if not snapshot.next and state and state.get("done"):
         return SessionResponse(
             thread_id=thread_id,
             status="completed",
@@ -1474,12 +1485,11 @@ async def serve_ui() -> FileResponse:
 
 def serve(host: str = "0.0.0.0", port: int = 8000, reload: bool = False) -> None:
     """Launch the FastAPI server via uvicorn."""
-    import sys
     import uvicorn
-    # Windows: psycopg async requires SelectorEventLoop (not the default ProactorEventLoop)
-    if sys.platform == "win32":
-        import asyncio
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Prevent stale .pyc bytecode cache (critical on Windows + uvicorn --reload).
+    # The Dockerfile sets this for containers, but local dev needs it too.
+    os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    sys.dont_write_bytecode = True
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(
         "flowise_dev_agent.api:app",

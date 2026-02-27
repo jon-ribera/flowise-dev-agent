@@ -10,7 +10,7 @@ The graph merges tools from all registered domains before calling each node,
 so the LLM sees all available tools from all domains simultaneously.
 
 Current domains:
-  FloviseDomain — wraps FlowiseClient (Cursorwise MCP, 50 tools)
+  FloviseDomain — wraps FlowiseClient (native MCP, 51 tools)
   PatternDomain — wraps PatternStore (pattern library search)
 
 Planned domains:
@@ -124,7 +124,7 @@ def merge_context(domains: list[DomainTools], phase: str) -> str:
 
 
 class FloviseDomain(DomainTools):
-    """Tool domain for the Flowise MCP (Cursorwise).
+    """Tool domain for the Flowise MCP (native).
 
     Wraps the FlowiseClient async methods as tool executors and declares
     ToolDef schemas for each phase.

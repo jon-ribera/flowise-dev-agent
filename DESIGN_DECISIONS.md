@@ -2968,3 +2968,143 @@ Legacy sessions (pre-anchor dictionary) still work via deprecated fuzzy fallback
 `flowise_dev_agent/agent/graph.py`, `flowise_dev_agent/agent/domains/workday.py`,
 `flowise_dev_agent/util/langsmith/metadata.py`, `tests/test_m103a_anchor_contract.py`
 (559 lines, 29 tests), `tests/test_patch_ir.py` (updated 7 call sites)
+
+## DD-099 — External MCP Server (Roadmap 10, M10.4)
+
+**Decision**: Expose all 51 FlowiseMCPTools methods as a standalone MCP server
+using the low-level `mcp.server.Server` with a single `call_tool` dispatcher
+driven by `TOOL_CATALOG`. Zero per-tool wrappers, zero schema duplication.
+
+**Problem**: External MCP clients (Cursor IDE, Claude Desktop) needed access to
+the 51 Flowise tools without the cursorwise PyPI dependency. A naive approach
+would write 51 `@mcp.tool()` wrapper functions — each passing arguments through
+unchanged — doubling the maintenance surface and duplicating schemas already
+defined in the registry.
+
+**Solution**:
+- **`TOOL_CATALOG`** (in `mcp/registry.py`): Module-level list of
+  `(method_name, ToolDef)` tuples. Single source of truth consumed by both
+  `register_flowise_mcp_tools()` (internal ToolRegistry) and the MCP server.
+- **`create_server(tools)`** (in `mcp/server.py`): Returns a `mcp.server.Server`
+  with two handlers:
+  - `@server.list_tools()`: Builds `mcp.types.Tool` objects from `TOOL_CATALOG`.
+  - `@server.call_tool()`: Dispatches by name via pre-computed `_DISPATCH` dict
+    → `getattr(tools, method_name)(**args)` → serializes `ToolResult` to JSON.
+- **`__main__.py`**: Entry point (`python -m flowise_dev_agent.mcp`) loads `.env`,
+  creates `FlowiseClient` + `FlowiseMCPTools`, runs stdio transport.
+- **SSE transport**: `NotImplementedError` until actually needed (YAGNI).
+
+**Architecture**:
+```
+TOOL_CATALOG (SSoT, 51 entries)
+    ├── ToolRegistry (internal agent) — register_flowise_mcp_tools()
+    └── MCP Server (external clients) — create_server() → list_tools + call_tool
+```
+
+**Anti-patterns avoided**:
+- No 51 wrapper functions (Anti-Pattern Zero: wrapper-on-wrapper).
+- No schema duplication — MCP server reads `ToolDef.parameters` directly.
+- No deprecated fallback paths — stdio only, SSE deferred.
+- Adding a tool = add method to `FlowiseMCPTools` + add entry to `TOOL_CATALOG`
+  (2 files, automatically available in both internal registry and MCP server).
+
+**Files**: `flowise_dev_agent/mcp/server.py` (new, ~60 lines),
+`flowise_dev_agent/mcp/__main__.py` (new, ~50 lines),
+`flowise_dev_agent/mcp/__init__.py` (updated re-exports),
+`flowise_dev_agent/mcp/README.md` (new, config docs),
+`tests/test_m104_mcp_server.py` (new, 9 tests). Test count: 556 passing.
+
+---
+
+## DD-100 — Repository Decoupling Strategy (Roadmap 10, M10.5)
+
+**Decision**: Formalize that `flowise-dev-agent` is now fully self-contained — no
+runtime dependency on `cursorwise`. The `cursorwise` repo becomes an optional,
+standalone alternative for users who only want Cursor IDE MCP access without
+the full agent platform.
+
+**Before (DD-023, pre-Roadmap 10)**:
+```
+flowise-dev-agent
+  └── pip depends on: cursorwise
+       └── FlowiseClient (52 async methods)
+       └── Settings
+       └── MCP Server (50 tools for Cursor IDE)
+                └── httpx → Flowise REST API
+```
+
+**After (M10.1–M10.4, DD-093–DD-099)**:
+```
+flowise-dev-agent  (this repo — self-contained)
+  ├── client/          FlowiseClient + Settings (internalized)
+  ├── mcp/tools.py     FlowiseMCPTools (51 methods → ToolResult)
+  ├── mcp/registry.py  TOOL_CATALOG (SSoT for all consumers)
+  ├── mcp/server.py    External MCP server (stdio)
+  └── mcp/__main__.py  python -m flowise_dev_agent.mcp
+           └── httpx → Flowise REST API
+
+cursorwise  (separate repo — standalone alternative)
+  ├── Can consume flowise-dev-agent's MCP server as upstream
+  ├── OR remain fully independent with its own FlowiseClient
+  └── No longer a dependency of flowise-dev-agent
+```
+
+**Principles**:
+- `flowise-dev-agent` is the canonical implementation of the Flowise MCP tool surface.
+  It defines `TOOL_CATALOG`, the `ToolResult` envelope, and the `ToolRegistry` wiring.
+- `cursorwise` is a lightweight standalone MCP server for users who want Cursor IDE
+  integration without the full agent (LangGraph, FastAPI, Postgres, LLM deps).
+- Neither repo depends on the other at runtime. They share no code — the
+  `FlowiseClient` was ported (DD-093), not linked.
+
+**Supersedes**: DD-023 (original repository separation), which established cursorwise
+as a pip dependency. That relationship is now reversed: flowise-dev-agent is the
+primary repo, cursorwise is optional.
+
+**Files**: `pyproject.toml` (no cursorwise entry), `README.md` (updated setup),
+`.mcp.json.example` (native server config).
+
+---
+
+## DD-101 — Future Flowise Native MCP Integration Path (Roadmap 10, M10.5)
+
+**Decision**: Document the transport swap path for when Flowise ships a native MCP
+server endpoint. The tool surface (`FlowiseMCPTools`, `TOOL_CATALOG`, `ToolRegistry`
+wiring) stays unchanged — only the underlying transport layer changes.
+
+**Today's architecture**:
+```
+FlowiseMCPTools (51 methods)
+  └── FlowiseClient (httpx REST)
+       └── Flowise REST API (localhost:3000/api/v1/*)
+```
+
+**Future architecture (when Flowise ships native MCP)**:
+```
+FlowiseMCPTools (51 methods)
+  └── mcp.ClientSession (MCP protocol)
+       └── Flowise MCP endpoint (localhost:3000/mcp)
+```
+
+**What gets replaced**:
+- `flowise_dev_agent/client/flowise_client.py` — the httpx REST wrapper becomes
+  unnecessary when Flowise exposes the same operations via MCP natively.
+- `flowise_dev_agent/client/config.py` — connection config changes from REST
+  endpoint to MCP endpoint URL.
+
+**What stays unchanged**:
+- `flowise_dev_agent/mcp/tools.py` — the 51 tool methods and `ToolResult` contract.
+- `flowise_dev_agent/mcp/registry.py` — `TOOL_CATALOG` and registration logic.
+- `flowise_dev_agent/mcp/server.py` — the external MCP server (may become redundant
+  if Flowise's native MCP replaces it, but the dispatch pattern stays valid).
+- `flowise_dev_agent/agent/graph.py` — all graph nodes call `execute_tool("flowise.*")`,
+  completely decoupled from the transport underneath.
+
+**This is correct because**: The abstraction boundary is at `FlowiseMCPTools`. Every
+consumer (graph nodes, ToolRegistry, MCP server) depends on the tool method signatures
+and `ToolResult` contract — never on `FlowiseClient` directly. Swapping the transport
+is a single-file change, not a system-wide refactor.
+
+**Status**: Future product item. No implementation until Flowise announces a native
+MCP server endpoint. Roadmap 10 establishes the tool surface so only transport swaps
+are needed later.

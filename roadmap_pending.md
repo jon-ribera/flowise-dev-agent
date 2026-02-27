@@ -7,7 +7,7 @@ Items in this file have **no corresponding Design Decision (DD)** in
 When an item is shipped, add a DD entry to DESIGN_DECISIONS.md and move the
 item to [roadmap_shipped.md](roadmap_shipped.md).
 
-Next available DD number: **DD-084**
+Next available DD number: **DD-102**
 
 ---
 
@@ -182,6 +182,33 @@ but not yet written.
 
 ---
 
+## roadmap10_native_mcp_platform.md — Future Transport Swap
+
+> Original file: `roadmap10_native_mcp_platform.md`
+> M10.1–M10.5 shipped (DD-093–DD-101). One future item remains.
+
+### M10-F: Flowise Native MCP Transport Swap (no DD)
+
+When Flowise ships a built-in MCP server endpoint, `FlowiseMCPTools` can swap
+its transport layer from REST (`FlowiseClient` / httpx) to native MCP
+(`mcp.ClientSession`).
+
+**What gets replaced:**
+- `flowise_dev_agent/client/flowise_client.py` — httpx REST calls replaced by
+  `mcp.ClientSession` calls to the Flowise MCP endpoint
+
+**What stays unchanged:**
+- `flowise_dev_agent/mcp/tools.py` — 51 tool methods (same `ToolResult` contract)
+- `flowise_dev_agent/mcp/registry.py` — `TOOL_CATALOG` (same ToolDef definitions)
+- `flowise_dev_agent/mcp/server.py` — external MCP server (same dispatch)
+- All graph wiring, knowledge layer, and persistence code
+
+**Prerequisite:** Flowise must ship a native MCP server endpoint with
+equivalent coverage to the REST API (chatflows, nodes, credentials, documents,
+predictions, etc.). See DD-101 for the full transport swap analysis.
+
+---
+
 ## Summary Table
 
 | Item | Source Roadmap | Prerequisite / Blocker |
@@ -196,6 +223,7 @@ but not yet written.
 | M5.2: Custom Tool JS template | `roadmap5_embedded_ux.md` | None |
 | M5.3: TypeScript INode scaffold | `roadmap5_embedded_ux.md` | None |
 | M5.4: Deployment guide | `roadmap5_embedded_ux.md` | None |
+| M10-F: Flowise native MCP transport swap | `roadmap10_native_mcp_platform.md` | Flowise ships native MCP endpoint |
 
 ---
 
@@ -206,7 +234,7 @@ When implementing any item above:
 1. Implement the feature.
 2. Write tests (regression: `pytest tests/ -q` must stay green).
 3. Add a DD entry in [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) using the
-   next available DD number (currently **DD-076**).
+   next available DD number (currently **DD-102**).
 4. Move the item from this file to [roadmap_shipped.md](roadmap_shipped.md)
    under the appropriate original roadmap section.
 5. Update the DD index table in `roadmap_shipped.md`.

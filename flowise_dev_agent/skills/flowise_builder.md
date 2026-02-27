@@ -12,7 +12,7 @@ version: 2.0.0
 # Flowise Builder Skill
 
 **Domain**: flowise
-**MCP Source**: cursorwise — 50 tools, full Flowise REST API
+**MCP Source**: native — 51 tools via `flowise_dev_agent.mcp`, full Flowise REST API
 
 > v2.0.0: Patch Context fully rewritten for Patch IR ops. The LLM no longer writes raw flowData.
 > The deterministic compiler (`compile_patch_ir` node) builds flowData from the ops you emit.

@@ -114,9 +114,9 @@ registered domains automatically.
 
 ## Relationship to the Orchestrator Guide
 
-The `FLOWISE_BUILDER_ORCHESTRATOR_CHATFLOW_MCP.md` guide in the `cursorwise` repo is the
-**Cursor IDE behavioral guide** — comprehensive reference for a human developer using the
-Cursorwise MCP directly in Cursor.
+The `Flowise_MCP_Builder_Guide.md` in the repo root is the **Cursor IDE behavioral
+guide** — comprehensive reference for a human developer using the Flowise MCP
+tools directly in Cursor or Claude Desktop.
 
 The `flowise_builder.md` skill file is the **agent's knowledge base** — structured,
 machine-injectable domain knowledge organized by phase.

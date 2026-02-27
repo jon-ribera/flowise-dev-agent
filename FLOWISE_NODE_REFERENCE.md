@@ -4,7 +4,7 @@
 **Total Nodes:** 303  
 **Categories:** 24
 
-This reference documents every node available in the Flowise instance, including required inputs, optional parameters, credential requirements, and base classes. Use this when programmatically building chatflows via the Cursorwise MCP.
+This reference documents every node available in the Flowise instance, including required inputs, optional parameters, credential requirements, and base classes. Use this when programmatically building chatflows via the Flowise MCP tools.
 
 ---
 

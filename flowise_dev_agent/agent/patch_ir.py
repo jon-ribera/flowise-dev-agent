@@ -261,43 +261,74 @@ def _validate_connect_anchors(
     anchor_store,
     warnings: list[str],
 ) -> None:
-    """Validate Connect anchor names against canonical anchor dictionaries.
+    """Validate Connect anchor names and type compatibility against canonical
+    anchor dictionaries.
 
-    Adds warnings (never errors) for unknown anchor names so the compiler can
-    still attempt fuzzy fallback. compatible_types are advisory only.
+    Adds warnings (never errors) for:
+    - Unknown anchor names (so the compiler can still attempt fuzzy fallback)
+    - Type-incompatible connections (source output types ∩ target input types = ∅)
     """
     # Source anchor validation
-    src_type = type_map.get(op.source_node_id)
-    if src_type is None:
+    src_node_type = type_map.get(op.source_node_id)
+    src_anchor_entry: dict[str, Any] | None = None
+    if src_node_type is None:
         warnings.append(
             f"ops[{op_idx}] Connect: no node_type mapping for source '{op.source_node_id}'"
         )
     else:
-        src_dict = anchor_store.get(src_type)
+        src_dict = anchor_store.get(src_node_type)
         if src_dict is not None:
-            output_names = [a["name"] for a in src_dict.get("output_anchors", [])]
+            output_anchors = src_dict.get("output_anchors", [])
+            output_names = [a["name"] for a in output_anchors]
             if op.source_anchor not in output_names:
                 warnings.append(
                     f"ops[{op_idx}] Connect: source_anchor '{op.source_anchor}' "
-                    f"not found in {src_type} output anchors. "
+                    f"not found in {src_node_type} output anchors. "
                     f"Valid options: {output_names}"
+                )
+            else:
+                src_anchor_entry = next(
+                    (a for a in output_anchors if a["name"] == op.source_anchor),
+                    None,
                 )
 
     # Target anchor validation
-    tgt_type = type_map.get(op.target_node_id)
-    if tgt_type is None:
+    tgt_node_type = type_map.get(op.target_node_id)
+    tgt_anchor_entry: dict[str, Any] | None = None
+    if tgt_node_type is None:
         warnings.append(
             f"ops[{op_idx}] Connect: no node_type mapping for target '{op.target_node_id}'"
         )
     else:
-        tgt_dict = anchor_store.get(tgt_type)
+        tgt_dict = anchor_store.get(tgt_node_type)
         if tgt_dict is not None:
-            input_names = [a["name"] for a in tgt_dict.get("input_anchors", [])]
+            input_anchors = tgt_dict.get("input_anchors", [])
+            input_names = [a["name"] for a in input_anchors]
             if op.target_anchor not in input_names:
                 warnings.append(
                     f"ops[{op_idx}] Connect: target_anchor '{op.target_anchor}' "
-                    f"not found in {tgt_type} input anchors. "
+                    f"not found in {tgt_node_type} input anchors. "
                     f"Valid options: {input_names}"
+                )
+            else:
+                tgt_anchor_entry = next(
+                    (a for a in input_anchors if a["name"] == op.target_anchor),
+                    None,
+                )
+
+    # Type compatibility check (M10.6 — DD-102)
+    if src_anchor_entry is not None and tgt_anchor_entry is not None:
+        src_type_str = src_anchor_entry.get("type", "")
+        tgt_type_str = tgt_anchor_entry.get("type", "")
+        if src_type_str and tgt_type_str:
+            src_types = {t.strip() for t in src_type_str.split("|") if t.strip()}
+            tgt_types = {t.strip() for t in tgt_type_str.split("|") if t.strip()}
+            if src_types and tgt_types and not src_types & tgt_types:
+                warnings.append(
+                    f"ops[{op_idx}] Connect: type mismatch — "
+                    f"{op.source_node_id}.{op.source_anchor} outputs "
+                    f"'{src_type_str}' but {op.target_node_id}.{op.target_anchor} "
+                    f"expects '{tgt_type_str}'"
                 )
 
 

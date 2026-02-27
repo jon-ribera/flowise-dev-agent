@@ -1,192 +1,222 @@
 # Flowise Dev Agent — Performance & Cost Analysis
 
-## Observed Token Costs (from `sessions.db`, February 2026)
+> Last updated: February 2026 (post-Roadmap 9)
 
-| Session | Description | Input tokens | Output tokens | Iterations | Est. cost |
-|---|---|---|---|---|---|
-| `bc7d31bd` | Disneyland planner (1st run) | 548,996 | 165,517 | 2 | **$4.13** |
-| `6bacdb1f` | Disneyland planner (2nd run) | 215,404 | 64,609 | 1 | **$1.62** |
+## Architecture Overview
 
-Pricing basis: Claude Sonnet at $3/MTok input + $15/MTok output.
+The agent runs on an **18-node LangGraph topology** (M9.6, DD-080) with per-phase
+token tracking, compact context enforcement, and LangSmith observability. The old
+monolithic `_react` loop and its quadratic context accumulation problem were fully
+eliminated in Roadmap 9.
 
-Both sessions failed to produce a working chatflow (chatflow_id was None) due to
-a separate bug (now fixed in `graph.py`). The cost data reflects accurate LLM usage
-regardless of session outcome.
+### Key Components
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| `ToolResult.summary` | `tools.py` (DD-048) | Only `.summary` reaches LLM context; `.data` goes to debug only |
+| `_summarize_flow_data()` | `graph.py` (M9.6) | Deterministic compact summary — full flowData never in prompts |
+| `PhaseMetrics` | `metrics.py` (DD-069) | Per-phase input/output token + timing capture |
+| `SessionSummary` | `api.py` | Cumulative token counts exposed via REST API |
+| Token budget evaluator | `langsmith/evaluators.py` (DD-087) | Per-phase budget enforcement via LangSmith |
+| State trifurcation | `state.py` (DD-050) | `messages` / `artifacts` / `debug` — clean separation |
 
 ---
 
-## Root Cause: Quadratic Context Accumulation
+## Context Management
 
-The `_react` loop in `flowise_dev_agent/agent/graph.py` sends `messages + new_msgs`
-to the API on every round:
+### ToolResult Envelope (DD-048)
 
-```python
-for round_num in range(max_rounds):
-    response = await engine.complete(
-        messages=messages + new_msgs,   # grows by ~2 messages per round
-        ...
-    )
+Every tool call returns a `ToolResult` with five fields. Only `.summary` is injected
+into the LLM message history via `result_to_str()`:
+
+```
+ToolResult(
+    ok=True,
+    summary="Chatflow 'My RAG Bot' (id=abc-123).",   # → LLM context
+    facts={"chatflow_id": "abc-123", ...},            # → state["facts"]
+    data={<full API response>},                       # → state["debug"] only
+    error=None,
+)
 ```
 
-`new_msgs` accumulates every assistant turn and every tool result. After N rounds,
-round N sends the full history of all prior tool results. This produces:
+The `_wrap_result()` function (single transformation point) applies 7 priority rules
+to normalize all tool outputs into compact summaries (200–300 char generation limits).
 
-**Total tokens = O(N² × avg_tool_result_size)**
+### Flow Data Summarization (M9.6)
 
-| Variable | Discover phase | Patch phase |
-|---|---|---|
-| max_rounds | 20 | 15 |
-| Typical tool calls | 10–15 | 5–8 |
-| Total rounds (inc. final text) | 11–16 | 6–9 |
-
-With avg_tool_result_size = 5,000 chars and 14 rounds:
-- Round 1: ~200 tokens
-- Round 14: ~200 + 26 × ~1,500 = ~39,000 tokens
-- **Total across all rounds: ~280,000 input tokens for discover alone**
-
----
-
-## Primary Cost Drivers (Ordered by Impact)
-
-### 1. `list_marketplace_templates` — 50,000–100,000 chars per call
-
-The raw marketplace response contains every Flowise template in full detail.
-`_list_marketplace_templates_slim` trims this to the most relevant fields, but
-even the slim version is large. Once this result lands in `new_msgs`, it
-accumulates in every subsequent round's context window.
-
-**Location**: `flowise_dev_agent/agent/tools.py` → `_list_marketplace_templates_slim`
-**Fix**: Cap `result_to_str` at 4,000 chars (see below)
-
-### 2. `get_chatflow` responses — 10,000–50,000 chars per call
-
-The discover phase instructs the LLM to call `get_chatflow` for any candidate
-existing chatflow. A complex chatflow's `flowData` JSON (all nodes, edges, params)
-can be 10–50k chars. Like the marketplace response, it accumulates in context.
-
-**Location**: `flowise_dev_agent/agent/tools.py` → `result_to_str`
-**Fix**: Cap `result_to_str` at 4,000 chars (see below)
-
-### 3. `_get_node_processed` `**schema` spread — ~2,000 extra chars per node
-
-`_get_node_processed` returns `{**schema, inputAnchors, inputParams, outputAnchors, outputs}`.
-The `**schema` spread includes fields that are **not needed for flowData construction**:
-- `inputs` — the raw inputs array, already replaced by `inputAnchors`/`inputParams`
-- `description` — long free-text description of the node
-- `category`, `icon`, `tags`, `badge`, `author`, `deprecated` — UI metadata
-
-With 8–14 `get_node` calls per discover, this adds ~20,000–40,000 extra chars
-to the accumulating context window.
-
-**Location**: `flowise_dev_agent/agent/tools.py` → `_get_node_processed` (line ~540)
-**Fix**: Remove `**schema` spread, explicitly select only needed fields
-
----
-
-## Proposed Fixes
-
-### Fix 1: `result_to_str` Truncation
-
-**File**: `flowise_dev_agent/agent/tools.py`
-**Change**: Add 4,000-char cap to `result_to_str`
+`_summarize_flow_data()` produces a compact dict from raw flowData JSON:
 
 ```python
-_MAX_TOOL_RESULT_CHARS = 4_000
-
-def result_to_str(result: Any) -> str:
-    if isinstance(result, str):
-        s = result
-    else:
-        try:
-            s = json.dumps(result, default=str)
-        except Exception:
-            s = str(result)
-    if len(s) > _MAX_TOOL_RESULT_CHARS:
-        omitted = len(s) - _MAX_TOOL_RESULT_CHARS
-        s = s[:_MAX_TOOL_RESULT_CHARS] + f"\n...[{omitted} chars truncated]"
-    return s
-```
-
-**Expected impact**: `list_marketplace_templates` (50–100k chars → 4k), `get_chatflow`
-(10–50k chars → 4k). This breaks the quadratic growth since per-round context
-delta stays bounded.
-
-### Fix 2: `_get_node_processed` Field Pruning
-
-**File**: `flowise_dev_agent/agent/tools.py`
-**Change**: Replace `{**schema, ...}` with explicit field selection
-
-```python
-_KEEP_PARAM_FIELDS = {"name", "type", "label", "id", "optional", "default", "list", "acceptVariable"}
-
-def _slim_param(entry: dict) -> dict:
-    return {k: v for k, v in entry.items() if k in _KEEP_PARAM_FIELDS}
-
-# In _get_node_processed return (replaces **schema spread):
-return {
-    "name": node_name,
-    "label": schema.get("label", node_name),
-    "version": schema.get("version"),
-    "baseClasses": base_classes,
-    "inputAnchors": [_slim_param(e) for e in input_anchors],
-    "inputParams": [_slim_param(e) for e in input_params],
-    "outputAnchors": output_anchors,
-    "outputs": {},
-    "_flowdata_note": ...,
+{
+    "node_count": 8,
+    "edge_count": 7,
+    "node_types": {"chatOpenAI": 1, "pdfFile": 1, ...},
+    "top_labels": ["ChatOpenAI_0", "PDF File_0", ...],
+    "key_tool_nodes": ["toolAgent_0"],
 }
 ```
 
-**Removed fields**: `inputs` (raw, replaced by inputAnchors/inputParams), `description`,
-`category`, `icon`, `tags`, `badge`, `author`, `deprecated`. None of these are
-referenced in flowData construction logic.
+This is used in UPDATE-mode prompts. The raw flowData (10–50k chars) is stored in
+`artifacts["flowise"]["current_flow_data"]` and never injected into LLM context.
+A SHA-256 hash (`facts["flowise"]["current_flow_hash"]`) provides identity checks.
 
-**Expected impact**: Each `get_node` response shrinks from ~3–5k to ~1–2k chars.
-With 8–14 calls per discover, saves ~14–56k chars from the accumulated context.
+### State Trifurcation (DD-050)
 
----
+| Bucket | Content | LLM-visible? |
+|--------|---------|---------------|
+| `messages` | Conversation turns + tool summaries | Yes |
+| `artifacts` | Raw flowData, full API responses | No |
+| `facts` | Scalar metadata (IDs, hashes, counts) | Selectively (via prompts) |
+| `debug` | Phase metrics, pattern metrics, raw data | No |
 
-## Expected Savings After Both Fixes
+### Compact-Context Invariants (M9.8, DD-083)
 
-| Metric | Current | After fixes | Reduction |
-|---|---|---|---|
-| `list_marketplace_templates` response | ~60k chars | ~4k chars | 93% |
-| `get_chatflow` response (discover) | ~30k chars | ~4k chars | 87% |
-| `get_node` response | ~4k chars | ~2k chars | 50% |
-| Input tokens / session (estimate) | 215k–549k | 60k–150k | ~70% |
-| Cost / session (estimate) | $1.62–$4.13 | $0.50–$1.20 | ~70% |
+Seven regression tests enforce these rules:
 
----
-
-## Additional Opportunities (Lower Priority)
-
-### 3. Periodic Context Summarization in `_react`
-
-After every 5 rounds, summarize `new_msgs` into a compact summary message and
-replace the accumulated messages with the summary. Reduces quadratic growth to
-linear but requires a summarization LLM call per checkpoint.
-
-**Complexity**: Medium. Requires careful summary prompt and validation that
-important tool results (chatflow IDs, credential IDs) are preserved.
-
-### 4. Trim `discovery_summary` Before Patch Context
-
-The discover summary (5–10k tokens) is passed verbatim to patch as context.
-Truncating to ~2k chars at the start of the patch node would save ~50–100k
-tokens across all patch rounds. Low risk since the approved plan already
-captures the key constraints.
-
-**Location**: `flowise_dev_agent/agent/graph.py` → `_make_patch_node`, `ctx` construction
-
-### 5. Caching Already in ROADMAP2 (DD-035)
-
-`list_marketplace_templates` and `list_nodes` are called fresh on every session.
-A TTL cache (already designed in ROADMAP2 as DD-035) would eliminate these calls
-entirely for repeat sessions within the cache window.
+1. Raw `current_flow_data` never appears in plan/patch prompts
+2. `flow_summary` (compact dict) is used instead — verified <10% of raw size
+3. `ToolResult.data` never reaches message history
+4. `hydrate_context` injects only scalar metadata, not raw schemas
+5. Debug values never appear in `state["messages"]`
+6. `current_flow_data` stored in artifacts, not facts
+7. `summarize_current_flow` output always <2000 chars
 
 ---
 
-## Next Design Decision Number
+## Token Tracking
 
-The next available DD number after the fixes above: **DD-041**
+### Per-Phase Metrics (DD-069)
 
-Suggested: `DD-041 — Tool Result Truncation and Node Schema Pruning`
+Each graph phase captures token usage via `MetricsCollector`:
+
+```python
+async with MetricsCollector("discover") as m:
+    response = await engine.complete(...)
+    m.input_tokens = response.input_tokens
+    m.output_tokens = response.output_tokens
+```
+
+Results accumulate in `state["debug"]["flowise"]["phase_metrics"]` as a list of dicts,
+each containing: `phase`, `start_ts`, `end_ts`, `duration_ms`, `input_tokens`,
+`output_tokens`, `tool_call_count`, `cache_hits`, `repair_events`.
+
+### Per-Phase Token Budgets
+
+The LangSmith `token_budget` evaluator enforces these per-phase limits:
+
+| Phase | Budget (tokens) |
+|-------|-----------------|
+| `discover` | 15,000 |
+| `plan` | 8,000 |
+| `patch` | 20,000 |
+| `test` | 10,000 |
+| `evaluate` | 5,000 |
+| `converge` | 5,000 |
+| Unknown phase | 25,000 (default) |
+
+Score = `1.0 - (violations / total_phases)`, clipped to [0.0, 1.0].
+
+### Session-Level Tracking
+
+`SessionSummary` (REST API) exposes cumulative per-session data:
+
+| Field | Description |
+|-------|-------------|
+| `total_input_tokens` | Cumulative LLM prompt tokens |
+| `total_output_tokens` | Cumulative LLM completion tokens |
+| `total_repair_events` | Schema/credential repair API fallbacks |
+| `total_phases_timed` | Number of phases with captured timing |
+| `phase_durations_ms` | Per-phase wall-clock durations |
+| `schema_fingerprint` | Current NodeSchemaStore snapshot fingerprint |
+| `drift_detected` | True when schema fingerprint changed vs prior iteration |
+| `pattern_metrics` | Pattern usage metrics from last patch iteration |
+
+---
+
+## Knowledge Layer Cost Savings
+
+### Local-First Lookups (Roadmap 6, DD-062–DD-064)
+
+| Store | Lookup Cost | API Fallback |
+|-------|-------------|--------------|
+| `NodeSchemaStore` | O(1) from snapshot | Repair-only (single node fetch) |
+| `TemplateStore` | Keyword search across local snapshot | Only when stale (TTL-gated) |
+| `CredentialStore` | O(1) by id/name/type | `resolve_or_repair()` async fallback |
+
+These replaced the old pattern of calling `list_nodes`, `list_marketplace_templates`,
+and `list_credentials` from the LLM via tool calls, which generated 50–100k char
+responses per call.
+
+### Anchor Dictionary (Roadmap 10, DD-095–DD-096)
+
+`AnchorDictionaryStore` provides a derived view of `NodeSchemaStore` for the Patch IR
+compiler. Anchor resolution uses exact-match (Pass 1) with deprecated fuzzy fallback
+(Pass 2), tracked via `CompileResult.anchor_metrics`.
+
+---
+
+## LangSmith Observability (DD-084–DD-088)
+
+| Evaluator | Score Basis |
+|-----------|-------------|
+| `compile_success` | 1.0 if chatflow_id present, else 0.0 |
+| `intent_confidence` | Raw confidence float from discover phase |
+| `iteration_efficiency` | 1.0 if converged in 1 iteration, penalty per extra |
+| `token_budget` | Fraction of phases within their token budget |
+| `plan_quality` | Heuristic from plan structure and specificity |
+
+All session runs are auto-routed to the `agent-review-queue` annotation queue.
+Redaction (DD-084) strips API keys, DSN strings, and credential values from traces.
+
+---
+
+## Historical Comparison
+
+### Pre-Roadmap 7 (Early February 2026)
+
+The original architecture used a monolithic `_react` loop that accumulated tool
+results in `new_msgs` across rounds, producing **O(N^2 x avg_tool_result_size)**
+token growth:
+
+| Session | Input Tokens | Output Tokens | Cost |
+|---------|-------------|---------------|------|
+| `bc7d31bd` (Disneyland planner, 1st) | 548,996 | 165,517 | $4.13 |
+| `6bacdb1f` (Disneyland planner, 2nd) | 215,404 | 64,609 | $1.62 |
+
+Pricing: Claude Sonnet at $3/MTok input + $15/MTok output.
+
+### Root Causes (All Resolved)
+
+| Problem | Tokens Wasted | Fix | DD |
+|---------|---------------|-----|-----|
+| Quadratic `_react` loop | 200k–400k/session | 18-node LangGraph topology | DD-080 |
+| `list_marketplace_templates` raw (50–100k chars) | 50k+/call | `ToolResult.summary` + `TemplateStore` | DD-048, DD-063 |
+| `get_chatflow` raw JSON in context | 10–50k/call | `_summarize_flow_data()` compact dict | DD-080 |
+| `_get_node_processed` `**schema` spread | 20–40k/session | `NodeSchemaStore` field selection | DD-062 |
+| No token tracking | N/A | `PhaseMetrics` + LangSmith evaluators | DD-069, DD-087 |
+
+---
+
+## Remaining Opportunities
+
+### 1. Live Session Benchmarks
+
+The historical data predates all fixes. We need fresh benchmarks from the current
+18-node topology to establish a new baseline. Key metrics to capture:
+
+- Per-phase token usage (from `PhaseMetrics`)
+- Total session cost for CREATE vs UPDATE flows
+- Token budget violation rate across sessions
+
+### 2. Prompt Compression
+
+Individual phase prompts (system + user) could be audited for redundancy. The
+compact-context invariants (M9.8) ensure no raw data leaks, but the prompt text
+itself may contain verbose instructions that could be tightened.
+
+### 3. LLM Call Caching
+
+Identical schema lookups across sessions could leverage LLM-level prompt caching
+(Anthropic prompt caching / OpenAI cached completions) for repeated system prompts.
+The `schema_fingerprint` + `drift_detected` fields (M9.7) provide the staleness
+signal needed to invalidate caches safely.

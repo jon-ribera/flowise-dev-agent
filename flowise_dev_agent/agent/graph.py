@@ -39,6 +39,7 @@ See DESIGN_DECISIONS.md — DD-007 through DD-010.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import json
 import logging
@@ -1416,8 +1417,11 @@ ANCHOR RESOLUTION RULES:
 - The canonical anchor name is the "name" field from the anchor dictionary entry.
 - Anchor dictionaries for node types in this flow are prefetched and available in context below.
   If you need the dictionary for a node type not shown, call get_anchor_dictionary(node_type).
-- compatible_types in anchor dictionaries are ADVISORY only — they hint at what can connect,
-  but the compiler resolves actual handle IDs from the canonical name.
+- Check compatible_types in anchor dictionaries before emitting Connect ops.
+   The source node's output type MUST overlap with the target anchor's expected type.
+   The validator REJECTS type-mismatched edges (e.g., a node outputting "string|json"
+   CANNOT connect to an anchor expecting "Tool"). Use the type info shown in
+   parentheses in the prefetched anchor dictionaries above.
 
 OUTPUT: A single JSON array only, nothing else.
 """
@@ -1547,7 +1551,8 @@ def _repair_schema_local_sync(
     repaired: list[str] = []
     for node_type in missing_node_types:
         # Check if the store already has this type in its index
-        schema = node_store._index.get(node_type) if hasattr(node_store, "_index") else None
+        # M10.7: use get() which includes case-insensitive fallback (DD-103)
+        schema = node_store.get(node_type) if hasattr(node_store, "get") else None
         if schema:
             repaired.append(node_type)
             logger.debug("[repair_schema] '%s' found in local index — no API call needed", node_type)
@@ -2232,8 +2237,22 @@ def _make_compile_patch_ir_node(
             logger.warning("[COMPILE_PATCH_IR] ops parse failed: %s", e)
 
         if not ir_errors:
-            # Validate (without a base graph context here; full validation in compile_flow_data)
-            ir_errors, _ir_warnings = validate_patch_ops(ops)
+            # Build node_type_map from AddNode ops for anchor validation
+            _node_type_map: dict[str, str] = {
+                o.node_id: o.node_name
+                for o in ops
+                if isinstance(o, AddNode) and o.node_id and o.node_name
+            }
+            ir_errors, _ir_warnings = validate_patch_ops(
+                ops,
+                anchor_store=_anchor_store,
+                node_type_map=_node_type_map,
+            )
+            if _ir_warnings:
+                logger.warning(
+                    "[COMPILE_PATCH_IR] IR warnings (%d): %s",
+                    len(_ir_warnings), _ir_warnings[:3],
+                )
 
         logger.info(
             "[COMPILE_PATCH_IR] ops=%d ir_errors=%d",
@@ -2457,12 +2476,53 @@ def _make_compile_flow_data_node(
 # ---------------------------------------------------------------------------
 
 
-def _make_validate_node():
+def _schema_mismatch_feedback(
+    missing_types: list[str],
+    known_node_names: list[str],
+    report: str,
+) -> str:
+    """Build developer_feedback for schema_mismatch with 'did you mean?' suggestions.
+
+    M10.7 (DD-103): Uses case-insensitive + difflib fuzzy matching against
+    NodeSchemaStore keys to suggest corrections for misspelled node types.
+    """
+    lines = [
+        "The previous plan used node type names that do not exist in the Flowise schema.  "
+        "Node type names are camelCase (e.g. 'bufferMemory', not 'BufferMemory').  "
+        "Please revise the plan using the EXACT node type names from the schema.\n",
+    ]
+    # Build lowercase → canonical map for efficient matching
+    lower_to_canonical = {n.lower(): n for n in known_node_names}
+    lower_names = list(lower_to_canonical.keys())
+
+    for mt in missing_types:
+        matches = difflib.get_close_matches(mt.lower(), lower_names, n=3, cutoff=0.6)
+        suggestions = [lower_to_canonical[m] for m in matches]
+        if suggestions:
+            lines.append(f"  - '{mt}' not found. Did you mean: {', '.join(repr(s) for s in suggestions)}?")
+        else:
+            lines.append(f"  - '{mt}' not found in schema.")
+
+    lines.append(f"\n{report}")
+    return "\n".join(lines)
+
+
+def _make_validate_node(
+    known_node_names: list[str] | None = None,
+):
     """Factory: validate node (deterministic).
 
     Validates artifacts["flowise"]["proposed_flow_data"] using _validate_flow_data.
     Classifies failure type for routing decisions.
+
+    Parameters
+    ----------
+    known_node_names:
+        All canonical node type names from NodeSchemaStore._index.keys().
+        Used by M10.7 (DD-103) to generate 'did you mean?' suggestions
+        when schema_mismatch is detected.
     """
+    _known_names = known_node_names or []
     async def validate(state: AgentState) -> dict:
         logger.info("[VALIDATE] running structural validation on proposed flow")
 
@@ -2542,6 +2602,11 @@ def _make_validate_node():
                     "Please revise the plan to fix the following issues:\n\n"
                     + report
                 )
+            elif failure_type == "schema_mismatch" and missing_types:
+                # M10.7 (DD-103): suggest close matches for misspelled node types
+                result["developer_feedback"] = _schema_mismatch_feedback(
+                    missing_types, _known_names, report,
+                )
             return result
 
         # Structural validation of the flow data
@@ -2576,6 +2641,7 @@ def _make_validate_node():
             # Classify failure type
             missing_types = []
             failure_type = "structural"
+            has_type_mismatch = False
             for err in errors:
                 if "no schema" in err.lower() or "unknown node type" in err.lower():
                     failure_type = "schema_mismatch"
@@ -2583,6 +2649,13 @@ def _make_validate_node():
                     m = _re.search(r"'([^']+)'", err)
                     if m:
                         missing_types.append(m.group(1))
+                elif "type mismatch" in err.lower():
+                    has_type_mismatch = True
+
+            # M10.6: type_mismatch takes precedence over structural
+            # (schema_mismatch still takes precedence — it needs repair first)
+            if has_type_mismatch and failure_type != "schema_mismatch":
+                failure_type = "type_mismatch"
 
             report = "Validation errors:\n" + "\n".join(errors[:10])
             logger.info(
@@ -2594,7 +2667,7 @@ def _make_validate_node():
             existing_retries = (
                 (existing_facts.get("validation") or {}).get("structural_retries", 0)
             )
-            result = {
+            result: dict = {
                 "facts": {
                     "validation": {
                         "ok": False,
@@ -2613,6 +2686,18 @@ def _make_validate_node():
                     "The previous plan produced structural validation errors.  "
                     "Please revise the plan to fix the following issues:\n\n"
                     + report
+                )
+            elif failure_type == "type_mismatch":
+                result["facts"]["validation"]["structural_retries"] = existing_retries + 1
+                result["developer_feedback"] = (
+                    "The previous plan produced type-incompatible connections.  "
+                    "Revise to use compatible node types:\n\n"
+                    + report
+                )
+            elif failure_type == "schema_mismatch" and missing_types:
+                # M10.7 (DD-103): suggest close matches for misspelled node types
+                result["developer_feedback"] = _schema_mismatch_feedback(
+                    missing_types, _known_names, report,
                 )
             return result
 
@@ -3087,6 +3172,7 @@ def _route_after_validate(state: AgentState) -> str:
     ok              → preflight_validate_patch
     schema_mismatch → repair_schema (if budget allows)
     structural      → plan_v2  (re-plan with compile error feedback)
+    type_mismatch   → plan_v2  (re-plan with type compatibility feedback)
     other/budget    → hitl_plan_v2  (escalate — user sees errors)
     """
     facts = state.get("facts") or {}
@@ -3108,6 +3194,11 @@ def _route_after_validate(state: AgentState) -> str:
     # already set developer_feedback).  The LLM re-plans → user approves at
     # hitl_plan_v2 → define_patch_scope → compile → validate again.
     if failure_type == "structural":
+        return "plan_v2"
+
+    # M10.6: Type-incompatible connections → re-plan with type feedback.
+    # Same flow as structural: plan_v2 → hitl_plan_v2 → compile → validate.
+    if failure_type == "type_mismatch":
         return "plan_v2"
 
     # Other failure or budget exceeded → escalate to HITL plan review
@@ -3364,7 +3455,17 @@ def _build_graph_v2(
     builder.add_node("compile_flow_data",  _w2("compile_flow_data",  _make_compile_flow_data_node(capabilities, executor=_mcp_executor)))
 
     # ---- Phase E ----
-    builder.add_node("validate",      _w2("validate",      _make_validate_node()))
+    # M10.7: pass known node names for 'did you mean?' suggestions (DD-103)
+    _known_node_names: list[str] = []
+    if capabilities:
+        for _cap in capabilities:
+            if _cap.name == "flowise" and hasattr(_cap, "knowledge"):
+                _ns = getattr(_cap.knowledge, "node_schemas", None)
+                if _ns and hasattr(_ns, "_index"):
+                    _ns._load()
+                    _known_node_names = list(_ns._index.keys())
+                break
+    builder.add_node("validate",      _w2("validate",      _make_validate_node(known_node_names=_known_node_names)))
     builder.add_node("repair_schema", _w2("repair_schema", _make_repair_schema_node(capabilities, executor=_mcp_executor)))
 
     # ---- Phase F ----

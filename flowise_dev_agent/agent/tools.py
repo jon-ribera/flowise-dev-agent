@@ -571,6 +571,7 @@ def _validate_flow_data(flow_data_str: str) -> dict:
     2. Every node has: data.inputAnchors, data.inputParams, data.outputAnchors, data.outputs
     3. Every edge's source/target references an existing node ID
     4. Every edge's sourceHandle/targetHandle references an existing anchor ID
+    5. Every edge's source output type overlaps with target input type (M10.6)
 
     Returns {"valid": True, "node_count": N, "edge_count": M} on success.
     Returns {"valid": False, "errors": [str]} listing all problems found.
@@ -590,6 +591,8 @@ def _validate_flow_data(flow_data_str: str) -> dict:
 
     node_ids: set[str] = set()
     anchor_ids: set[str] = set()
+    # M10.6: anchor_id → type string for type compatibility checking
+    anchor_types: dict[str, str] = {}
 
     for node in nodes:
         nid = node.get("id", "?")
@@ -599,15 +602,21 @@ def _validate_flow_data(flow_data_str: str) -> dict:
             if required_key not in data:
                 errors.append(f"Node '{nid}': missing data.{required_key}")
         for anchor in data.get("inputAnchors", []):
-            if "id" in anchor:
-                anchor_ids.add(anchor["id"])
+            aid = anchor.get("id", "")
+            if aid:
+                anchor_ids.add(aid)
+                anchor_types[aid] = anchor.get("type", "")
         for anchor in data.get("outputAnchors", []):
-            if "id" in anchor:
-                anchor_ids.add(anchor["id"])
+            aid = anchor.get("id", "")
+            if aid:
+                anchor_ids.add(aid)
+                anchor_types[aid] = anchor.get("type", "")
             # Multi-output nodes use type="options" — IDs are nested inside options[]
             for opt in anchor.get("options", []):
-                if "id" in opt:
-                    anchor_ids.add(opt["id"])
+                oid = opt.get("id", "")
+                if oid:
+                    anchor_ids.add(oid)
+                    anchor_types[oid] = opt.get("type", "")
 
     for edge in edges:
         src = edge.get("source")
@@ -616,12 +625,25 @@ def _validate_flow_data(flow_data_str: str) -> dict:
             errors.append(f"Edge: source '{src}' not found in nodes")
         if tgt not in node_ids:
             errors.append(f"Edge: target '{tgt}' not found in nodes")
-        sh = edge.get("sourceHandle")
-        th = edge.get("targetHandle")
+        sh = edge.get("sourceHandle", "")
+        th = edge.get("targetHandle", "")
         if sh and sh not in anchor_ids:
             errors.append(f"Edge: sourceHandle '{sh}' not in any node's outputAnchors")
         if th and th not in anchor_ids:
             errors.append(f"Edge: targetHandle '{th}' not in any node's inputAnchors")
+
+        # M10.6: Type compatibility check (DD-102)
+        src_type_str = anchor_types.get(sh, "")
+        tgt_type_str = anchor_types.get(th, "")
+        if src_type_str and tgt_type_str:
+            src_types = {t.strip() for t in src_type_str.split("|") if t.strip()}
+            tgt_types = {t.strip() for t in tgt_type_str.split("|") if t.strip()}
+            if src_types and tgt_types and not src_types & tgt_types:
+                errors.append(
+                    f"Edge {src}\u2192{tgt}: type mismatch \u2014 "
+                    f"source outputs '{src_type_str}' "
+                    f"but target expects '{tgt_type_str}'"
+                )
 
     if errors:
         return {"valid": False, "errors": errors}

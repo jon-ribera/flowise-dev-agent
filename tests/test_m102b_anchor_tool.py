@@ -239,7 +239,8 @@ class TestPatchIRPrompt:
         assert "canonical anchor NAMES" in prompt
         assert "do NOT use" in prompt.lower() or "NOT type names" in prompt
         assert "compatible_types" in prompt
-        assert "ADVISORY" in prompt.upper() or "advisory" in prompt.lower()
+        # M10.6: reframed from "advisory" to "REJECTS type-mismatched edges"
+        assert "REJECTS" in prompt or "rejects" in prompt.lower()
         assert "get_anchor_dictionary" in prompt
 
     def test_target_anchor_rule_updated(self):

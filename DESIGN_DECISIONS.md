@@ -3108,3 +3108,104 @@ is a single-file change, not a system-wide refactor.
 **Status**: Future product item. No implementation until Flowise announces a native
 MCP server endpoint. Roadmap 10 establishes the tool surface so only transport swaps
 are needed later.
+
+---
+
+### DD-102: Anchor Type Compatibility Validation (M10.6)
+
+**Date**: 2026-02-26
+**Milestone**: M10.6
+
+**Problem**: The compiler resolves anchor names to handle IDs but never checks
+whether the source output type is compatible with the target input type. Session
+`7978c2fb` produced a chatflow with a `cheerioWebScraper` (output `string|json`)
+connected to `toolAgent.tools` (expects `Tool`). This type mismatch caused a
+white-screen crash in the Flowise UI.
+
+**Decision**: Add type compatibility checking across three layers:
+
+1. **Layer 1 — Prompt (preventive)**: Update `_COMPILE_PATCH_IR_V2_SYSTEM` to
+   instruct the LLM to check `compatible_types` before emitting Connect ops.
+   Reframed from "advisory only" to "validator REJECTS type-mismatched edges."
+
+2. **Layer 2 — IR Validation (advisory warnings)**: Enhance
+   `_validate_connect_anchors()` in `patch_ir.py` to check type overlap using
+   anchor dictionary data. Returns warnings (not errors) for early detection.
+   Wire `anchor_store` + `node_type_map` into the `validate_patch_ops()` call
+   in `compile_patch_ir` node.
+
+3. **Layer 3 — Flow Data Validation (blocking gate)**: Enhance
+   `_validate_flow_data()` in `tools.py` to check type overlap using compiled
+   node anchor data. Returns errors (blocking). New `type_mismatch` failure type
+   in `_make_validate_node()` routes back to `plan_v2` with developer feedback.
+
+**Type compatibility rule**: For each edge, parse source output type and target
+input type as pipe-separated sets. If both non-empty and intersection is empty →
+type mismatch.
+
+**Why three layers**: Layer 1 prevents the LLM from generating bad ops. Layer 2
+catches it before compilation (saves compute, early observability). Layer 3
+catches it definitively before the write. The iteration loop (evaluate → plan_v2
+→ ... → validate) re-applies all layers automatically.
+
+**What stays unchanged**:
+- `AnchorDictionaryStore.compatible_types` — stays as LLM context data
+- Refresh pipeline (`knowledge/refresh.py`) — no new snapshots or CLI flags
+- `_resolve_anchor_id()` in `compiler.py` — stays name-only resolution
+- `compile_patch_ops()` — stays deterministic compilation, no validation
+- Graph topology — no new nodes
+
+**Files modified**:
+- `flowise_dev_agent/agent/graph.py` — prompt, IR wiring, validate node, routing
+- `flowise_dev_agent/agent/patch_ir.py` — `_validate_connect_anchors()` type check
+- `flowise_dev_agent/agent/tools.py` — `_validate_flow_data()` type check
+
+---
+
+### DD-103: Node Name Normalization — Case-Insensitive Lookup + Schema Mismatch Feedback (M10.7)
+
+**Date**: 2026-02-27
+**Milestone**: M10.7
+
+**Problem**: The LLM emits PascalCase node type names (e.g. `BufferMemory`) when the
+Flowise schema uses camelCase (e.g. `bufferMemory`). All lookups in `NodeSchemaStore`,
+`schema_cache`, and `_repair_schema_local_sync()` are case-sensitive exact-match.
+The result is a `schema_mismatch` → repair (0 recovered) → re-plan loop that never
+self-corrects because: (1) repair can't find the type, and (2) no `developer_feedback`
+is generated for `schema_mismatch` failures — the LLM is blind to the error.
+
+**Root cause**: The LLM sees PascalCase names in `baseClasses` fields of the schema
+(e.g. `["BufferMemory", "BaseChatMemory"]`) alongside camelCase node type names, and
+confuses them. `CredentialStore` already has case-insensitive resolve via `.lower()`
+keys, but `NodeSchemaStore` does not.
+
+**Decision**: Two complementary fixes:
+
+1. **Case-insensitive index in `NodeSchemaStore`**: Add `_lower_index: dict[str, str]`
+   mapping `lowered_name → canonical_name`, built alongside `_index` during `_load()`.
+   Both `get()` and `get_or_repair()` try exact match first, then fall back to
+   `_lower_index`. Matches the pattern already established by `CredentialStore`.
+   Also update `_repair_schema_local_sync()` in `graph.py` to use `store.get()`
+   (which includes the fallback) instead of raw `_index.get()`.
+
+2. **Developer feedback for `schema_mismatch`**: When the validate node detects
+   `schema_mismatch`, generate `developer_feedback` with:
+   - Explicit instruction that node names are camelCase
+   - "Did you mean?" suggestions via `difflib.get_close_matches()` against all known
+     node type names from `NodeSchemaStore._index.keys()`
+   - The original compilation/validation error report
+
+   `_make_validate_node()` now accepts `known_node_names: list[str]` (injected from
+   `NodeSchemaStore._index.keys()` at graph build time). Both the compile_errors path
+   and the validation_errors path generate feedback for `schema_mismatch`.
+
+**What stays unchanged**:
+- `NodeSchemaStore._index` — still keyed by canonical camelCase names
+- Snapshot format (`schemas/flowise_nodes.snapshot.json`) — no changes
+- Refresh pipeline — no new CLI flags or snapshot files
+- `compile_patch_ops()` in `compiler.py` — unchanged
+- `AnchorDictionaryStore` — unchanged
+
+**Files modified**:
+- `flowise_dev_agent/knowledge/provider.py` — `_lower_index`, `get()` fallback, `get_or_repair()` fallback
+- `flowise_dev_agent/agent/graph.py` — `_schema_mismatch_feedback()`, `_make_validate_node()` params, `_repair_schema_local_sync()`, graph build wiring

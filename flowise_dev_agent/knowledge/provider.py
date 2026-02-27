@@ -193,6 +193,8 @@ class NodeSchemaStore:
         self._meta_path = meta_path
         # node_type → processed schema dict (camelCase keys, matching schema_cache format)
         self._index: dict[str, dict] = {}
+        # M10.7: lowered node_type → canonical node_type (case-insensitive fallback)
+        self._lower_index: dict[str, str] = {}
         self._repair_events: list[dict[str, Any]] = []
         self._loaded = False
         # M8.2: total get_or_repair calls this session (cache hits + misses)
@@ -236,6 +238,7 @@ class NodeSchemaStore:
                 key = node.get("node_type") or node.get("name")
                 if key:
                     self._index[key] = node
+                    self._lower_index[key.lower()] = key
 
             logger.info(
                 "[NodeSchemaStore] Loaded %d node schemas from snapshot (no API calls needed)",
@@ -267,6 +270,7 @@ class NodeSchemaStore:
     def get(self, node_type: str) -> dict | None:
         """Return the processed schema for node_type from snapshot, or None.
 
+        Uses exact match first, then case-insensitive fallback (M10.7 — DD-103).
         This is the fast, synchronous, no-network path. If None is returned,
         callers SHOULD use get_or_repair() to trigger a targeted API fetch.
         """
@@ -274,7 +278,16 @@ class NodeSchemaStore:
         schema = self._index.get(node_type)
         if schema is not None:
             logger.debug("[NodeSchemaStore] Cache HIT: %s — no API call", node_type)
-        return schema
+            return schema
+        # M10.7: case-insensitive fallback
+        canonical = self._lower_index.get(node_type.lower())
+        if canonical is not None:
+            logger.info(
+                "[NodeSchemaStore] Case-insensitive match: '%s' → '%s'",
+                node_type, canonical,
+            )
+            return self._index.get(canonical)
+        return None
 
     async def get_or_repair(
         self,
@@ -304,8 +317,16 @@ class NodeSchemaStore:
         self._load()
         self._call_count += 1  # M8.2: count every call (hits + misses)
 
-        # --- Fast path: local snapshot hit ---
+        # --- Fast path: local snapshot hit (exact, then case-insensitive) ---
         local = self._index.get(node_type)
+        if local is None:
+            canonical = self._lower_index.get(node_type.lower())
+            if canonical is not None:
+                local = self._index.get(canonical)
+                logger.info(
+                    "[NodeSchemaStore] Case-insensitive match: '%s' → '%s'",
+                    node_type, canonical,
+                )
         if local is not None:
             logger.debug(
                 "[NodeSchemaStore] Cache HIT: %s — skipping API get_node call", node_type

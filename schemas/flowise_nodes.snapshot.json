@@ -3439,97 +3439,203 @@
     ]
   },
   {
-    "node_type": "chatAnthropic",
-    "name": "chatAnthropic",
+    "loadMethods": {},
     "label": "ChatAnthropic",
+    "name": "chatAnthropic",
+    "version": 8,
+    "type": "ChatAnthropic",
+    "icon": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/chatmodels/ChatAnthropic/Anthropic.svg",
     "category": "Chat Models",
+    "description": "Wrapper around ChatAnthropic large language models that use the Chat endpoint",
+    "baseClasses": [
+      "ChatAnthropic",
+      "ChatAnthropicMessages",
+      "BaseChatModel",
+      "BaseLanguageModel",
+      "Runnable"
+    ],
+    "credential": {
+      "label": "Connect Credential",
+      "name": "credential",
+      "type": "credential",
+      "credentialNames": [
+        "anthropicApi"
+      ]
+    },
+    "inputs": [
+      {
+        "label": "Cache",
+        "name": "cache",
+        "type": "BaseCache",
+        "optional": true
+      },
+      {
+        "label": "Model Name",
+        "name": "modelName",
+        "type": "asyncOptions",
+        "loadMethod": "listModels",
+        "default": "claude-3-haiku"
+      },
+      {
+        "label": "Temperature",
+        "name": "temperature",
+        "type": "number",
+        "step": 0.1,
+        "default": 0.9,
+        "optional": true
+      },
+      {
+        "label": "Streaming",
+        "name": "streaming",
+        "type": "boolean",
+        "default": true,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Max Tokens",
+        "name": "maxTokensToSample",
+        "type": "number",
+        "step": 1,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Top P",
+        "name": "topP",
+        "type": "number",
+        "step": 0.1,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Top K",
+        "name": "topK",
+        "type": "number",
+        "step": 0.1,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Extended Thinking",
+        "name": "extendedThinking",
+        "type": "boolean",
+        "description": "Enable extended thinking for reasoning model such as Claude Sonnet 3.7 and Claude 4",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Budget Tokens",
+        "name": "budgetTokens",
+        "type": "number",
+        "step": 1,
+        "default": 1024,
+        "description": "Maximum number of tokens Claude is allowed use for its internal reasoning process",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Allow Image Uploads",
+        "name": "allowImageUploads",
+        "type": "boolean",
+        "description": "Allow image input. Refer to the <a href=\"https://docs.flowiseai.com/using-flowise/uploads#image\" target=\"_blank\">docs</a> for more details.",
+        "default": false,
+        "optional": true
+      }
+    ],
+    "filePath": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/chatmodels/ChatAnthropic/ChatAnthropic.js",
+    "node_type": "chatAnthropic",
     "inputAnchors": [
       {
-        "id": "{nodeId}-input-cache-BaseCache",
+        "label": "Cache",
         "name": "cache",
-        "label": "cache",
         "type": "BaseCache",
         "optional": true,
-        "description": "Cache"
+        "id": "{nodeId}-input-cache-BaseCache"
       }
     ],
     "inputParams": [
       {
-        "id": "{nodeId}-input-modelName-asyncOptions",
+        "label": "Model Name",
         "name": "modelName",
-        "label": "modelName",
         "type": "asyncOptions",
-        "optional": true,
+        "loadMethod": "listModels",
         "default": "claude-3-haiku",
-        "description": "Model Name"
+        "id": "{nodeId}-input-modelName-asyncOptions"
       },
       {
-        "id": "{nodeId}-input-temperature-number",
+        "label": "Temperature",
         "name": "temperature",
-        "label": "temperature",
         "type": "number",
+        "step": 0.1,
+        "default": 0.9,
         "optional": true,
-        "default": "0.9",
-        "description": "Temperature"
+        "id": "{nodeId}-input-temperature-number"
       },
       {
-        "id": "{nodeId}-input-allowImageUploads-boolean",
-        "name": "allowImageUploads",
-        "label": "allowImageUploads",
-        "type": "boolean",
-        "optional": true,
-        "default": "False",
-        "description": "Allow image input. Refer to the <a href=\"https://docs.flowiseai.com/using-flowise/uploads#image\" tar"
-      },
-      {
-        "id": "{nodeId}-input-streaming-boolean",
+        "label": "Streaming",
         "name": "streaming",
-        "label": "streaming",
         "type": "boolean",
+        "default": true,
         "optional": true,
-        "default": "True",
-        "description": "Streaming"
+        "additionalParams": true,
+        "id": "{nodeId}-input-streaming-boolean"
       },
       {
-        "id": "{nodeId}-input-maxTokensToSample-number",
+        "label": "Max Tokens",
         "name": "maxTokensToSample",
-        "label": "maxTokensToSample",
         "type": "number",
+        "step": 1,
         "optional": true,
-        "description": "Max Tokens"
+        "additionalParams": true,
+        "id": "{nodeId}-input-maxTokensToSample-number"
       },
       {
-        "id": "{nodeId}-input-topP-number",
+        "label": "Top P",
         "name": "topP",
-        "label": "topP",
         "type": "number",
+        "step": 0.1,
         "optional": true,
-        "description": "Top P"
+        "additionalParams": true,
+        "id": "{nodeId}-input-topP-number"
       },
       {
-        "id": "{nodeId}-input-topK-number",
+        "label": "Top K",
         "name": "topK",
-        "label": "topK",
         "type": "number",
+        "step": 0.1,
         "optional": true,
-        "description": "Top K"
+        "additionalParams": true,
+        "id": "{nodeId}-input-topK-number"
       },
       {
-        "id": "{nodeId}-input-extendedThinking-boolean",
+        "label": "Extended Thinking",
         "name": "extendedThinking",
-        "label": "extendedThinking",
         "type": "boolean",
+        "description": "Enable extended thinking for reasoning model such as Claude Sonnet 3.7 and Claude 4",
         "optional": true,
-        "description": "Enable extended thinking for reasoning model such as Claude Sonnet 3.7 and Claude 4"
+        "additionalParams": true,
+        "id": "{nodeId}-input-extendedThinking-boolean"
       },
       {
-        "id": "{nodeId}-input-budgetTokens-number",
+        "label": "Budget Tokens",
         "name": "budgetTokens",
-        "label": "budgetTokens",
         "type": "number",
+        "step": 1,
+        "default": 1024,
+        "description": "Maximum number of tokens Claude is allowed use for its internal reasoning process",
         "optional": true,
-        "default": "1024",
-        "description": "Maximum number of tokens Claude is allowed use for its internal reasoning process"
+        "additionalParams": true,
+        "id": "{nodeId}-input-budgetTokens-number"
+      },
+      {
+        "label": "Allow Image Uploads",
+        "name": "allowImageUploads",
+        "type": "boolean",
+        "description": "Allow image input. Refer to the <a href=\"https://docs.flowiseai.com/using-flowise/uploads#image\" target=\"_blank\">docs</a> for more details.",
+        "default": false,
+        "optional": true,
+        "id": "{nodeId}-input-allowImageUploads-boolean"
       }
     ],
     "outputAnchors": [
@@ -3541,19 +3647,7 @@
       }
     ],
     "outputs": {},
-    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object.",
-    "version": "8",
-    "description": "Wrapper around ChatAnthropic large language models that use the Chat endpoint",
-    "baseClasses": [
-      "ChatAnthropic",
-      "ChatAnthropicMessages",
-      "BaseChatModel",
-      "BaseLanguageModel",
-      "Runnable"
-    ],
-    "credential_required": [
-      "anthropicApi"
-    ]
+    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object."
   },
   {
     "node_type": "chatAnthropic_LlamaIndex",
@@ -5651,170 +5745,448 @@
     ]
   },
   {
-    "node_type": "chatOpenAI",
-    "name": "chatOpenAI",
+    "loadMethods": {},
     "label": "ChatOpenAI",
+    "name": "chatOpenAI",
+    "version": 8.3,
+    "type": "ChatOpenAI",
+    "icon": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/chatmodels/ChatOpenAI/openai.svg",
     "category": "Chat Models",
+    "description": "Wrapper around OpenAI large language models that use the Chat endpoint",
+    "baseClasses": [
+      "ChatOpenAI",
+      "BaseChatOpenAI",
+      "BaseChatModel",
+      "BaseLanguageModel",
+      "Runnable"
+    ],
+    "credential": {
+      "label": "Connect Credential",
+      "name": "credential",
+      "type": "credential",
+      "credentialNames": [
+        "openAIApi"
+      ]
+    },
+    "inputs": [
+      {
+        "label": "Cache",
+        "name": "cache",
+        "type": "BaseCache",
+        "optional": true
+      },
+      {
+        "label": "Model Name",
+        "name": "modelName",
+        "type": "asyncOptions",
+        "loadMethod": "listModels",
+        "default": "gpt-4o-mini"
+      },
+      {
+        "label": "Temperature",
+        "name": "temperature",
+        "type": "number",
+        "step": 0.1,
+        "default": 0.9,
+        "optional": true
+      },
+      {
+        "label": "Streaming",
+        "name": "streaming",
+        "type": "boolean",
+        "default": true,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Max Tokens",
+        "name": "maxTokens",
+        "type": "number",
+        "step": 1,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Top Probability",
+        "name": "topP",
+        "type": "number",
+        "step": 0.1,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Frequency Penalty",
+        "name": "frequencyPenalty",
+        "type": "number",
+        "step": 0.1,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Presence Penalty",
+        "name": "presencePenalty",
+        "type": "number",
+        "step": 0.1,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Timeout",
+        "name": "timeout",
+        "type": "number",
+        "step": 1,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Strict Tool Calling",
+        "name": "strictToolCalling",
+        "type": "boolean",
+        "description": "Whether the model supports the `strict` argument when passing in tools. If not specified, the `strict` argument will not be passed to OpenAI.",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Stop Sequence",
+        "name": "stopSequence",
+        "type": "string",
+        "rows": 4,
+        "optional": true,
+        "description": "List of stop words to use when generating. Use comma to separate multiple stop words.",
+        "additionalParams": true
+      },
+      {
+        "label": "BasePath",
+        "name": "basepath",
+        "type": "string",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Proxy Url",
+        "name": "proxyUrl",
+        "type": "string",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "BaseOptions",
+        "name": "baseOptions",
+        "type": "json",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Allow Image Uploads",
+        "name": "allowImageUploads",
+        "type": "boolean",
+        "description": "Allow image input. Refer to the <a href=\"https://docs.flowiseai.com/using-flowise/uploads#image\" target=\"_blank\">docs</a> for more details.",
+        "default": false,
+        "optional": true
+      },
+      {
+        "label": "Image Resolution",
+        "description": "This parameter controls the resolution in which the model views the image.",
+        "name": "imageResolution",
+        "type": "options",
+        "options": [
+          {
+            "label": "Low",
+            "name": "low"
+          },
+          {
+            "label": "High",
+            "name": "high"
+          },
+          {
+            "label": "Auto",
+            "name": "auto"
+          }
+        ],
+        "default": "low",
+        "optional": false,
+        "show": {
+          "allowImageUploads": true
+        }
+      },
+      {
+        "label": "Reasoning",
+        "description": "Whether the model supports reasoning. Only applicable for reasoning models.",
+        "name": "reasoning",
+        "type": "boolean",
+        "default": false,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Reasoning Effort",
+        "description": "Constrains effort on reasoning for reasoning models",
+        "name": "reasoningEffort",
+        "type": "options",
+        "options": [
+          {
+            "label": "Low",
+            "name": "low"
+          },
+          {
+            "label": "Medium",
+            "name": "medium"
+          },
+          {
+            "label": "High",
+            "name": "high"
+          }
+        ],
+        "additionalParams": true,
+        "show": {
+          "reasoning": true
+        }
+      },
+      {
+        "label": "Reasoning Summary",
+        "description": "A summary of the reasoning performed by the model. This can be useful for debugging and understanding the model's reasoning process",
+        "name": "reasoningSummary",
+        "type": "options",
+        "options": [
+          {
+            "label": "Auto",
+            "name": "auto"
+          },
+          {
+            "label": "Concise",
+            "name": "concise"
+          },
+          {
+            "label": "Detailed",
+            "name": "detailed"
+          }
+        ],
+        "additionalParams": true,
+        "show": {
+          "reasoning": true
+        }
+      }
+    ],
+    "filePath": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/chatmodels/ChatOpenAI/ChatOpenAI.js",
+    "node_type": "chatOpenAI",
     "inputAnchors": [
       {
-        "id": "{nodeId}-input-cache-BaseCache",
+        "label": "Cache",
         "name": "cache",
-        "label": "cache",
         "type": "BaseCache",
         "optional": true,
-        "description": "Cache"
+        "id": "{nodeId}-input-cache-BaseCache"
       }
     ],
     "inputParams": [
       {
-        "id": "{nodeId}-input-imageResolution-options",
-        "name": "imageResolution",
-        "label": "imageResolution",
-        "type": "options",
-        "optional": false,
-        "default": "low",
-        "description": "This parameter controls the resolution in which the model views the image."
-      },
-      {
-        "id": "{nodeId}-input-modelName-asyncOptions",
+        "label": "Model Name",
         "name": "modelName",
-        "label": "modelName",
         "type": "asyncOptions",
-        "optional": true,
+        "loadMethod": "listModels",
         "default": "gpt-4o-mini",
-        "description": "Model Name"
+        "id": "{nodeId}-input-modelName-asyncOptions"
       },
       {
-        "id": "{nodeId}-input-temperature-number",
+        "label": "Temperature",
         "name": "temperature",
-        "label": "temperature",
         "type": "number",
+        "step": 0.1,
+        "default": 0.9,
         "optional": true,
-        "default": "0.9",
-        "description": "Temperature"
+        "id": "{nodeId}-input-temperature-number"
       },
       {
-        "id": "{nodeId}-input-allowImageUploads-boolean",
-        "name": "allowImageUploads",
-        "label": "allowImageUploads",
-        "type": "boolean",
-        "optional": true,
-        "default": "False",
-        "description": "Allow image input. Refer to the <a href=\"https://docs.flowiseai.com/using-flowise/uploads#image\" tar"
-      },
-      {
-        "id": "{nodeId}-input-streaming-boolean",
+        "label": "Streaming",
         "name": "streaming",
-        "label": "streaming",
         "type": "boolean",
+        "default": true,
         "optional": true,
-        "default": "True",
-        "description": "Streaming"
+        "additionalParams": true,
+        "id": "{nodeId}-input-streaming-boolean"
       },
       {
-        "id": "{nodeId}-input-maxTokens-number",
+        "label": "Max Tokens",
         "name": "maxTokens",
-        "label": "maxTokens",
         "type": "number",
+        "step": 1,
         "optional": true,
-        "description": "Max Tokens"
+        "additionalParams": true,
+        "id": "{nodeId}-input-maxTokens-number"
       },
       {
-        "id": "{nodeId}-input-topP-number",
+        "label": "Top Probability",
         "name": "topP",
-        "label": "topP",
         "type": "number",
+        "step": 0.1,
         "optional": true,
-        "description": "Top Probability"
+        "additionalParams": true,
+        "id": "{nodeId}-input-topP-number"
       },
       {
-        "id": "{nodeId}-input-frequencyPenalty-number",
+        "label": "Frequency Penalty",
         "name": "frequencyPenalty",
-        "label": "frequencyPenalty",
         "type": "number",
+        "step": 0.1,
         "optional": true,
-        "description": "Frequency Penalty"
+        "additionalParams": true,
+        "id": "{nodeId}-input-frequencyPenalty-number"
       },
       {
-        "id": "{nodeId}-input-presencePenalty-number",
+        "label": "Presence Penalty",
         "name": "presencePenalty",
-        "label": "presencePenalty",
         "type": "number",
+        "step": 0.1,
         "optional": true,
-        "description": "Presence Penalty"
+        "additionalParams": true,
+        "id": "{nodeId}-input-presencePenalty-number"
       },
       {
-        "id": "{nodeId}-input-timeout-number",
+        "label": "Timeout",
         "name": "timeout",
-        "label": "timeout",
         "type": "number",
+        "step": 1,
         "optional": true,
-        "description": "Timeout"
+        "additionalParams": true,
+        "id": "{nodeId}-input-timeout-number"
       },
       {
-        "id": "{nodeId}-input-strictToolCalling-boolean",
+        "label": "Strict Tool Calling",
         "name": "strictToolCalling",
-        "label": "strictToolCalling",
         "type": "boolean",
+        "description": "Whether the model supports the `strict` argument when passing in tools. If not specified, the `strict` argument will not be passed to OpenAI.",
         "optional": true,
-        "description": "Whether the model supports the `strict` argument when passing in tools. If not specified, the `stric"
+        "additionalParams": true,
+        "id": "{nodeId}-input-strictToolCalling-boolean"
       },
       {
-        "id": "{nodeId}-input-stopSequence-string",
+        "label": "Stop Sequence",
         "name": "stopSequence",
-        "label": "stopSequence",
         "type": "string",
+        "rows": 4,
         "optional": true,
-        "description": "List of stop words to use when generating. Use comma to separate multiple stop words."
+        "description": "List of stop words to use when generating. Use comma to separate multiple stop words.",
+        "additionalParams": true,
+        "id": "{nodeId}-input-stopSequence-string"
       },
       {
-        "id": "{nodeId}-input-basepath-string",
+        "label": "BasePath",
         "name": "basepath",
-        "label": "basepath",
         "type": "string",
         "optional": true,
-        "description": "BasePath"
+        "additionalParams": true,
+        "id": "{nodeId}-input-basepath-string"
       },
       {
-        "id": "{nodeId}-input-proxyUrl-string",
+        "label": "Proxy Url",
         "name": "proxyUrl",
-        "label": "proxyUrl",
         "type": "string",
         "optional": true,
-        "description": "Proxy Url"
+        "additionalParams": true,
+        "id": "{nodeId}-input-proxyUrl-string"
       },
       {
-        "id": "{nodeId}-input-baseOptions-json",
+        "label": "BaseOptions",
         "name": "baseOptions",
-        "label": "baseOptions",
         "type": "json",
         "optional": true,
-        "description": "BaseOptions"
+        "additionalParams": true,
+        "id": "{nodeId}-input-baseOptions-json"
       },
       {
-        "id": "{nodeId}-input-reasoning-boolean",
-        "name": "reasoning",
-        "label": "reasoning",
+        "label": "Allow Image Uploads",
+        "name": "allowImageUploads",
         "type": "boolean",
+        "description": "Allow image input. Refer to the <a href=\"https://docs.flowiseai.com/using-flowise/uploads#image\" target=\"_blank\">docs</a> for more details.",
+        "default": false,
         "optional": true,
-        "default": "False",
-        "description": "Whether the model supports reasoning. Only applicable for reasoning models."
+        "id": "{nodeId}-input-allowImageUploads-boolean"
       },
       {
-        "id": "{nodeId}-input-reasoningEffort-options",
+        "label": "Image Resolution",
+        "description": "This parameter controls the resolution in which the model views the image.",
+        "name": "imageResolution",
+        "type": "options",
+        "options": [
+          {
+            "label": "Low",
+            "name": "low"
+          },
+          {
+            "label": "High",
+            "name": "high"
+          },
+          {
+            "label": "Auto",
+            "name": "auto"
+          }
+        ],
+        "default": "low",
+        "optional": false,
+        "show": {
+          "allowImageUploads": true
+        },
+        "id": "{nodeId}-input-imageResolution-options"
+      },
+      {
+        "label": "Reasoning",
+        "description": "Whether the model supports reasoning. Only applicable for reasoning models.",
+        "name": "reasoning",
+        "type": "boolean",
+        "default": false,
+        "optional": true,
+        "additionalParams": true,
+        "id": "{nodeId}-input-reasoning-boolean"
+      },
+      {
+        "label": "Reasoning Effort",
+        "description": "Constrains effort on reasoning for reasoning models",
         "name": "reasoningEffort",
-        "label": "reasoningEffort",
         "type": "options",
-        "optional": true,
-        "description": "Constrains effort on reasoning for reasoning models"
+        "options": [
+          {
+            "label": "Low",
+            "name": "low"
+          },
+          {
+            "label": "Medium",
+            "name": "medium"
+          },
+          {
+            "label": "High",
+            "name": "high"
+          }
+        ],
+        "additionalParams": true,
+        "show": {
+          "reasoning": true
+        },
+        "id": "{nodeId}-input-reasoningEffort-options"
       },
       {
-        "id": "{nodeId}-input-reasoningSummary-options",
+        "label": "Reasoning Summary",
+        "description": "A summary of the reasoning performed by the model. This can be useful for debugging and understanding the model's reasoning process",
         "name": "reasoningSummary",
-        "label": "reasoningSummary",
         "type": "options",
-        "optional": true,
-        "description": "A summary of the reasoning performed by the model. This can be useful for debugging and understandin"
+        "options": [
+          {
+            "label": "Auto",
+            "name": "auto"
+          },
+          {
+            "label": "Concise",
+            "name": "concise"
+          },
+          {
+            "label": "Detailed",
+            "name": "detailed"
+          }
+        ],
+        "additionalParams": true,
+        "show": {
+          "reasoning": true
+        },
+        "id": "{nodeId}-input-reasoningSummary-options"
       }
     ],
     "outputAnchors": [
@@ -5826,19 +6198,7 @@
       }
     ],
     "outputs": {},
-    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object.",
-    "version": "8.3",
-    "description": "Wrapper around OpenAI large language models that use the Chat endpoint",
-    "baseClasses": [
-      "ChatOpenAI",
-      "BaseChatOpenAI",
-      "BaseChatModel",
-      "BaseLanguageModel",
-      "Runnable"
-    ],
-    "credential_required": [
-      "openAIApi"
-    ]
+    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object."
   },
   {
     "node_type": "chatOpenAICustom",
@@ -7441,70 +7801,166 @@
     ]
   },
   {
-    "node_type": "cheerioWebScraper",
-    "name": "cheerioWebScraper",
     "label": "Cheerio Web Scraper",
+    "name": "cheerioWebScraper",
+    "version": 2,
+    "type": "Document",
+    "icon": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/documentloaders/Cheerio/cheerio.svg",
     "category": "Document Loaders",
+    "description": "Load data from webpages",
+    "baseClasses": [
+      "Document"
+    ],
+    "inputs": [
+      {
+        "label": "URL",
+        "name": "url",
+        "type": "string"
+      },
+      {
+        "label": "Text Splitter",
+        "name": "textSplitter",
+        "type": "TextSplitter",
+        "optional": true
+      },
+      {
+        "label": "Get Relative Links Method",
+        "name": "relativeLinksMethod",
+        "type": "options",
+        "description": "Select a method to retrieve relative links",
+        "options": [
+          {
+            "label": "Web Crawl",
+            "name": "webCrawl",
+            "description": "Crawl relative links from HTML URL"
+          },
+          {
+            "label": "Scrape XML Sitemap",
+            "name": "scrapeXMLSitemap",
+            "description": "Scrape relative links from XML sitemap URL"
+          }
+        ],
+        "default": "webCrawl",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Get Relative Links Limit",
+        "name": "limit",
+        "type": "number",
+        "optional": true,
+        "default": "10",
+        "additionalParams": true,
+        "description": "Only used when \"Get Relative Links Method\" is selected. Set 0 to retrieve all relative links, default limit is 10.",
+        "warning": "Retrieving all links might take long time, and all links will be upserted again if the flow's state changed (eg: different URL, chunk size, etc)"
+      },
+      {
+        "label": "Selector (CSS)",
+        "name": "selector",
+        "type": "string",
+        "description": "Specify a CSS selector to select the content to be extracted",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Additional Metadata",
+        "name": "metadata",
+        "type": "json",
+        "description": "Additional metadata to be added to the extracted documents",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Omit Metadata Keys",
+        "name": "omitMetadataKeys",
+        "type": "string",
+        "rows": 4,
+        "description": "Each document loader comes with a default set of metadata keys that are extracted from the document. You can use this field to omit some of the default metadata keys. The value should be a list of keys, seperated by comma. Use * to omit all metadata keys execept the ones you specify in the Additional Metadata field",
+        "placeholder": "key1, key2, key3.nestedKey1",
+        "optional": true,
+        "additionalParams": true
+      }
+    ],
+    "outputs": {},
+    "filePath": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/documentloaders/Cheerio/Cheerio.js",
+    "node_type": "cheerioWebScraper",
     "inputAnchors": [
       {
-        "id": "{nodeId}-input-textSplitter-TextSplitter",
+        "label": "Text Splitter",
         "name": "textSplitter",
-        "label": "textSplitter",
         "type": "TextSplitter",
         "optional": true,
-        "description": "Text Splitter"
+        "id": "{nodeId}-input-textSplitter-TextSplitter"
       }
     ],
     "inputParams": [
       {
-        "id": "{nodeId}-input-url-string",
+        "label": "URL",
         "name": "url",
-        "label": "url",
         "type": "string",
-        "optional": true,
-        "description": "URL"
+        "id": "{nodeId}-input-url-string"
       },
       {
-        "id": "{nodeId}-input-relativeLinksMethod-options",
+        "label": "Get Relative Links Method",
         "name": "relativeLinksMethod",
-        "label": "relativeLinksMethod",
         "type": "options",
-        "optional": true,
+        "description": "Select a method to retrieve relative links",
+        "options": [
+          {
+            "label": "Web Crawl",
+            "name": "webCrawl",
+            "description": "Crawl relative links from HTML URL"
+          },
+          {
+            "label": "Scrape XML Sitemap",
+            "name": "scrapeXMLSitemap",
+            "description": "Scrape relative links from XML sitemap URL"
+          }
+        ],
         "default": "webCrawl",
-        "description": "Select a method to retrieve relative links"
+        "optional": true,
+        "additionalParams": true,
+        "id": "{nodeId}-input-relativeLinksMethod-options"
       },
       {
-        "id": "{nodeId}-input-limit-number",
+        "label": "Get Relative Links Limit",
         "name": "limit",
-        "label": "limit",
         "type": "number",
         "optional": true,
-        "default": "10",
-        "description": "Only used when \"Get Relative Links Method\" is selected. Set 0 to retrieve all relative links, defaul"
+        "default": 10,
+        "additionalParams": true,
+        "description": "Only used when \"Get Relative Links Method\" is selected. Set 0 to retrieve all relative links, default limit is 10.",
+        "warning": "Retrieving all links might take long time, and all links will be upserted again if the flow's state changed (eg: different URL, chunk size, etc)",
+        "id": "{nodeId}-input-limit-number"
       },
       {
-        "id": "{nodeId}-input-selector-string",
+        "label": "Selector (CSS)",
         "name": "selector",
-        "label": "selector",
         "type": "string",
+        "description": "Specify a CSS selector to select the content to be extracted",
         "optional": true,
-        "description": "Specify a CSS selector to select the content to be extracted"
+        "additionalParams": true,
+        "id": "{nodeId}-input-selector-string"
       },
       {
-        "id": "{nodeId}-input-metadata-json",
+        "label": "Additional Metadata",
         "name": "metadata",
-        "label": "metadata",
         "type": "json",
+        "description": "Additional metadata to be added to the extracted documents",
         "optional": true,
-        "description": "Additional metadata to be added to the extracted documents"
+        "additionalParams": true,
+        "id": "{nodeId}-input-metadata-json"
       },
       {
-        "id": "{nodeId}-input-omitMetadataKeys-string",
+        "label": "Omit Metadata Keys",
         "name": "omitMetadataKeys",
-        "label": "omitMetadataKeys",
         "type": "string",
+        "rows": 4,
+        "description": "Each document loader comes with a default set of metadata keys that are extracted from the document. You can use this field to omit some of the default metadata keys. The value should be a list of keys, seperated by comma. Use * to omit all metadata keys execept the ones you specify in the Additional Metadata field",
+        "placeholder": "key1, key2, key3.nestedKey1",
         "optional": true,
-        "description": "Each document loader comes with a default set of metadata keys that are extracted from the document."
+        "additionalParams": true,
+        "id": "{nodeId}-input-omitMetadataKeys-string"
       }
     ],
     "outputAnchors": [
@@ -7521,13 +7977,7 @@
         "type": "string | json"
       }
     ],
-    "outputs": {},
-    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object.",
-    "version": "2",
-    "description": "Load data from webpages",
-    "baseClasses": [
-      "Document"
-    ]
+    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object."
   },
   {
     "node_type": "confluence",
@@ -11171,60 +11621,121 @@
     ]
   },
   {
-    "node_type": "openAIEmbeddings",
-    "name": "openAIEmbeddings",
+    "loadMethods": {},
     "label": "OpenAI Embeddings",
+    "name": "openAIEmbeddings",
+    "version": 4,
+    "type": "OpenAIEmbeddings",
+    "icon": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/embeddings/OpenAIEmbedding/openai.svg",
     "category": "Embeddings",
+    "description": "OpenAI API to generate embeddings for a given text",
+    "baseClasses": [
+      "OpenAIEmbeddings",
+      "Embeddings"
+    ],
+    "credential": {
+      "label": "Connect Credential",
+      "name": "credential",
+      "type": "credential",
+      "credentialNames": [
+        "openAIApi"
+      ]
+    },
+    "inputs": [
+      {
+        "label": "Model Name",
+        "name": "modelName",
+        "type": "asyncOptions",
+        "loadMethod": "listModels",
+        "default": "text-embedding-ada-002"
+      },
+      {
+        "label": "Strip New Lines",
+        "name": "stripNewLines",
+        "type": "boolean",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Batch Size",
+        "name": "batchSize",
+        "type": "number",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Timeout",
+        "name": "timeout",
+        "type": "number",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "BasePath",
+        "name": "basepath",
+        "type": "string",
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Dimensions",
+        "name": "dimensions",
+        "type": "number",
+        "optional": true,
+        "additionalParams": true
+      }
+    ],
+    "filePath": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/embeddings/OpenAIEmbedding/OpenAIEmbedding.js",
+    "node_type": "openAIEmbeddings",
     "inputAnchors": [],
     "inputParams": [
       {
-        "id": "{nodeId}-input-modelName-asyncOptions",
+        "label": "Model Name",
         "name": "modelName",
-        "label": "modelName",
         "type": "asyncOptions",
-        "optional": true,
+        "loadMethod": "listModels",
         "default": "text-embedding-ada-002",
-        "description": "Model Name"
+        "id": "{nodeId}-input-modelName-asyncOptions"
       },
       {
-        "id": "{nodeId}-input-stripNewLines-boolean",
+        "label": "Strip New Lines",
         "name": "stripNewLines",
-        "label": "stripNewLines",
         "type": "boolean",
         "optional": true,
-        "description": "Strip New Lines"
+        "additionalParams": true,
+        "id": "{nodeId}-input-stripNewLines-boolean"
       },
       {
-        "id": "{nodeId}-input-batchSize-number",
+        "label": "Batch Size",
         "name": "batchSize",
-        "label": "batchSize",
         "type": "number",
         "optional": true,
-        "description": "Batch Size"
+        "additionalParams": true,
+        "id": "{nodeId}-input-batchSize-number"
       },
       {
-        "id": "{nodeId}-input-timeout-number",
+        "label": "Timeout",
         "name": "timeout",
-        "label": "timeout",
         "type": "number",
         "optional": true,
-        "description": "Timeout"
+        "additionalParams": true,
+        "id": "{nodeId}-input-timeout-number"
       },
       {
-        "id": "{nodeId}-input-basepath-string",
+        "label": "BasePath",
         "name": "basepath",
-        "label": "basepath",
         "type": "string",
         "optional": true,
-        "description": "BasePath"
+        "additionalParams": true,
+        "id": "{nodeId}-input-basepath-string"
       },
       {
-        "id": "{nodeId}-input-dimensions-number",
+        "label": "Dimensions",
         "name": "dimensions",
-        "label": "dimensions",
         "type": "number",
         "optional": true,
-        "description": "Dimensions"
+        "additionalParams": true,
+        "id": "{nodeId}-input-dimensions-number"
       }
     ],
     "outputAnchors": [
@@ -11236,16 +11747,7 @@
       }
     ],
     "outputs": {},
-    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object.",
-    "version": "4",
-    "description": "OpenAI API to generate embeddings for a given text",
-    "baseClasses": [
-      "OpenAIEmbeddings",
-      "Embeddings"
-    ],
-    "credential_required": [
-      "openAIApi"
-    ]
+    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object."
   },
   {
     "node_type": "openAIEmbeddingsCustom",
@@ -17923,59 +18425,105 @@
     ]
   },
   {
-    "node_type": "customTool",
-    "name": "customTool",
+    "loadMethods": {},
     "label": "Custom Tool",
+    "name": "customTool",
+    "version": 3,
+    "type": "CustomTool",
+    "icon": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/tools/CustomTool/customtool.svg",
     "category": "Tools",
+    "description": "Use custom tool you've created in Flowise within chatflow",
+    "inputs": [
+      {
+        "label": "Select Tool",
+        "name": "selectedTool",
+        "type": "asyncOptions",
+        "loadMethod": "listTools"
+      },
+      {
+        "label": "Return Direct",
+        "name": "returnDirect",
+        "description": "Return the output of the tool directly to the user",
+        "type": "boolean",
+        "optional": true
+      },
+      {
+        "label": "Custom Tool Name",
+        "name": "customToolName",
+        "type": "string",
+        "hidden": true
+      },
+      {
+        "label": "Custom Tool Description",
+        "name": "customToolDesc",
+        "type": "string",
+        "hidden": true
+      },
+      {
+        "label": "Custom Tool Schema",
+        "name": "customToolSchema",
+        "type": "string",
+        "hidden": true
+      },
+      {
+        "label": "Custom Tool Func",
+        "name": "customToolFunc",
+        "type": "string",
+        "hidden": true
+      }
+    ],
+    "baseClasses": [
+      "CustomTool",
+      "Tool",
+      "StructuredTool",
+      "Runnable"
+    ],
+    "filePath": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/tools/CustomTool/CustomTool.js",
+    "node_type": "customTool",
     "inputAnchors": [],
     "inputParams": [
       {
-        "id": "{nodeId}-input-selectedTool-asyncOptions",
+        "label": "Select Tool",
         "name": "selectedTool",
-        "label": "selectedTool",
         "type": "asyncOptions",
-        "optional": true,
-        "description": "Select Tool"
+        "loadMethod": "listTools",
+        "id": "{nodeId}-input-selectedTool-asyncOptions"
       },
       {
-        "id": "{nodeId}-input-returnDirect-boolean",
+        "label": "Return Direct",
         "name": "returnDirect",
-        "label": "returnDirect",
+        "description": "Return the output of the tool directly to the user",
         "type": "boolean",
         "optional": true,
-        "description": "Return the output of the tool directly to the user"
+        "id": "{nodeId}-input-returnDirect-boolean"
       },
       {
-        "id": "{nodeId}-input-customToolName-string",
+        "label": "Custom Tool Name",
         "name": "customToolName",
-        "label": "customToolName",
         "type": "string",
-        "optional": true,
-        "description": "Custom Tool Name"
+        "hidden": true,
+        "id": "{nodeId}-input-customToolName-string"
       },
       {
-        "id": "{nodeId}-input-customToolDesc-string",
+        "label": "Custom Tool Description",
         "name": "customToolDesc",
-        "label": "customToolDesc",
         "type": "string",
-        "optional": true,
-        "description": "Custom Tool Description"
+        "hidden": true,
+        "id": "{nodeId}-input-customToolDesc-string"
       },
       {
-        "id": "{nodeId}-input-customToolSchema-string",
+        "label": "Custom Tool Schema",
         "name": "customToolSchema",
-        "label": "customToolSchema",
         "type": "string",
-        "optional": true,
-        "description": "Custom Tool Schema"
+        "hidden": true,
+        "id": "{nodeId}-input-customToolSchema-string"
       },
       {
-        "id": "{nodeId}-input-customToolFunc-string",
+        "label": "Custom Tool Func",
         "name": "customToolFunc",
-        "label": "customToolFunc",
         "type": "string",
-        "optional": true,
-        "description": "Custom Tool Func"
+        "hidden": true,
+        "id": "{nodeId}-input-customToolFunc-string"
       }
     ],
     "outputAnchors": [
@@ -17987,15 +18535,7 @@
       }
     ],
     "outputs": {},
-    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object.",
-    "version": "3",
-    "description": "Use custom tool you've created in Flowise within chatflow",
-    "baseClasses": [
-      "CustomTool",
-      "Tool",
-      "StructuredTool",
-      "Runnable"
-    ]
+    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object."
   },
   {
     "node_type": "exaSearch",
@@ -21538,55 +22078,145 @@
     ]
   },
   {
-    "node_type": "webScraperTool",
-    "name": "webScraperTool",
     "label": "Web Scraper Tool",
+    "name": "webScraperTool",
+    "version": 1.1,
+    "type": "Tool",
+    "icon": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/tools/WebScraperTool/webScraperTool.svg",
     "category": "Tools",
+    "description": "Scrapes web pages recursively by following links OR by fetching URLs from the default sitemap.",
+    "baseClasses": [
+      "Tool",
+      "Tool",
+      "StructuredTool",
+      "Runnable"
+    ],
+    "inputs": [
+      {
+        "label": "Scraping Mode",
+        "name": "scrapeMode",
+        "type": "options",
+        "options": [
+          {
+            "label": "Recursive Link Following",
+            "name": "recursive"
+          },
+          {
+            "label": "Sitemap",
+            "name": "sitemap"
+          }
+        ],
+        "default": "recursive",
+        "description": "Select discovery method: 'Recursive' follows links found on pages (uses Max Depth). 'Sitemap' tries sitemap.xml first, but falls back to 'Recursive' if the sitemap is not found or empty.",
+        "additionalParams": true
+      },
+      {
+        "label": "Max Depth",
+        "name": "maxDepth",
+        "type": "number",
+        "description": "Maximum levels of links to follow (e.g., 1 = only the initial URL, 2 = initial URL + links found on it). Default 1.",
+        "placeholder": "1",
+        "default": 1,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Max Pages",
+        "name": "maxPages",
+        "type": "number",
+        "description": "Maximum total number of pages to scrape, regardless of mode or depth. Stops when this limit is reached. Leave empty for no page limit. Default: 10.",
+        "placeholder": "10",
+        "default": 10,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Timeout (s)",
+        "name": "timeoutS",
+        "type": "number",
+        "description": "Maximum time in seconds to wait for each page request to complete. Accepts decimals (e.g., 0.5). Default 60.",
+        "placeholder": "60",
+        "default": 60,
+        "optional": true,
+        "additionalParams": true
+      },
+      {
+        "label": "Tool Description",
+        "name": "description",
+        "type": "string",
+        "description": "Custom description of what the tool does. This is for LLM to determine when to use this tool. Overrides the default description.",
+        "rows": 4,
+        "additionalParams": true,
+        "optional": true,
+        "placeholder": "Scrapes web pages recursively or via default sitemap. Extracts title, description, and paragraph text. Input should be a single URL string. Returns a JSON string array of scraped page data objects."
+      }
+    ],
+    "filePath": "/usr/local/lib/node_modules/flowise/node_modules/flowise-components/dist/nodes/tools/WebScraperTool/WebScraperTool.js",
+    "node_type": "webScraperTool",
     "inputAnchors": [],
     "inputParams": [
       {
-        "id": "{nodeId}-input-scrapeMode-options",
+        "label": "Scraping Mode",
         "name": "scrapeMode",
-        "label": "scrapeMode",
         "type": "options",
-        "optional": true,
+        "options": [
+          {
+            "label": "Recursive Link Following",
+            "name": "recursive"
+          },
+          {
+            "label": "Sitemap",
+            "name": "sitemap"
+          }
+        ],
         "default": "recursive",
-        "description": "Select discovery method: 'Recursive' follows links found on pages (uses Max Depth). 'Sitemap' tries"
+        "description": "Select discovery method: 'Recursive' follows links found on pages (uses Max Depth). 'Sitemap' tries sitemap.xml first, but falls back to 'Recursive' if the sitemap is not found or empty.",
+        "additionalParams": true,
+        "id": "{nodeId}-input-scrapeMode-options"
       },
       {
-        "id": "{nodeId}-input-maxDepth-number",
+        "label": "Max Depth",
         "name": "maxDepth",
-        "label": "maxDepth",
         "type": "number",
+        "description": "Maximum levels of links to follow (e.g., 1 = only the initial URL, 2 = initial URL + links found on it). Default 1.",
+        "placeholder": "1",
+        "default": 1,
         "optional": true,
-        "default": "1",
-        "description": "Maximum levels of links to follow (e.g., 1 = only the initial URL, 2 = initial URL + links found on"
+        "additionalParams": true,
+        "id": "{nodeId}-input-maxDepth-number"
       },
       {
-        "id": "{nodeId}-input-maxPages-number",
+        "label": "Max Pages",
         "name": "maxPages",
-        "label": "maxPages",
         "type": "number",
+        "description": "Maximum total number of pages to scrape, regardless of mode or depth. Stops when this limit is reached. Leave empty for no page limit. Default: 10.",
+        "placeholder": "10",
+        "default": 10,
         "optional": true,
-        "default": "10",
-        "description": "Maximum total number of pages to scrape, regardless of mode or depth. Stops when this limit is reach"
+        "additionalParams": true,
+        "id": "{nodeId}-input-maxPages-number"
       },
       {
-        "id": "{nodeId}-input-timeoutS-number",
+        "label": "Timeout (s)",
         "name": "timeoutS",
-        "label": "timeoutS",
         "type": "number",
+        "description": "Maximum time in seconds to wait for each page request to complete. Accepts decimals (e.g., 0.5). Default 60.",
+        "placeholder": "60",
+        "default": 60,
         "optional": true,
-        "default": "60",
-        "description": "Maximum time in seconds to wait for each page request to complete. Accepts decimals (e.g., 0.5). Def"
+        "additionalParams": true,
+        "id": "{nodeId}-input-timeoutS-number"
       },
       {
-        "id": "{nodeId}-input-description-string",
+        "label": "Tool Description",
         "name": "description",
-        "label": "description",
         "type": "string",
+        "description": "Custom description of what the tool does. This is for LLM to determine when to use this tool. Overrides the default description.",
+        "rows": 4,
+        "additionalParams": true,
         "optional": true,
-        "description": "Custom description of what the tool does. This is for LLM to determine when to use this tool. Overri"
+        "placeholder": "Scrapes web pages recursively or via default sitemap. Extracts title, description, and paragraph text. Input should be a single URL string. Returns a JSON string array of scraped page data objects.",
+        "id": "{nodeId}-input-description-string"
       }
     ],
     "outputAnchors": [
@@ -21598,15 +22228,7 @@
       }
     ],
     "outputs": {},
-    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object.",
-    "version": "1.1",
-    "description": "Scrapes web pages recursively by following links OR by fetching URLs from the default sitemap.",
-    "baseClasses": [
-      "Tool",
-      "Tool",
-      "StructuredTool",
-      "Runnable"
-    ]
+    "_flowdata_note": "Replace {nodeId} in all 'id' fields with your actual node ID (e.g. 'chatOpenAI_0'). Embed inputAnchors, inputParams, outputAnchors, and outputs verbatim in each flowData node's data object."
   },
   {
     "node_type": "wolframAlpha",

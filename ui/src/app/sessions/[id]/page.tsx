@@ -15,11 +15,12 @@ export default function SessionDetailPage({ params }: { params: { id: string } }
   const { id } = params;
   const router = useRouter();
   const { toast } = useToast();
-  const { initActive, applySSEEvent, applyNodeEvent, setReconnectAttempt, active } = useSessionStore((s) => ({
+  const { initActive, applySSEEvent, applyNodeEvent, setReconnectAttempt, startSubmitting, active } = useSessionStore((s) => ({
     initActive: s.initActive,
     applySSEEvent: s.applySSEEvent,
     applyNodeEvent: s.applyNodeEvent,
     setReconnectAttempt: s.setReconnectAttempt,
+    startSubmitting: s.startSubmitting,
     active: s.active,
   }));
 
@@ -90,6 +91,8 @@ export default function SessionDetailPage({ params }: { params: { id: string } }
   // 4. HITL response handler — called by ActivePanel when user submits a response
   const handleSubmit = useCallback(
     (response: string) => {
+      // Immediately transition to streaming — disables HITL buttons and shows StreamingPanel
+      startSubmitting();
       resumeCleanupRef.current?.(); // cancel any previous resume stream
       resumeCleanupRef.current = openResumeStream(
         id,

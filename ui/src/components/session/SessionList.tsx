@@ -4,6 +4,7 @@ import { useSessionStore } from "@/store/session-store";
 import { api } from "@/lib/api";
 import { SessionCard } from "./SessionCard";
 import { NewSessionModal } from "./NewSessionModal";
+import { SchemaRefreshButton } from "./SchemaRefreshButton";
 
 export function SessionList() {
   const { sessions, setSessions, setLoadingSessions, modalOpen, setModalOpen } = useSessionStore();
@@ -29,7 +30,10 @@ export function SessionList() {
     <div className="mx-auto max-w-5xl p-6">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-xl font-semibold">Flowise Dev Agent</h1>
-        <button onClick={() => setModalOpen(true)} className="rounded bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90">+ New Session</button>
+        <div className="flex items-center gap-3">
+          <SchemaRefreshButton />
+          <button onClick={() => setModalOpen(true)} className="rounded bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90">+ New Session</button>
+        </div>
       </div>
       {sessions.length === 0 ? (
         <div className="rounded-lg border border-border p-12 text-center">

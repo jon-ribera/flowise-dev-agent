@@ -16,7 +16,7 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-import type { SessionSummary, SessionResponse, VersionSnapshot, PatternSummary } from "./types";
+import type { SessionSummary, SessionResponse, VersionSnapshot, PatternSummary, SchemaRefreshResponse, SchemaStats } from "./types";
 
 export const api = {
   listSessions: (params?: { sort?: string; limit?: number }) => {
@@ -34,4 +34,9 @@ export const api = {
   listPatterns: (q?: string) => apiFetch<PatternSummary[]>(`/patterns${q ? `?q=${encodeURIComponent(q)}` : ""}`),
   listInstances: () => apiFetch<{ default: string | null; instances: string[] }>("/instances"),
   health: () => apiFetch<{ api: string; flowise: string }>("/health"),
+  startSchemaRefresh: (scope: string = "all", force: boolean = false) =>
+    apiFetch<SchemaRefreshResponse>("/platform/schema/refresh", { method: "POST", body: JSON.stringify({ scope, force }) }),
+  getSchemaRefreshStatus: (jobId: string) =>
+    apiFetch<{ job_id: string; status: string; summary_json: Record<string, unknown> }>(`/platform/schema/refresh/${jobId}`),
+  getSchemaStats: () => apiFetch<SchemaStats>("/platform/schema/stats"),
 };

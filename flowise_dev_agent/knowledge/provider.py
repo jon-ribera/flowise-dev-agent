@@ -78,6 +78,64 @@ _UUID_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 
+def _coerce_default(value: Any, param_type: str) -> Any:
+    """Coerce a string default value to the appropriate Python type.
+
+    Flowise API returns defaults as strings (e.g. "0.9", "True", "10").
+    Converting them to native types ensures the compiled flowData matches
+    what Flowise expects for rendering.  M11.2 (DD-106).
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    # Boolean
+    if param_type == "boolean" or value in ("True", "False", "true", "false"):
+        return value.lower() == "true"
+    # Number — only coerce when param_type is "number" or value is clearly numeric
+    if param_type == "number":
+        try:
+            f = float(value)
+            return int(f) if f == int(f) else f
+        except (ValueError, OverflowError):
+            return value
+    # JSON-like strings
+    if value.startswith(("{", "[")):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return value
+    return value
+
+
+def _validate_render_safe(param: dict) -> list[str]:
+    """Validate a single inputParam against the render-safe minimum contract.
+
+    Returns a list of warning strings (empty = valid).  M11.2 (DD-106).
+    """
+    warnings: list[str] = []
+    ptype = param.get("type", "")
+    pname = param.get("name", "?")
+
+    if ptype == "options" and not isinstance(param.get("options"), list):
+        param["options"] = param.get("options") or []
+        warnings.append(f"[{pname}] type=options but 'options' missing — set to []")
+
+    if ptype == "asyncOptions" and not param.get("loadMethod"):
+        warnings.append(f"[{pname}] type=asyncOptions but 'loadMethod' missing")
+
+    default = param.get("default")
+    if default is not None:
+        if ptype == "number" and not isinstance(default, (int, float)):
+            warnings.append(
+                f"[{pname}] type=number but default={default!r} is not numeric"
+            )
+        if ptype == "boolean" and not isinstance(default, bool):
+            warnings.append(
+                f"[{pname}] type=boolean but default={default!r} is not bool"
+            )
+
+    return warnings
+
+
 def _normalize_api_schema(raw: dict) -> dict:
     """Convert a raw Flowise API get_node response to the normalized snapshot format.
 
@@ -86,6 +144,12 @@ def _normalize_api_schema(raw: dict) -> dict:
     identical to entries populated from a live API call.  This is the ONLY place
     that performs this transformation — keeping it here means tools.py is never
     imported by the knowledge layer.
+
+    M11.2 enhancements:
+    - Default value coercion (string → native type)
+    - Render-safe contract validation (options, asyncOptions, number, boolean)
+    - All UI-relevant fields preserved via dict(inp) (step, rows,
+      additionalParams, loadMethod, credentialNames, options, show, etc.)
     """
     node_name = raw.get("name", "")
     base_classes = raw.get("baseClasses", [])
@@ -95,10 +159,17 @@ def _normalize_api_schema(raw: dict) -> dict:
     input_params: list[dict] = []
 
     for inp in raw_inputs:
-        entry = dict(inp)
+        entry = dict(inp)  # preserves ALL fields (near-lossless)
         inp_type = entry.get("type", "")
         entry["id"] = f"{{nodeId}}-input-{entry.get('name', '')}-{inp_type}"
         if inp_type in _PRIMITIVE_TYPES:
+            # M11.2: Coerce default values to native types
+            if "default" in entry:
+                entry["default"] = _coerce_default(entry["default"], inp_type)
+            # M11.2: Validate render-safe contract (log warnings only)
+            render_warnings = _validate_render_safe(entry)
+            for w in render_warnings:
+                logger.warning("[_normalize_api_schema] %s/%s: %s", node_name, entry.get("name", "?"), w)
             input_params.append(entry)
         else:
             input_anchors.append(entry)
@@ -188,15 +259,20 @@ class NodeSchemaStore:
         self,
         snapshot_path: Path = _NODES_SNAPSHOT,
         meta_path: Path = _NODES_META,
+        pg_cache: Any = None,
     ) -> None:
         self._snapshot_path = snapshot_path
         self._meta_path = meta_path
+        # M11.1: Postgres-backed schema cache (warm tier). None = file-only mode.
+        self._pg_cache = pg_cache
         # node_type → processed schema dict (camelCase keys, matching schema_cache format)
         self._index: dict[str, dict] = {}
         # M10.7: lowered node_type → canonical node_type (case-insensitive fallback)
         self._lower_index: dict[str, str] = {}
         self._repair_events: list[dict[str, Any]] = []
         self._loaded = False
+        # M11.1: True when Postgres was the load source (not file snapshot)
+        self._loaded_from_pg = False
         # M8.2: total get_or_repair calls this session (cache hits + misses)
         self._call_count: int = 0
 
@@ -209,7 +285,60 @@ class NodeSchemaStore:
         if self._loaded:
             return
         self._loaded = True
+        self._load_from_file_snapshot()
 
+    async def load_from_pg(self) -> bool:
+        """M11.1: Attempt to populate memory index from Postgres cache.
+
+        Called during startup when pg_cache is available. If Postgres is
+        populated (>= 100 node schemas), it becomes the authoritative source
+        and the file snapshot is NOT loaded.
+
+        Returns True if Postgres was used, False if caller should fall back
+        to file snapshot via _load().
+        """
+        if self._pg_cache is None:
+            return False
+        try:
+            populated = await self._pg_cache.is_populated("node", min_count=100)
+        except Exception:
+            logger.warning("[NodeSchemaStore] Postgres cache check failed — falling back to file")
+            return False
+        if not populated:
+            return False
+
+        # Read all node schemas from Postgres (no TTL filter for bulk load)
+        try:
+            async with self._pg_cache._pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT type_key, schema_json, schema_hash "
+                        "FROM schema_cache_items "
+                        "WHERE base_url = %s AND schema_kind = 'node'",
+                        (self._pg_cache._base_url,),
+                    )
+                    rows = await cur.fetchall()
+            for row in rows:
+                key = row["type_key"]
+                schema = row["schema_json"]
+                if isinstance(schema, str):
+                    schema = json.loads(schema)
+                schema["_schema_hash"] = row["schema_hash"]
+                self._index[key] = schema
+                self._lower_index[key.lower()] = key
+            self._loaded = True
+            self._loaded_from_pg = True
+            logger.info(
+                "[NodeSchemaStore] Loaded %d node schemas from Postgres cache (authoritative)",
+                len(self._index),
+            )
+            return True
+        except Exception:
+            logger.exception("[NodeSchemaStore] Failed to load from Postgres — falling back to file")
+            return False
+
+    def _load_from_file_snapshot(self) -> None:
+        """Load snapshot from file into memory index."""
         if not self._snapshot_path.exists():
             logger.info(
                 "[NodeSchemaStore] Snapshot not found at %s — "
@@ -317,7 +446,7 @@ class NodeSchemaStore:
         self._load()
         self._call_count += 1  # M8.2: count every call (hits + misses)
 
-        # --- Fast path: local snapshot hit (exact, then case-insensitive) ---
+        # --- Tier 1: Memory hit (exact, then case-insensitive) ---
         local = self._index.get(node_type)
         if local is None:
             canonical = self._lower_index.get(node_type.lower())
@@ -329,11 +458,31 @@ class NodeSchemaStore:
                 )
         if local is not None:
             logger.debug(
-                "[NodeSchemaStore] Cache HIT: %s — skipping API get_node call", node_type
+                "[NodeSchemaStore] Cache HIT (memory): %s — skipping API get_node call", node_type
             )
             return local
 
-        # --- Slow path: API repair ---
+        # --- Tier 2: Postgres cache (M11.1, DD-105) ---
+        if self._pg_cache is not None:
+            try:
+                pg_hit = await self._pg_cache.get("node", node_type)
+                if pg_hit is not None:
+                    # Populate memory tier from Postgres hit
+                    self._index[node_type] = pg_hit
+                    self._lower_index[node_type.lower()] = node_type
+                    logger.info(
+                        "[NodeSchemaStore] Cache HIT (postgres): %s — loaded into memory",
+                        node_type,
+                    )
+                    return pg_hit
+            except Exception:
+                logger.warning(
+                    "[NodeSchemaStore] Postgres cache lookup failed for '%s' — "
+                    "falling through to MCP repair",
+                    node_type,
+                )
+
+        # --- Tier 3: MCP repair (cold path) ---
         logger.info(
             "[NodeSchemaStore] REPAIR triggered: '%s' not in snapshot — "
             "calling API get_node (ONE targeted call only)",
@@ -373,12 +522,95 @@ class NodeSchemaStore:
         # Normalise to snapshot format and update in-memory index + disk
         normalized = _normalize_api_schema(api_raw)
         self._index[node_type] = normalized
+        self._lower_index[node_type.lower()] = node_type
         self._persist()
+
+        # M11.1: Write-back to Postgres (warm tier) on successful MCP repair
+        if self._pg_cache is not None:
+            try:
+                await self._pg_cache.put("node", node_type, normalized)
+                logger.info(
+                    "[NodeSchemaStore] REPAIR write-back to Postgres: '%s'", node_type
+                )
+            except Exception:
+                logger.warning(
+                    "[NodeSchemaStore] Postgres write-back failed for '%s' — "
+                    "memory updated, Postgres stale",
+                    node_type,
+                )
+
         logger.info(
             "[NodeSchemaStore] REPAIR applied: action=%s for '%s' — snapshot updated",
             action,
             node_type,
         )
+        return normalized
+
+    def invalidate_memory(self) -> int:
+        """M11.1: Clear in-memory index. Returns count of entries cleared.
+
+        Called after a refresh completes so the next get() re-populates
+        from the freshly-updated Postgres tier.
+        """
+        count = len(self._index)
+        self._index.clear()
+        self._lower_index.clear()
+        self._loaded = False
+        self._loaded_from_pg = False
+        return count
+
+    async def force_refresh_node_schema(
+        self,
+        node_type: str,
+        api_fetcher,
+    ) -> dict | None:
+        """M11.4 (DD-110): Force-refresh a single node schema from MCP.
+
+        Bypasses version gating — always overwrites memory + Postgres.
+        Used by the bounded repair policy when drift is detected.
+
+        Returns the refreshed schema dict, or None on failure.
+        """
+        self._load()
+        logger.info(
+            "[NodeSchemaStore] FORCE REFRESH: '%s' — bypassing version gating",
+            node_type,
+        )
+        try:
+            api_raw = await api_fetcher(node_type)
+        except Exception as exc:
+            logger.warning(
+                "[NodeSchemaStore] FORCE REFRESH failed for '%s': %s",
+                node_type, exc,
+            )
+            return None
+
+        if not api_raw or not isinstance(api_raw, dict) or "error" in api_raw:
+            logger.warning(
+                "[NodeSchemaStore] FORCE REFRESH: API returned no usable schema for '%s'",
+                node_type,
+            )
+            return None
+
+        normalized = _normalize_api_schema(api_raw)
+        self._index[node_type] = normalized
+        self._lower_index[node_type.lower()] = node_type
+        self._persist()
+
+        # Write-back to Postgres
+        if self._pg_cache is not None:
+            try:
+                await self._pg_cache.put("node", node_type, normalized)
+                logger.info(
+                    "[NodeSchemaStore] FORCE REFRESH write-back to Postgres: '%s'",
+                    node_type,
+                )
+            except Exception:
+                logger.warning(
+                    "[NodeSchemaStore] Postgres write-back failed for '%s'",
+                    node_type,
+                )
+
         return normalized
 
     # ------------------------------------------------------------------
@@ -1192,11 +1424,16 @@ class FlowiseKnowledgeProvider:
       - Snapshot data MUST NOT be injected wholesale into LLM prompts.
     """
 
-    def __init__(self, schemas_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        schemas_dir: Path | None = None,
+        pg_cache: Any = None,
+    ) -> None:
         base = schemas_dir or _SCHEMAS_DIR
         self._node_schemas = NodeSchemaStore(
             base / "flowise_nodes.snapshot.json",
             base / "flowise_nodes.meta.json",
+            pg_cache=pg_cache,
         )
         self._template_store = TemplateStore(
             base / "flowise_templates.snapshot.json",
@@ -1206,6 +1443,7 @@ class FlowiseKnowledgeProvider:
             base / "flowise_credentials.snapshot.json",
             base / "flowise_credentials.meta.json",
         )
+        self._pg_cache = pg_cache
         self._anchor_store: AnchorDictionaryStore | None = None  # lazy M10.2a
 
     @property

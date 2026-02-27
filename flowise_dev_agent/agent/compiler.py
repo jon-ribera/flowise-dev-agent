@@ -140,10 +140,14 @@ class GraphIR:
         return next((n for n in self.nodes if n.id == node_id), None)
 
     def to_flow_data(self) -> dict[str, Any]:
-        """Convert to the Flowise flowData dict format for API writes."""
+        """Convert to the Flowise flowData dict format for API writes.
+
+        M11.2: Includes viewport for canvas positioning (DD-107).
+        """
         return {
             "nodes": [_graph_node_to_flowise(n) for n in self.nodes],
             "edges": [_graph_edge_to_flowise(e) for e in self.edges],
+            "viewport": {"x": 0, "y": 0, "zoom": 0.5},
         }
 
     def to_flow_data_str(self) -> str:
@@ -215,6 +219,7 @@ class CompileResult:
     diff_summary: str
     errors: list[str] = field(default_factory=list)
     anchor_metrics: dict[str, Any] = field(default_factory=dict)
+    schema_gap_metrics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -473,7 +478,7 @@ def _build_node_data(
     base_classes = list(schema.get("baseClasses") or [])
     node_type = base_classes[0] if base_classes else node_name
 
-    return {
+    data = {
         "id": node_id,
         "label": label or schema.get("label", node_name),
         "version": node_version,
@@ -490,16 +495,92 @@ def _build_node_data(
         "selected": False,
     }
 
+    # M11.2: Ensure credential inputParam when schema requires credentials
+    _ensure_credential_input_param(data, schema, node_id)
+
+    return data
+
+
+def _compute_node_height(data: dict[str, Any]) -> int:
+    """Compute deterministic node height from schema data.
+
+    M11.2 (DD-107): Replaces hardcoded 500px with a heuristic based on
+    the number of visible inputParams and inputAnchors.
+
+    Formula: base(260) + visible_params * 22 + input_anchors * 12
+    Clamped to [260, 900].
+    """
+    input_params = data.get("inputParams") or []
+    input_anchors = data.get("inputAnchors") or []
+
+    # Count visible params: exclude those with show explicitly set to False
+    visible_count = 0
+    for p in input_params:
+        show = p.get("show")
+        if show is False:
+            continue
+        visible_count += 1
+
+    height = 260 + (visible_count * 22) + (len(input_anchors) * 12)
+    return max(260, min(900, height))
+
+
+def _ensure_credential_input_param(
+    data: dict[str, Any],
+    schema: dict[str, Any],
+    node_id: str,
+) -> None:
+    """Ensure a credential inputParam exists when the node requires credentials.
+
+    M11.2 (DD-106): Idempotent — safe to call multiple times. If a
+    credential inputParam already exists in data["inputParams"], this is a no-op.
+
+    The credential param is inserted as the FIRST entry in inputParams,
+    matching Flowise UI convention.
+    """
+    # Determine if this node requires credentials
+    cred_names: list[str] = []
+    # 1. Top-level credential field (e.g. "openAIApi")
+    top_cred = schema.get("credential")
+    if isinstance(top_cred, str) and top_cred:
+        cred_names = [top_cred]
+    # 2. credentialNames list at schema level
+    if not cred_names:
+        cred_names = schema.get("credentialNames") or []
+
+    if not cred_names:
+        return
+
+    # Check if credential inputParam already exists (idempotent)
+    input_params = data.get("inputParams") or []
+    for p in input_params:
+        if p.get("type") == "credential" or p.get("name") == "credential":
+            return
+
+    # Synthesize and insert at position 0
+    cred_param = {
+        "label": "Connect Credential",
+        "name": "credential",
+        "type": "credential",
+        "credentialNames": list(cred_names),
+        "id": f"{node_id}-input-credential-credential",
+        "optional": False,
+    }
+    data.setdefault("inputParams", []).insert(0, cred_param)
+
 
 def _graph_node_to_flowise(node: GraphNode) -> dict[str, Any]:
-    """Serialize a GraphNode to the Flowise flowData node JSON format."""
+    """Serialize a GraphNode to the Flowise flowData node JSON format.
+
+    M11.2: Uses _compute_node_height() instead of hardcoded 500.
+    """
     return {
         "id": node.id,
         "position": node.position,
         "type": "customNode",
         "data": node.data,
         "width": 300,
-        "height": 500,
+        "height": _compute_node_height(node.data),
         "selected": False,
         "positionAbsolute": node.position,
         "dragging": False,

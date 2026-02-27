@@ -51,7 +51,11 @@ from typing import TYPE_CHECKING, Any
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from flowise_dev_agent.agent.compiler import GraphIR, compile_patch_ops
+from flowise_dev_agent.agent.compiler import GraphIR, compile_patch_ops, CompileResult
+from flowise_dev_agent.knowledge.drift import (
+    DriftMetrics,
+    validate_flow_render_contract,
+)
 from flowise_dev_agent.agent.domain import (
     DomainCapability,
     DomainDiscoveryResult,
@@ -1125,6 +1129,7 @@ class FlowiseCapability(DomainCapability):
         engine: ReasoningEngine,
         system: str,
         client: "FlowiseClient | None" = None,
+        pg_cache: "Any | None" = None,
     ) -> None:
         self._flowise_domain = flowise_domain
         self._engine = engine
@@ -1138,14 +1143,14 @@ class FlowiseCapability(DomainCapability):
             from flowise_dev_agent.mcp.tools import FlowiseMCPTools
             from flowise_dev_agent.mcp.registry import register_flowise_mcp_tools
 
-            self._knowledge = FlowiseKnowledgeProvider()
+            self._knowledge = FlowiseKnowledgeProvider(pg_cache=pg_cache)
             _anchor_getter = self._knowledge.anchor_dictionary.get
             self._mcp_tools = FlowiseMCPTools(client, anchor_dict_getter=_anchor_getter)
             register_flowise_mcp_tools(self._registry, self._mcp_tools)
         else:
             self._mcp_tools = None
             self._registry.register_domain(flowise_domain)
-            self._knowledge = FlowiseKnowledgeProvider()
+            self._knowledge = FlowiseKnowledgeProvider(pg_cache=pg_cache)
 
         self._registry.register_context("flowise", "discover", flowise_domain.discover_context)
         self._registry.register_context("flowise", "patch", flowise_domain.patch_context)
@@ -2416,11 +2421,91 @@ def _make_compile_flow_data_node(
                     if isinstance(_result, ToolResult) and _result.ok and isinstance(_result.data, dict):
                         schema_cache[node_name] = _result.data
 
-        # Deterministic compilation
+        # -----------------------------------------------------------
+        # M11.4 (DD-110): Drift detection + bounded repair
+        # -----------------------------------------------------------
+        drift_metrics = DriftMetrics()
+
+        # Track cache tier hits during schema_cache population
+        for node_name in new_node_names:
+            if node_name in schema_cache:
+                if node_store is not None and node_name in getattr(node_store, "_index", {}):
+                    drift_metrics.cache_hits_memory += 1
+                else:
+                    drift_metrics.mcp_fetches += 1
+            else:
+                drift_metrics.cache_misses += 1
+
+        # Session-scoped repair tracking (bounded: max 1 repair per node type)
+        _repaired_this_session: set[str] = set()
+        existing_debug = (state.get("debug") or {}).get("flowise") or {}
+        _prior_repaired = existing_debug.get("schema_substrate", {}).get(
+            "repaired_node_types", []
+        )
+        _repaired_this_session.update(_prior_repaired)
+
+        # Initial compilation
         compile_result = compile_patch_ops(base_graph, ops, schema_cache)
 
         if not compile_result.ok:
             logger.warning("[COMPILE_FLOW_DATA] compile errors: %s", compile_result.errors[:3])
+
+        # Run render-safe contract validation on compiled flow
+        drift_result = validate_flow_render_contract(compile_result.flow_data)
+
+        if not drift_result.ok:
+            drift_metrics.drift_detected_count += len(
+                [i for i in drift_result.issues if i.severity == "error"]
+            )
+            logger.warning(
+                "[COMPILE_FLOW_DATA] drift detected: %d issues, severity=%s",
+                len(drift_result.issues), drift_result.severity,
+            )
+
+            # Identify node types that need repair (only error-level, not yet repaired)
+            types_to_repair = {
+                i.node_type for i in drift_result.issues
+                if i.severity == "error" and i.node_type not in _repaired_this_session
+            }
+
+            # Guard: only attempt repair if node_store has force_refresh_node_schema
+            from flowise_dev_agent.knowledge.provider import NodeSchemaStore as _NSS
+            _can_repair = (
+                types_to_repair
+                and node_store is not None
+                and isinstance(node_store, _NSS)
+            )
+
+            if _can_repair:
+                # Bounded repair: force-refresh each affected type (max 1 per type per session)
+                async def _api_fetch(nt: str):
+                    r = await execute_tool("get_node", {"name": nt}, discover_executor)
+                    if isinstance(r, ToolResult) and r.ok and isinstance(r.data, dict):
+                        return r.data
+                    return None
+
+                for nt in types_to_repair:
+                    drift_metrics.repair_attempts_count += 1
+                    refreshed = await node_store.force_refresh_node_schema(nt, _api_fetch)
+                    if refreshed is not None:
+                        schema_cache[nt] = refreshed
+                        drift_metrics.repaired_node_types.append(nt)
+                        drift_metrics.mcp_fetches += 1
+                    _repaired_this_session.add(nt)
+
+                # Retry compilation exactly once
+                drift_metrics.compile_retry_count = 1
+                import copy as _copy_mod
+                compile_result = compile_patch_ops(
+                    _copy_mod.deepcopy(base_graph), ops, schema_cache,
+                )
+                logger.info(
+                    "[COMPILE_FLOW_DATA] retry after repair: ok=%s errors=%d",
+                    compile_result.ok, len(compile_result.errors),
+                )
+
+        # Attach schema_gap_metrics to CompileResult
+        compile_result.schema_gap_metrics = drift_metrics.to_dict()
 
         # Compute proposed flow hash
         proposed_hash = compile_result.payload_hash
@@ -2464,6 +2549,7 @@ def _make_compile_flow_data_node(
                 "flowise": {
                     **existing_flowise_debug,
                     "anchor_resolution": _anchor_metrics,
+                    "schema_substrate": drift_metrics.to_dict(),
                 }
             },
         }
@@ -3246,6 +3332,7 @@ def make_default_capabilities(
     engine: ReasoningEngine,
     domains: list[DomainTools],
     client: "FlowiseClient | None" = None,
+    pg_cache: "Any | None" = None,
 ) -> list[DomainCapability]:
     """Build the default capability list for capability-first mode (M7.1, DD-066).
 
@@ -3257,6 +3344,7 @@ def make_default_capabilities(
         domains: List of DomainTools plugins.
         client:  Optional FlowiseClient. When provided, FlowiseCapability
                  registers MCP tools via FlowiseMCPTools (M10.3).
+        pg_cache: Optional SchemaCache for Postgres-backed schema lookup (M11.1).
 
     Returns:
         list containing one FlowiseCapability instance wrapping the first
@@ -3269,7 +3357,7 @@ def make_default_capabilities(
         domains[0],
     )
     system = _build_system_prompt(_DISCOVER_BASE, domains, "discover")
-    return [FlowiseCapability(flowise_domain, engine, system, client=client)]
+    return [FlowiseCapability(flowise_domain, engine, system, client=client, pg_cache=pg_cache)]
 
 
 def build_graph(

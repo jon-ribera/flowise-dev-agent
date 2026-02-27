@@ -221,7 +221,7 @@ class TestValidatePatchOpsAnchors:
                     {"name": "cache", "type": "BaseCache"},
                 ],
                 "output_anchors": [
-                    {"name": "chatOpenAI", "type": "ChatOpenAI"},
+                    {"name": "chatOpenAI", "type": "ChatOpenAI | BaseChatModel | BaseLanguageModel"},
                 ],
             },
         }.get(node_type)

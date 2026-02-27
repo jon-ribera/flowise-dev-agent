@@ -1119,6 +1119,140 @@ def refresh_workday_mcp(dry_run: bool = False) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# API-populate: bulk fetch from Flowise MCP → Postgres cache (M11.1, DD-105)
+# ---------------------------------------------------------------------------
+
+
+_API_POPULATE_CONCURRENCY = 5   # max concurrent get_node() calls
+_API_POPULATE_CHUNK_SIZE = 50   # batch insert chunk size
+
+
+async def _api_populate_async() -> int:
+    """Bulk-fetch all node schemas from Flowise API and persist to Postgres cache.
+
+    Uses a bounded semaphore (max 5 concurrent get_node calls) to avoid
+    overwhelming the Flowise API. Batch inserts in chunks of 50.
+
+    Returns exit code (0 = success, 1 = error).
+    """
+    import os
+
+    from flowise_dev_agent.client import FlowiseClient, Settings
+    from flowise_dev_agent.knowledge.provider import _normalize_api_schema
+    from flowise_dev_agent.knowledge.schema_cache import SchemaCache
+
+    postgres_dsn = os.getenv("POSTGRES_DSN")
+    if not postgres_dsn:
+        logger.error(
+            "POSTGRES_DSN environment variable is required for --api-populate. "
+            "Set it to your Postgres connection string."
+        )
+        return 1
+
+    settings = Settings.from_env()
+    base_url = settings.api_endpoint
+    client = FlowiseClient(settings)
+
+    # Create a temporary Postgres pool for this CLI operation
+    from psycopg.rows import dict_row
+    from psycopg_pool import AsyncConnectionPool
+
+    pool = AsyncConnectionPool(
+        conninfo=postgres_dsn,
+        min_size=2,
+        max_size=5,
+        kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+    )
+    await pool.open()
+
+    try:
+        cache = SchemaCache(pool=pool, base_url=base_url)
+        await cache.setup()
+
+        # Step 1: List all node types
+        logger.info("Fetching node type list from %s ...", base_url)
+        node_list = await client.get_node_types()
+        if not isinstance(node_list, list):
+            logger.error(
+                "Unexpected response from list_nodes: %s", type(node_list).__name__
+            )
+            return 1
+
+        # Extract node names from the response
+        node_names: list[str] = []
+        for item in node_list:
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("label")
+                if name:
+                    node_names.append(name)
+            elif isinstance(item, str):
+                node_names.append(item)
+
+        logger.info("Found %d node types to fetch", len(node_names))
+
+        # Step 2: Fetch each schema with bounded concurrency
+        sem = asyncio.Semaphore(_API_POPULATE_CONCURRENCY)
+        entries: list[tuple[str, dict]] = []
+        errors: list[str] = []
+
+        async def _fetch_one(name: str) -> None:
+            async with sem:
+                try:
+                    raw = await client.get_node(name)
+                    if not isinstance(raw, dict) or "error" in raw:
+                        errors.append(name)
+                        logger.warning("  SKIP %s: API returned error or invalid response", name)
+                        return
+                    normalized = _normalize_api_schema(raw)
+                    entries.append((name, normalized))
+                except Exception as exc:
+                    errors.append(name)
+                    logger.warning("  SKIP %s: %s", name, exc)
+
+        await asyncio.gather(*[_fetch_one(n) for n in node_names])
+
+        logger.info(
+            "Fetched %d / %d schemas (%d errors)",
+            len(entries), len(node_names), len(errors),
+        )
+
+        # Step 3: Batch persist to Postgres
+        if entries:
+            total = await cache.put_batch("node", entries, ttl_seconds=86400, chunk_size=_API_POPULATE_CHUNK_SIZE)
+            logger.info("Persisted %d schemas to Postgres cache", total)
+
+        # Summary
+        print(f"\n[api-populate]  {len(entries)} / {len(node_names)} node schemas persisted to Postgres")
+        if errors:
+            print(f"  errors ({len(errors)}): {', '.join(errors[:10])}" + (" ..." if len(errors) > 10 else ""))
+        return 0
+
+    finally:
+        await client.close()
+        await pool.close()
+
+
+def refresh_api_populate(dry_run: bool = False) -> int:
+    """Bulk-fetch all node schemas from Flowise API → Postgres cache.
+
+    This is the M11.1 authoritative population path. Once Postgres is
+    populated, runtime node schema lookups use Postgres as SSoT instead
+    of the Markdown-parsed file snapshot.
+
+    Returns exit code (0 = success, 1 = error).
+    """
+    if dry_run:
+        print("\n[api-populate] --dry-run: would bulk-fetch all node schemas from Flowise API to Postgres")
+        return 0
+
+    try:
+        return asyncio.run(_api_populate_async())
+    except Exception:
+        logger.exception("Failed to run api-populate")
+        return 1
+
+
 def refresh_workday_api(dry_run: bool = False) -> int:
     """No-op stub for future Workday API snapshot refresh.
 
@@ -1215,6 +1349,17 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--api-populate",
+        action="store_true",
+        help=(
+            "M11.1: Bulk-fetch all node schemas from the live Flowise API and "
+            "persist to Postgres schema cache. Requires POSTGRES_DSN, "
+            "FLOWISE_API_ENDPOINT, and optionally FLOWISE_API_KEY. "
+            "Uses bounded concurrency (max 5) and batch inserts (chunk 50). "
+            "Once populated, runtime uses Postgres as SSoT for node schemas."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Parse / fetch and diff but do not write any files.",
@@ -1227,11 +1372,12 @@ Examples:
         or args.credentials
         or args.workday_mcp
         or args.workday_api
+        or args.api_populate
     ):
         parser.print_help()
         print(
             "\nError: specify at least one of "
-            "--nodes, --templates, --credentials, --workday-mcp, or --workday-api"
+            "--nodes, --templates, --credentials, --workday-mcp, --workday-api, or --api-populate"
         )
         return 1
 
@@ -1252,6 +1398,8 @@ Examples:
         exit_code = max(exit_code, refresh_workday_mcp(dry_run=args.dry_run))
     if args.workday_api:
         exit_code = max(exit_code, refresh_workday_api(dry_run=args.dry_run))
+    if args.api_populate:
+        exit_code = max(exit_code, refresh_api_populate(dry_run=args.dry_run))
     return exit_code
 
 

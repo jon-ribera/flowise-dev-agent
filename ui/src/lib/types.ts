@@ -70,3 +70,6 @@ export type NodeSSEEvent = NodeStartEvent | NodeEndEvent | NodeErrorEvent | Node
 export interface PhaseNode { name: string; status: NodeStatus; duration_ms?: number; summary?: string; }
 export interface Phase { name: string; nodes: PhaseNode[]; expanded: boolean; }
 export interface ToolCall { name: string; status: "calling" | "done"; preview?: string; }
+
+export interface SchemaRefreshResponse { job_id: string; status: string; message?: string; }
+export interface SchemaStats { node: number; credential: number; template: number; last_refresh: string | null; stale_count: number; }

@@ -190,13 +190,27 @@ async def lifespan(app: FastAPI):
     event_log = EventLog(dsn=postgres_dsn)
     await event_log.setup()
 
+    # M11.1 (DD-104): Schema cache — Postgres-backed warm tier for node schemas.
+    from flowise_dev_agent.knowledge.schema_cache import SchemaCache
+
+    flowise_base_url = os.getenv("FLOWISE_API_ENDPOINT", "http://localhost:3000")
+    schema_cache = SchemaCache(pool=None, base_url=flowise_base_url)  # pool set below
+
     async with make_checkpointer(postgres_dsn) as checkpointer:
+        # M11.1: SchemaCache shares the checkpointer's pool for Postgres access.
+        # The pool is an AsyncConnectionPool created inside make_checkpointer.
+        schema_cache._pool = checkpointer.conn  # type: ignore[attr-defined]
+        await schema_cache.setup()
+        logger.info("SchemaCache initialized for %s", flowise_base_url)
+
         engine = create_engine(reasoning_settings)
         domains = [FloviseDomain(default_client)]
         pattern_store = await PatternStore.open(pattern_db_path)
 
         # M7.1 (DD-066): capability-first is the default; compat_legacy only when opted in.
-        _capabilities = None if _COMPAT_LEGACY else make_default_capabilities(engine, domains, client=default_client)
+        _capabilities = None if _COMPAT_LEGACY else make_default_capabilities(
+            engine, domains, client=default_client, pg_cache=schema_cache,
+        )
         _runtime_mode = "compat_legacy" if _COMPAT_LEGACY else "capability_first"
         logger.info("Runtime mode: %s (FLOWISE_COMPAT_LEGACY=%s)", _runtime_mode, _COMPAT_LEGACY)
 
@@ -216,6 +230,8 @@ async def lifespan(app: FastAPI):
         app.state.pattern_store = pattern_store
         app.state.engine = engine
         app.state.event_log = event_log  # M9.1: available to all endpoints
+        app.state.schema_cache = schema_cache  # M11.3: schema cache for platform endpoints
+        app.state.default_client = default_client  # M11.3: for refresh service
 
         yield
 
@@ -1463,6 +1479,98 @@ async def stream_session_events(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------------------------------------------------------------------------
+# M11.3 — Platform schema endpoints (DD-108, DD-109)
+# ---------------------------------------------------------------------------
+
+
+class SchemaRefreshRequest(BaseModel):
+    """Request body for POST /platform/schema/refresh."""
+
+    scope: Literal["all", "nodes", "credentials", "marketplace"] = Field(
+        "all", description="What to refresh: all, nodes, credentials, or marketplace.",
+    )
+    force: bool = Field(
+        False, description="Force refresh even if cache is fresh.",
+    )
+
+
+class SchemaRefreshResponse(BaseModel):
+    """Response body for POST /platform/schema/refresh."""
+
+    job_id: str
+    status: str
+    message: str | None = None
+
+
+@app.post(
+    "/platform/schema/refresh",
+    response_model=SchemaRefreshResponse,
+    tags=["platform"],
+    dependencies=[Depends(_verify_api_key)],
+)
+async def start_schema_refresh(
+    body: SchemaRefreshRequest,
+    request: Request,
+) -> SchemaRefreshResponse:
+    """Start a schema refresh job.
+
+    Acquires a Postgres advisory lock per (base_url, scope). If a refresh is
+    already running, returns the existing job_id with status='already_running'.
+
+    See DESIGN_DECISIONS.md — DD-108.
+    """
+    from flowise_dev_agent.platform.refresh_service import RefreshService
+
+    cache = getattr(request.app.state, "schema_cache", None)
+    client = getattr(request.app.state, "default_client", None)
+    if cache is None or client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Schema cache or Flowise client not initialized.",
+        )
+
+    service = RefreshService(cache=cache, client=client)
+    result = await service.start_refresh(scope=body.scope, force=body.force)
+    return SchemaRefreshResponse(**result)
+
+
+@app.get(
+    "/platform/schema/refresh/{job_id}",
+    tags=["platform"],
+    dependencies=[Depends(_verify_api_key)],
+)
+async def get_schema_refresh_status(
+    job_id: str,
+    request: Request,
+) -> dict:
+    """Get the status of a schema refresh job.
+
+    Returns job details including progress counts and summary.
+    """
+    cache = getattr(request.app.state, "schema_cache", None)
+    if cache is None:
+        raise HTTPException(status_code=503, detail="Schema cache not initialized.")
+
+    job = await cache.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    return job
+
+
+@app.get(
+    "/platform/schema/stats",
+    tags=["platform"],
+    dependencies=[Depends(_verify_api_key)],
+)
+async def get_schema_stats(request: Request) -> dict:
+    """Get schema cache statistics (counts per kind, last refresh, stale count)."""
+    cache = getattr(request.app.state, "schema_cache", None)
+    if cache is None:
+        raise HTTPException(status_code=503, detail="Schema cache not initialized.")
+    return await cache.refresh_stats()
 
 
 # ---------------------------------------------------------------------------

@@ -1,8 +1,8 @@
 {
   "snapshot_file": "schemas\\flowise_nodes.snapshot.json",
-  "generated_at": "2026-02-24T22:04:07.795947Z",
+  "generated_at": "2026-02-27T08:12:36.417275Z",
   "source": "local_markdown",
   "node_count": 303,
-  "fingerprint": "75152cca5bb01dfd8ab48e73bd89f0091af13ab0cc24fb7c1cea1d9ee1a58b58",
+  "fingerprint": "2fb541c4ccab45d73c698f59065de4453dacbeafa98e5275d81f2a239fc9f148",
   "status": "ok"
 }

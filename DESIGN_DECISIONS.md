@@ -3111,7 +3111,7 @@ are needed later.
 
 ---
 
-### DD-102: Anchor Type Compatibility Validation (M10.6)
+## DD-102 — Anchor Type Compatibility Validation (Roadmap 10, M10.6)
 
 **Date**: 2026-02-26
 **Milestone**: M10.6
@@ -3162,7 +3162,7 @@ catches it definitively before the write. The iteration loop (evaluate → plan_
 
 ---
 
-### DD-103: Node Name Normalization — Case-Insensitive Lookup + Schema Mismatch Feedback (M10.7)
+## DD-103 — Node Name Normalization: Case-Insensitive Lookup + Schema Mismatch Feedback (Roadmap 10, M10.7)
 
 **Date**: 2026-02-27
 **Milestone**: M10.7
@@ -3209,3 +3209,426 @@ keys, but `NodeSchemaStore` does not.
 **Files modified**:
 - `flowise_dev_agent/knowledge/provider.py` — `_lower_index`, `get()` fallback, `get_or_repair()` fallback
 - `flowise_dev_agent/agent/graph.py` — `_schema_mismatch_feedback()`, `_make_validate_node()` params, `_repair_schema_local_sync()`, graph build wiring
+
+---
+
+## DD-104 — Postgres Schema Cache Table (Roadmap 11, M11.1)
+
+**Date**: 2026-02-26
+**Milestone**: M11.1
+
+**Problem**: Node schemas are populated from Markdown parsing (`FLOWISE_NODE_REFERENCE.md`),
+which drops 7+ UI-critical fields per inputParam (step, rows, additionalParams, loadMethod,
+credentialNames, options, show). The `_normalize_api_schema()` function already preserves
+ALL fields via `dict(inp)` for API-sourced data — the problem is purely the data source.
+File-based snapshots are ephemeral and don't persist across sessions.
+
+**Decision**: Create a Postgres-backed schema cache (`schema_cache_items`) with:
+- Composite primary key: `(base_url, schema_kind, type_key)` — supports multi-tenant
+- `schema_json JSONB` for the full normalized schema
+- `schema_hash TEXT` (SHA-256 of canonical JSON) for version gating
+- `fetched_at + ttl_seconds` for TTL-gated reads
+- Content hash computed via `_content_hash()`: `sha256(json.dumps(data, sort_keys=True))`
+
+A second table `schema_refresh_jobs` provides an audit trail for refresh operations
+(prerequisite for M11.3).
+
+**Credential safety**: When `schema_kind == "credential"`, entries are stripped to
+`_CRED_SCHEMA_ALLOWLIST` before persistence. Known-dangerous keys (`encryptedData`,
+`apiKey`, `password`, etc.) are logged and removed. Mirrors `_CRED_ALLOWLIST` in
+provider.py (DD-064).
+
+**DDL**: Application-managed via `SchemaCache.setup()` using `CREATE TABLE IF NOT EXISTS`.
+Safe to call on every startup. Follows the same pattern as `EventLog` and checkpointer.
+
+**Files**:
+- `flowise_dev_agent/knowledge/schema_cache.py` — **NEW**: `SchemaCache` class, DDL,
+  get/put/put_batch/count/is_populated/invalidate/stale_keys/refresh_stats
+- `tests/test_m111_schema_cache_unit.py` — **NEW**: 24 tests (CRUD, TTL, credential safety)
+
+---
+
+## DD-105 — 3-Tier Schema Lookup Contract (Roadmap 11, M11.1)
+
+**Date**: 2026-02-26
+**Milestone**: M11.1
+
+**Problem**: `NodeSchemaStore` loads from the file snapshot only. When the snapshot is
+Markdown-parsed, UI fields are missing. When it's API-populated (via `get_or_repair`),
+repairs are per-node and per-session — no persistence across restarts.
+
+**Decision**: 3-tier lookup: Memory (hot dict) → Postgres (warm, TTL-gated) → MCP fetch
+(cold, bounded).
+
+**Tier 1 — Memory**: Existing `_index` dict. O(1) lookup. Populated from file snapshot
+or Postgres on startup, and from MCP repair during session.
+
+**Tier 2 — Postgres**: On memory miss, try `pg_cache.get("node", node_type)`. On hit,
+populate memory and return. Avoids MCP call.
+
+**Tier 3 — MCP repair**: On full miss, call `api_fetcher(node_type)` (existing path).
+Normalize via `_normalize_api_schema()`. Write-back to both Postgres (`pg_cache.put()`)
+and memory (`_index`).
+
+**Startup load**: If `pg_cache.is_populated("node", min_count=100)` → use Postgres as
+authoritative source (skip file snapshot). Otherwise fall back to file snapshot.
+`pg_cache=None` preserves all existing file-only behavior.
+
+**Bulk population**: `refresh.py --api-populate` fetches all node types from the Flowise
+API via bounded concurrency (`asyncio.Semaphore(5)`) and persists to Postgres via
+`put_batch(chunk_size=50)`.
+
+**Wiring**: `SchemaCache` instantiated in `api.py` lifespan, pool shared from checkpointer.
+Passed through `FlowiseCapability` → `FlowiseKnowledgeProvider` → `NodeSchemaStore`.
+
+**Files modified**:
+- `flowise_dev_agent/knowledge/provider.py` — `NodeSchemaStore.__init__` gains `pg_cache`,
+  `load_from_pg()`, `get_or_repair()` 3-tier, `invalidate_memory()`,
+  `FlowiseKnowledgeProvider` accepts `pg_cache`
+- `flowise_dev_agent/api.py` — lifespan instantiates `SchemaCache`, passes to capabilities
+- `flowise_dev_agent/agent/graph.py` — `FlowiseCapability` + `make_default_capabilities()`
+  accept and propagate `pg_cache`
+- `flowise_dev_agent/knowledge/refresh.py` — `_api_populate_async()`,
+  `refresh_api_populate()`, `--api-populate` CLI flag
+
+**Tests**:
+- `tests/test_m111_nodeschemastore_3tier.py` — **NEW**: 19 tests (memory hit, pg hit,
+  MCP repair, write-back, fallback, load_from_pg)
+- `tests/test_m111_refresh_api_populate.py` — **NEW**: 7 tests (flow, concurrency,
+  chunk_size, error handling)
+
+---
+
+## DD-106 — Credential InputParam Synthesis + Render-Safe Schema Contract (Roadmap 11, M11.2)
+
+**Date**: 2026-02-26
+**Milestone**: M11.2
+
+**Problem**: Agent-created chatflows render as white screens because:
+1. String defaults aren't coerced to native types (Flowise expects `0.9` not `"0.9"`)
+2. `options` params missing the `options` list → React render crash
+3. Credential-bearing nodes missing the credential `inputParam[0]` → credential
+   selector doesn't render
+4. BindCredential sets `data.credential` but doesn't ensure the credential inputParam
+   exists in `data.inputParams[]`
+
+**Decision**: Three changes:
+
+**A) Default value coercion** (`_coerce_default()` in provider.py):
+- `"0.9"` → `0.9` (float) when param type is `number`
+- `"True"`/`"False"` → `True`/`False` (bool)
+- JSON-like strings (`{...}`, `[...]`) → parsed JSON when valid
+- Applied during `_normalize_api_schema()` to every inputParam with a `default` key
+
+**B) Render-safe contract validation** (`_validate_render_safe()` in provider.py):
+- `type=options` → ensures `options` is a list (sets to `[]` if missing)
+- `type=asyncOptions` → warns if `loadMethod` missing
+- `type=number` → warns if `default` is not numeric
+- `type=boolean` → warns if `default` is not bool
+- Validation runs during normalization; warnings logged, never blocking
+
+**C) Credential inputParam synthesis** (`_ensure_credential_input_param()` in compiler.py):
+- Called from `_build_node_data()` after assembling the data dict
+- If schema has `credential` (string) or `credentialNames` (list), ensures
+  `inputParams[0]` is `{name: "credential", type: "credential", credentialNames: [...]}`
+- Idempotent: no-op if credential param already present
+- Combined with existing BindCredential behavior (`data.credential` + `data.inputs.credential`)
+
+**What stays unchanged**:
+- `_normalize_api_schema()` already uses `dict(inp)` preserving all UI fields — no
+  truncation was ever applied (the concern about description slicing was unfounded)
+- `compile_patch_ops()` — only `_build_node_data()` gains the credential synthesis call
+- Existing BindCredential behavior in compile_patch_ops — unchanged
+
+**Files modified**:
+- `flowise_dev_agent/knowledge/provider.py` — `_coerce_default()`, `_validate_render_safe()`,
+  enhanced `_normalize_api_schema()`
+- `flowise_dev_agent/agent/compiler.py` — `_ensure_credential_input_param()`, called
+  from `_build_node_data()`
+
+**Tests**:
+- `tests/test_m112_render_safe_schema_contract.py` — **NEW**: 22 tests
+- `tests/test_m112_credential_param_synthesis.py` — **NEW**: 10 tests
+
+---
+
+## DD-107 — Viewport and Dynamic Node Height (Roadmap 11, M11.2)
+
+**Date**: 2026-02-26
+**Milestone**: M11.2
+
+**Problem**: Two compiler gaps prevent proper Flowise rendering:
+1. `to_flow_data()` returns `{nodes, edges}` — no `viewport` key. Flowise needs
+   viewport for initial canvas positioning; without it the canvas may not render.
+2. `_graph_node_to_flowise()` hardcodes `height: 500` for all nodes. Nodes with
+   many params overflow; nodes with few params waste space.
+
+**Decision**:
+
+**A) Viewport**: `to_flow_data()` now returns
+`{nodes, edges, viewport: {x: 0, y: 0, zoom: 0.5}}`. Deterministic defaults.
+`from_flow_data()` already ignores unknown keys, so round-trip is safe.
+
+**B) Dynamic node height** (`_compute_node_height(data)` in compiler.py):
+- Formula: `base(260) + visible_params * 22 + input_anchors * 12`
+- Visible params: all `inputParams` except those with `show: false`
+- Clamped to `[260, 900]` to avoid extremes
+- This is a render heuristic — it doesn't need to match Flowise's internal
+  calculation exactly, just produce reasonable heights
+
+**Why these constants**: Base 260 covers the node header, title, and padding.
+22px per param matches Flowise's typical input field height. 12px per anchor
+covers the smaller connection handles. The clamp avoids micro-nodes (< 260) and
+giant nodes (> 900) that break canvas layout.
+
+**What stays unchanged**:
+- `_auto_position()` — layout grid unchanged
+- `_build_node_data()` — data assembly unchanged (except credential synthesis above)
+- `compile_patch_ops()` — compilation logic unchanged
+- `from_flow_data()` — ignores viewport (already tolerant of unknown keys)
+
+**Files modified**:
+- `flowise_dev_agent/agent/compiler.py` — `_compute_node_height()`, `to_flow_data()`
+  viewport, `_graph_node_to_flowise()` dynamic height
+
+**Tests**:
+- `tests/test_m112_flowdata_viewport_and_height.py` — **NEW**: 13 tests
+- `tests/test_m112_anchor_fields.py` — **NEW**: 7 tests
+
+
+## DD-108 — Schema Refresh API Endpoint (Roadmap 11, M11.3)
+
+**Date**: 2026-02-26
+**Milestone**: M11.3
+
+**Problem**: Schema refresh is CLI-only (`python -m flowise_dev_agent.knowledge.refresh
+--nodes`). No programmatic trigger, no progress monitoring, no concurrent-refresh
+protection. Operators must SSH into the server to refresh schemas after a Flowise
+upgrade.
+
+**Decision**:
+
+**A) POST /platform/schema/refresh** — new endpoint under `/platform/` prefix
+(does not modify any existing routes).
+
+Request body:
+```json
+{"scope": "all|nodes|credentials|marketplace", "force": false}
+```
+
+Returns `{job_id, status}` immediately. The actual refresh runs in a background
+`asyncio.create_task`. Concurrent refresh for the same `(base_url, scope)` is
+rejected via Postgres advisory lock — returns the existing `job_id` with
+`status: "already_running"`.
+
+**B) RefreshService** (`platform/refresh_service.py`) — orchestrates bulk fetch:
+- `list_nodes()` → parallel `get_node()` with `Semaphore(5)` concurrency limit
+- Batch persistence via `SchemaCache.put_batch()` with chunk_size 50
+- Progress tracked incrementally in `schema_refresh_jobs.summary_json`
+- Credentials and marketplace templates handled similarly
+- Errors captured per-node in `summary.errors[]` — never aborts the whole job
+
+**C) GET /platform/schema/refresh/{job_id}** — poll job status. Returns current
+progress counts (`nodes_fetched`, `nodes_failed`, `credentials_fetched`,
+`templates_fetched`) and `status` (running/success/failed).
+
+**D) GET /platform/schema/stats** — returns cache counts per kind, last refresh
+time, and stale key count. Delegates to `SchemaCache.refresh_stats()`.
+
+**Why advisory lock**: Postgres advisory locks are lightweight, automatically
+released on disconnect, and shared across all app instances. No additional
+locking infrastructure needed.
+
+**What stays unchanged**:
+- All 16 existing session/system endpoints — unchanged
+- CLI `refresh.py` — continues to work for scripted/CI usage
+- Graph topology, HITL interrupts — unchanged
+
+**Files modified**:
+- `flowise_dev_agent/platform/refresh_service.py` — **NEW**: `RefreshService`
+  class (start_refresh, get_job_status, _execute, _refresh_nodes,
+  _refresh_credentials, _refresh_marketplace)
+- `flowise_dev_agent/api.py` — 3 new endpoints: `start_schema_refresh`,
+  `get_schema_refresh_status`, `get_schema_stats` + Pydantic models
+  `SchemaRefreshRequest`, `SchemaRefreshResponse`
+- `flowise_dev_agent/knowledge/schema_cache.py` — `refresh_stats()`,
+  `create_job()`, `get_job()`, `update_job()`, `get_latest_running_job()`,
+  `try_advisory_lock()`, `release_advisory_lock()` methods
+
+**Tests**:
+- `tests/test_m113_refresh_api.py` — **NEW**: API endpoint tests
+- `tests/test_m113_refresh_executor.py` — **NEW**: RefreshService executor tests
+- Total: 31 tests
+
+
+## DD-109 — Job-Based Progress Tracking for Refresh (Roadmap 11, M11.3)
+
+**Date**: 2026-02-26
+**Milestone**: M11.3
+
+**Problem**: The original plan called for SSE streaming on a dedicated
+`/platform/schema/refresh/{id}/stream` endpoint. However, the refresh already
+runs as a background task with progress persisted to Postgres — adding a
+dedicated SSE endpoint would duplicate the existing session SSE infrastructure
+without clear benefit. Clients can poll the job status endpoint instead.
+
+**Decision**: Job-based progress tracking via Postgres instead of dedicated SSE.
+
+The `schema_refresh_jobs` table stores:
+```sql
+job_id TEXT PRIMARY KEY,
+base_url TEXT NOT NULL,
+scope TEXT NOT NULL,
+status TEXT NOT NULL DEFAULT 'running',
+summary_json JSONB,
+started_at TIMESTAMPTZ DEFAULT now(),
+ended_at TIMESTAMPTZ
+```
+
+Progress updates are written every 10 node fetches during execution. The job
+row transitions: `running → success | failed`. Clients poll via
+`GET /platform/schema/refresh/{job_id}`.
+
+**Why not SSE**: The refresh is a bulk operation (seconds to minutes). Polling
+every 2–3 seconds is perfectly adequate and avoids maintaining a long-lived SSE
+connection for a one-shot operation. Session SSE (which streams graph node
+progress) remains the primary real-time channel.
+
+**Trade-off**: Slightly higher latency for progress visibility (poll interval)
+vs. simpler implementation and no additional SSE infrastructure.
+
+**Files modified**: Same as DD-108 (job tracking is integral to RefreshService).
+
+
+## DD-110 — Compile-Time Schema Gap Detection and Bounded Repair (Roadmap 11, M11.4)
+
+**Date**: 2026-02-26
+**Milestone**: M11.4
+
+**Problem**: Schema drift (Flowise upgrade adds/changes nodes, cached schema
+becomes stale) is detected only when compilation fails or Flowise renders a
+white screen. No proactive detection, no structured repair, no observability.
+
+**Decision**:
+
+**A) Render-safe contract validator** (`knowledge/drift.py`):
+
+Deterministic, cheap (no API calls) validation of compiled node data against
+6 rules that prevent Flowise UI white-screen rendering:
+
+| Rule | Condition | Severity |
+|------|-----------|----------|
+| 1 | `type=options` without `options` list | error |
+| 2 | `type=asyncOptions` without `loadMethod` | error |
+| 3 | `type=credential` without `credentialNames` | warning |
+| 4 | `type=number` with string default | warning |
+| 5 | `type=boolean` with string default | warning |
+| 6 | Node has `credentialNames` but no credential `inputParam` | error |
+
+Rule 6 only checks the schema-level `credentialNames` field — NOT the runtime
+`credential` field set by `BindCredential` (which is a bound credential UUID,
+not a schema requirement indicator).
+
+Returns `DriftResult(ok, issues)` where `ok` is False only when error-severity
+issues exist. Warnings don't fail validation.
+
+**B) Bounded repair policy** in `compile_flow_data` node:
+
+1. Compile flow data via `compile_patch_ops()`
+2. Run `validate_flow_render_contract()` on result
+3. If error-level drift found AND `isinstance(node_store, NodeSchemaStore)`:
+   - For each affected node type not yet repaired this session:
+     - Call `node_store.force_refresh_node_schema(node_type, api_fetcher)`
+     - Update memory + Postgres caches
+     - Track in `repaired_node_types`
+   - Retry compilation exactly once (`compile_retry_count = 1`)
+4. If still failing → escalation path via compile errors (HITL)
+
+**Bounds**: Max 1 force-refresh per node type per session. Max 1 compile retry
+per compilation. The `isinstance` guard prevents repair from running against
+MagicMock in tests.
+
+**C) `force_refresh_node_schema()`** on `NodeSchemaStore`:
+
+```python
+async def force_refresh_node_schema(self, node_type, api_fetcher) -> dict | None
+```
+
+- Bypasses version gating — always overwrites
+- Writes to memory index + Postgres cache
+- Returns normalized schema or None on failure
+- API errors caught and logged, never propagated
+
+**Files modified**:
+- `flowise_dev_agent/knowledge/drift.py` — **NEW**: `DriftIssue`, `DriftResult`,
+  `DriftMetrics` dataclasses, `validate_node_render_contract()`,
+  `validate_flow_render_contract()`
+- `flowise_dev_agent/knowledge/provider.py` — `force_refresh_node_schema()` method
+  on `NodeSchemaStore`
+- `flowise_dev_agent/agent/graph.py` — drift detection + bounded repair logic in
+  `compile_flow_data` node
+- `flowise_dev_agent/agent/compiler.py` — `schema_gap_metrics` field on
+  `CompileResult`
+
+**Tests**:
+- `tests/test_m114_drift_validator.py` — **NEW**: 30 tests (6 rule classes +
+  flow-level + DriftResult properties)
+- `tests/test_m114_bounded_repair.py` — **NEW**: 16 tests (force_refresh +
+  bounded repair policy)
+
+
+## DD-111 — Drift Observability Metrics (Roadmap 11, M11.4)
+
+**Date**: 2026-02-26
+**Milestone**: M11.4
+
+**Problem**: No visibility into cache performance, repair frequency, or drift
+patterns. Operators cannot tell whether the system is running cache-first or
+constantly repairing.
+
+**Decision**:
+
+**A) DriftMetrics** dataclass (`knowledge/drift.py`):
+
+```python
+@dataclass
+class DriftMetrics:
+    cache_hits_memory: int = 0
+    cache_hits_postgres: int = 0
+    cache_misses: int = 0
+    mcp_fetches: int = 0
+    drift_detected_count: int = 0
+    repair_attempts_count: int = 0
+    repaired_node_types: list[str] = field(default_factory=list)
+    compile_retry_count: int = 0
+```
+
+Counters are populated during the `compile_flow_data` node and attached to
+`CompileResult.schema_gap_metrics` via `to_dict()`.
+
+**B) Debug state**: Metrics stored in `debug["flowise"]["schema_substrate"]`
+alongside existing debug namespaces. Includes all counters plus
+`repaired_node_types` list for HITL visibility.
+
+**C) LangSmith telemetry** via `telemetry_dict()`:
+
+| Key | Derivation |
+|-----|------------|
+| `telemetry.cache_hit_rate` | `(memory + postgres) / total`, rounded to 4 decimals |
+| `telemetry.mcp_fetches` | Direct counter |
+| `telemetry.schema_repairs` | `repair_attempts_count` |
+| `telemetry.drift_detected` | `drift_detected_count` |
+
+Cache hit rate is 1.0 when no lookups occurred (vacuously true — no misses).
+All keys follow the `telemetry.*` naming convention used by existing anchor
+metrics.
+
+**D) CompileResult.schema_gap_metrics**: New `dict[str, Any]` field (default
+empty dict). Does not affect `CompileResult.ok` — ok depends on `errors` list,
+not gap metrics.
+
+**Files modified**: Same as DD-110 (metrics are integral to drift detection).
+
+**Tests**:
+- `tests/test_m114_metrics.py` — **NEW**: 15 tests (counters, serialization,
+  telemetry keys, hit rates, CompileResult integration)

@@ -34,6 +34,8 @@ interface ActiveSession {
   latestTestResults: string | null;
   /** SSE reconnect state: null=ok, 1-3=retrying, 4=lost */
   reconnectAttempt: number | null;
+  /** True between user clicking a HITL button and first SSE event arriving */
+  submitting: boolean;
 }
 
 interface SessionStore {
@@ -43,6 +45,7 @@ interface SessionStore {
   setLoadingSessions: (loading: boolean) => void;
   active: ActiveSession | null;
   initActive: (id: string) => void;
+  startSubmitting: () => void;
   applySSEEvent: (event: SSEEvent) => void;
   applyNodeEvent: (event: NodeSSEEvent) => void;
   setReconnectAttempt: (n: number | null) => void;
@@ -60,11 +63,18 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   setLoadingSessions: (loading) => set({ loadingSessions: loading }),
 
   active: null,
-  initActive: (id) => set({ active: { id, status: "streaming", interrupt: null, phases: initPhases(), tokens: "", toolCalls: [], chatflow_id: null, iteration: 0, total_input_tokens: 0, total_output_tokens: 0, lastNodeSeq: 0, errorDetail: null, latestPlan: null, latestTestResults: null, reconnectAttempt: null } }),
+  initActive: (id) => set({ active: { id, status: "streaming", interrupt: null, phases: initPhases(), tokens: "", toolCalls: [], chatflow_id: null, iteration: 0, total_input_tokens: 0, total_output_tokens: 0, lastNodeSeq: 0, errorDetail: null, latestPlan: null, latestTestResults: null, reconnectAttempt: null, submitting: false } }),
+
+  startSubmitting: () => {
+    const a = get().active;
+    if (a) set({ active: { ...a, submitting: true, status: "streaming", tokens: "", toolCalls: [] } });
+  },
 
   applySSEEvent: (event) => {
     const a = get().active;
     if (!a) return;
+    // Clear submitting flag on any incoming event — backend is responding
+    if (a.submitting) { set({ active: { ...a, submitting: false } }); }
     // The backend spreads the interrupt payload dict into the SSE event, so the top-level
     // "type" field is the interrupt subtype (e.g. "plan_approval"), not the string "interrupt".
     // We handle all interrupt subtypes here in addition to the canonical SSE types.
